@@ -1,26 +1,70 @@
 import { query } from '../config/database';
 import { logger } from '../utils/logger';
+import { AppError } from '../utils/appError';
+
+/**
+ * Customer-facing catalogue.
+ *
+ * This file was still unported Postgres: `$1` placeholders, ILIKE, a
+ * `categories` table that does not exist (it is `service_categories`),
+ * and columns that were never in this schema -- `price` (it is
+ * `base_price`), `icon_url` (it is `icon_name`), `min_quantity` and
+ * `max_quantity` (neither exists). Every call threw. It is rewritten
+ * here against the schema as it actually is.
+ *
+ * SCOPE. The catalogue holds both the customer list and the hotel/B2B
+ * list in one table, separated by `services.scope`. A customer endpoint
+ * must never leak the B2B list, so scope is applied to every query and
+ * defaults to CUSTOMER. At the time of writing there are no
+ * CUSTOMER-scope rows at all, so these endpoints correctly return an
+ * empty catalogue rather than quietly serving hotel items -- pool
+ * towels and banquet linen -- to a retail customer.
+ */
+
+const VALID_SCOPES = ['CUSTOMER', 'BUSINESS'];
+
+function resolveScope(scope?: string): string {
+  const value = String(scope || 'CUSTOMER').trim().toUpperCase();
+  if (!VALID_SCOPES.includes(value)) {
+    throw new AppError(`scope must be one of: ${VALID_SCOPES.join(', ')}`, 400);
+  }
+  return value;
+}
+
+/** LIMIT/OFFSET cannot be bound as parameters here, so they are forced
+ *  to safe integers and interpolated -- the same approach the public
+ *  business listing already uses. */
+function safePaging(page: number, limit: number) {
+  const safeLimit = Math.min(Math.max(Number.isFinite(limit) ? Math.trunc(limit) : 20, 1), 100);
+  const safePage = Math.max(Number.isFinite(page) ? Math.trunc(page) : 1, 1);
+  return { limit: safeLimit, offset: (safePage - 1) * safeLimit, page: safePage };
+}
 
 export interface Category {
   id: string;
   name: string;
-  description?: string;
-  icon_url?: string;
+  slug: string | null;
+  description: string | null;
+  icon_name: string | null;
+  image_url: string | null;
   display_order: number;
-  is_active: boolean;
+  item_count: number;
 }
 
 export interface Service {
   id: string;
-  category_id: string;
-  category_name: string;
+  category_id: string | null;
+  category_name: string | null;
   name: string;
-  description?: string;
-  price: number;
+  description: string | null;
+  /** Null when the catalogue has no price yet, so the client can say
+   *  "price on request" instead of showing a confident zero. */
+  price: number | null;
+  discounted_price: number | null;
   unit: string;
-  image_url?: string;
-  min_quantity: number;
-  max_quantity: number;
+  image_url: string | null;
+  icon_name: string | null;
+  weight_kg: number | null;
   is_popular: boolean;
   is_active: boolean;
 }
@@ -30,93 +74,112 @@ export interface ServiceQueryParams {
   search?: string;
   page: number;
   limit: number;
+  scope?: string;
 }
 
-async function getCategories(): Promise<Category[]> {
-  logger.debug('[ServiceService] Fetching all active categories');
+/** `base_price` is 0 across the whole catalogue today, which is not the
+ *  same as "free"; it is unpriced. NULLIF keeps that distinction. */
+const PRICE_SELECT = `NULLIF(s.base_price, 0) AS price,
+                      NULLIF(s.discounted_price, 0) AS discounted_price`;
+
+/** Item categories that actually have something live in them. */
+async function getCategories(scope?: string): Promise<Category[]> {
+  const resolved = resolveScope(scope);
+  logger.debug(`[ServiceService] Categories for scope ${resolved}`);
+
   const result = await query<Category>(
-    `SELECT id, name, description, icon_url, display_order, is_active
-     FROM categories
-     WHERE is_active = true
-     ORDER BY display_order ASC, name ASC`
+    `SELECT c.id, c.name, c.slug, c.description, c.icon_name, c.image_url,
+            c.display_order,
+            COUNT(s.id) AS item_count
+       FROM service_categories c
+       LEFT JOIN services s
+              ON s.category_id = c.id AND s.is_active = true AND s.kind = 'ITEM'
+      WHERE c.is_active = true
+        AND c.kind = 'ITEM_CATEGORY'
+        AND c.scope = ?
+      GROUP BY c.id
+      ORDER BY c.display_order ASC, c.name ASC`,
+    [resolved]
   );
   return result.rows;
 }
 
 async function getServices(
   params: ServiceQueryParams
-): Promise<{ services: Service[]; total: number }> {
-  const { categoryId, search, page, limit } = params;
-  const offset = (page - 1) * limit;
+): Promise<{ services: Service[]; total: number; page: number; limit: number }> {
+  const resolved = resolveScope(params.scope);
+  const { limit, offset, page } = safePaging(params.page, params.limit);
 
-  const conditions: string[] = ['s.is_active = true'];
-  const values: unknown[] = [];
-  let paramIndex = 1;
+  const conditions = [`s.is_active = true`, `s.kind = 'ITEM'`, `s.scope = ?`];
+  const values: unknown[] = [resolved];
 
-  if (categoryId) {
-    conditions.push(`s.category_id = $${paramIndex++}`);
-    values.push(categoryId);
+  if (params.categoryId) {
+    conditions.push(`s.category_id = ?`);
+    values.push(params.categoryId);
+  }
+  if (params.search) {
+    // LIKE, not ILIKE: the collation is already case-insensitive.
+    conditions.push(`(s.name LIKE ? OR s.description LIKE ?)`);
+    values.push(`%${params.search}%`, `%${params.search}%`);
   }
 
-  if (search) {
-    conditions.push(
-      `(s.name ILIKE $${paramIndex} OR s.description ILIKE $${paramIndex})`
-    );
-    values.push(`%${search}%`);
-    paramIndex++;
-  }
+  const where = `WHERE ${conditions.join(' AND ')}`;
 
-  const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
-
-  const countResult = await query<{ count: string }>(
-    `SELECT COUNT(*) AS count
-     FROM services s
-     ${whereClause}`,
+  const countResult = await query<{ total: number }>(
+    `SELECT COUNT(*) AS total FROM services s ${where}`,
     values
   );
-  const total = parseInt(countResult.rows[0]?.count || '0', 10);
+  const total = Number(countResult.rows[0]?.total || 0);
 
-  const dataValues = [...values, limit, offset];
-  const servicesResult = await query<Service>(
-    `SELECT s.id, s.category_id, c.name AS category_name, s.name, s.description,
-            s.price, s.unit, s.image_url, s.min_quantity, s.max_quantity,
-            s.is_popular, s.is_active
-     FROM services s
-     JOIN categories c ON c.id = s.category_id
-     ${whereClause}
-     ORDER BY s.is_popular DESC, s.name ASC
-     LIMIT $${paramIndex} OFFSET $${paramIndex + 1}`,
-    dataValues
-  );
-
-  return { services: servicesResult.rows, total };
-}
-
-async function getServiceById(id: string): Promise<Service | null> {
-  logger.debug(`[ServiceService] Fetching service: ${id}`);
   const result = await query<Service>(
     `SELECT s.id, s.category_id, c.name AS category_name, s.name, s.description,
-            s.price, s.unit, s.image_url, s.min_quantity, s.max_quantity,
-            s.is_popular, s.is_active
-     FROM services s
-     JOIN categories c ON c.id = s.category_id
-     WHERE s.id = $1 AND s.is_active = true`,
-    [id]
+            ${PRICE_SELECT},
+            s.unit, s.image_url, s.icon_name, s.weight_kg, s.is_popular, s.is_active
+       FROM services s
+       LEFT JOIN service_categories c ON c.id = s.category_id
+       ${where}
+      ORDER BY s.is_popular DESC, s.display_order ASC, s.name ASC
+      LIMIT ${limit} OFFSET ${offset}`,
+    values
   );
-  return result.rows[0] || null;
+
+  return { services: result.rows, total, page, limit };
 }
 
-async function getPopularServices(): Promise<Service[]> {
-  logger.debug('[ServiceService] Fetching popular services');
+async function getServiceById(id: string, scope?: string): Promise<Service> {
+  const resolved = resolveScope(scope);
   const result = await query<Service>(
     `SELECT s.id, s.category_id, c.name AS category_name, s.name, s.description,
-            s.price, s.unit, s.image_url, s.min_quantity, s.max_quantity,
-            s.is_popular, s.is_active
-     FROM services s
-     JOIN categories c ON c.id = s.category_id
-     WHERE s.is_active = true AND s.is_popular = true
-     ORDER BY s.name ASC
-     LIMIT 10`
+            ${PRICE_SELECT},
+            s.unit, s.image_url, s.icon_name, s.weight_kg, s.is_popular, s.is_active
+       FROM services s
+       LEFT JOIN service_categories c ON c.id = s.category_id
+      WHERE s.id = ? AND s.is_active = true AND s.kind = 'ITEM' AND s.scope = ?`,
+    [id, resolved]
+  );
+
+  const service = result.rows[0];
+  // A missing row is a 404, not a null the route has to remember to
+  // check -- the old version returned null and the route sent 200.
+  if (!service) {
+    throw new AppError('Service not found', 404);
+  }
+  return service;
+}
+
+async function getPopularServices(scope?: string): Promise<Service[]> {
+  const resolved = resolveScope(scope);
+  const result = await query<Service>(
+    `SELECT s.id, s.category_id, c.name AS category_name, s.name, s.description,
+            ${PRICE_SELECT},
+            s.unit, s.image_url, s.icon_name, s.weight_kg, s.is_popular, s.is_active
+       FROM services s
+       LEFT JOIN service_categories c ON c.id = s.category_id
+      WHERE s.is_active = true AND s.kind = 'ITEM'
+        AND s.is_popular = true AND s.scope = ?
+      ORDER BY s.display_order ASC, s.name ASC
+      LIMIT 10`,
+    [resolved]
   );
   return result.rows;
 }

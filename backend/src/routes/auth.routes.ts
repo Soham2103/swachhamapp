@@ -14,6 +14,10 @@ import {
   register,
   customerLogin,
   businessLogin,
+  adminLogin,
+  superAdminSendOtp,
+  superAdminVerifyOtp,
+  superAdminLogin,
   getMe,
   updateProfile,
   changePassword,
@@ -22,7 +26,6 @@ import {
   sendPasswordResetOtp,
   verifyPasswordResetOtp,
   resetPassword,
-  businessRegister,
   sendEntryOtp,
   verifyEntryOtp,
   resendEntryOtp,
@@ -33,6 +36,16 @@ import {
   authenticate,
   AuthenticatedRequest,
 } from '../middleware/auth';
+
+import {
+  resolveAfterOtp,
+  completeWithPassword,
+} from '../services/unifiedAuth.service';
+
+import {
+  sendEntryOtp as sendUnifiedOtp,
+  verifyEntryOtpOnly,
+} from '../services/auth.service';
 
 import {
   handleValidation,
@@ -50,6 +63,7 @@ import {
   businessRegisterValidation,
   entryOtpSendValidation,
   entryOtpVerifyValidation,
+  superAdminLoginValidation,
 } from '../validators/auth.validators';
 
 import {
@@ -482,6 +496,212 @@ router.post(
 
 
 // ======================================================
+// ADMIN LOGIN
+// ======================================================
+
+router.post(
+  '/admin/login',
+  authLimiter,
+  // Same shape as the customer form (email + password), so the existing
+  // chain is reused rather than duplicated.
+  customerLoginValidation,
+  handleValidation,
+
+  async (
+    req: Request,
+    res: Response,
+    next: NextFunction
+  ) => {
+
+    try {
+
+      const {
+        email,
+        password,
+      } = req.body;
+
+
+      const result =
+        await adminLogin(
+          email,
+          password
+        );
+
+
+      sendSuccess(
+        res,
+        result,
+        'Admin login successful.'
+      );
+
+    } catch (error) {
+      next(error);
+    }
+  }
+);
+
+
+// ======================================================
+// SUPER ADMIN SIGN-IN — STEP 1: SEND MOBILE OTP
+// ======================================================
+
+router.post(
+  '/super-admin/send-otp',
+  authLimiter,
+  entryOtpSendValidation,
+  handleValidation,
+
+  async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      await superAdminSendOtp(req.body.mobile);
+
+      sendSuccess(res, null, 'OTP sent to the registered mobile number.');
+    } catch (error) {
+      next(error);
+    }
+  }
+);
+
+
+// ======================================================
+// SUPER ADMIN SIGN-IN — STEP 1b: VERIFY MOBILE OTP
+//
+// Responds with whether this number belongs to a super
+// admin, and if so a short-lived token that step 2 needs.
+// ======================================================
+
+router.post(
+  '/super-admin/verify-otp',
+  authLimiter,
+  entryOtpVerifyValidation,
+  handleValidation,
+
+  async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      const result = await superAdminVerifyOtp(req.body.mobile, req.body.otp);
+
+      sendSuccess(
+        res,
+        result,
+        result.isSuperAdmin
+          ? 'Mobile verified. Please sign in with your username and password.'
+          : 'Mobile verified.'
+      );
+    } catch (error) {
+      next(error);
+    }
+  }
+);
+
+
+// ======================================================
+// SUPER ADMIN SIGN-IN — STEP 2: USERNAME + PASSWORD
+// ======================================================
+
+router.post(
+  '/super-admin/login',
+  authLimiter,
+  superAdminLoginValidation,
+  handleValidation,
+
+  async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      const { username, password, preAuthToken } = req.body;
+
+      const result = await superAdminLogin(username, password, preAuthToken);
+
+      sendSuccess(res, result, 'Super admin login successful.');
+    } catch (error) {
+      next(error);
+    }
+  }
+);
+
+
+// ======================================================
+// UNIFIED SIGN-IN — STEP 1: MOBILE OTP
+//
+// One entry point for everybody. The OTP goes out for any
+// valid number, so this cannot be used to find out which
+// numbers are staff.
+// ======================================================
+
+router.post(
+  '/signin/send-otp',
+  authLimiter,
+  entryOtpSendValidation,
+  handleValidation,
+
+  async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      await sendUnifiedOtp(req.body.mobile);
+      sendSuccess(res, null, 'OTP sent.');
+    } catch (error) {
+      next(error);
+    }
+  }
+);
+
+
+// ======================================================
+// UNIFIED SIGN-IN — STEP 2: VERIFY, THEN THE SERVER DECIDES
+//
+// A customer (or an unrecognised number, which becomes one)
+// is signed in here and goes straight to Home. Staff and
+// business accounts get a short-lived token and are sent on
+// to the password step. The client never says which it is.
+// ======================================================
+
+router.post(
+  '/signin/verify-otp',
+  authLimiter,
+  entryOtpVerifyValidation,
+  handleValidation,
+
+  async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      const mobile = await verifyEntryOtpOnly(req.body.mobile, req.body.otp);
+      const result = await resolveAfterOtp(mobile);
+
+      sendSuccess(
+        res,
+        result,
+        result.mode === 'CUSTOMER_SESSION'
+          ? 'Signed in.'
+          : result.mode === 'PASSWORD_REQUIRED'
+            ? 'Mobile verified. Please enter your username and password.'
+            : (result.message as string)
+      );
+    } catch (error) {
+      next(error);
+    }
+  }
+);
+
+
+// ======================================================
+// UNIFIED SIGN-IN — STEP 3: PASSWORD (STAFF AND BUSINESS)
+// ======================================================
+
+router.post(
+  '/signin/password',
+  authLimiter,
+  superAdminLoginValidation,
+  handleValidation,
+
+  async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      const { username, password, preAuthToken } = req.body;
+      const result = await completeWithPassword(username, password, preAuthToken);
+      sendSuccess(res, result, 'Signed in.');
+    } catch (error) {
+      next(error);
+    }
+  }
+);
+
+
+// ======================================================
 // GET CURRENT USER
 // ======================================================
 
@@ -643,37 +863,27 @@ router.post(
 // BUSINESS REGISTRATION
 // ======================================================
 
-router.post(
-  '/business/register',
-  authLimiter,
-  businessRegisterValidation,
-  handleValidation,
+/*
+ * Business self-registration is CLOSED.
+ *
+ * Every business is onboarded by a super admin, who creates the account
+ * through POST /api/super-admin/businesses. Leaving this endpoint open
+ * would let an account into the system that never passed through
+ * onboarding, and so could be missing the establishment details that
+ * ordering now depends on.
+ *
+ * It stays mounted, and answers, so an older build of the app gets a
+ * clear explanation instead of a confusing 404.
+ */
+router.post('/business/register', authLimiter, (_req: Request, res: Response) => {
+  sendError(
+    res,
+    'Business accounts are created by Swachham during onboarding. Please contact us to register your establishment.',
+    403
+  );
+});
 
-  async (
-    req: Request,
-    res: Response,
-    next: NextFunction
-  ) => {
 
-    try {
-
-      const result =
-        await businessRegister(
-          req.body
-        );
-
-      sendSuccess(
-        res,
-        result,
-        'Business registration successful.',
-        201
-      );
-
-    } catch (error) {
-      next(error);
-    }
-  }
-);
 
 
 // ======================================================

@@ -21,6 +21,7 @@ import businessRoutes from './routes/business.routes';
 import businessOrderingRoutes from './routes/businessOrdering.routes';
 import businessPublicRoutes from './routes/businessPublic.routes';
 import sorterRoutes from './routes/sorter.routes';
+import superAdminRoutes from './routes/superAdmin.routes';
 import adminRoutes from './routes/admin.routes';
 
 const app = express();
@@ -55,6 +56,7 @@ app.use('/api/businesses/public', businessPublicRoutes);
 app.use('/api/businesses', businessOrderingRoutes);
 app.use('/api/businesses', businessRoutes);
 app.use('/api/sorter', sorterRoutes);
+app.use('/api/super-admin', superAdminRoutes);
 app.use('/api/admin', adminRoutes);
 
 // Error Handling Middleware

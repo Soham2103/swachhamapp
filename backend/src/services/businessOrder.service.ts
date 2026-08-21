@@ -3,6 +3,7 @@ import { AppError } from '../utils/appError';
 import { logger } from '../utils/logger';
 import { config } from '../config/env';
 import { getCart, BusinessCart } from './businessCart.service';
+import { assertComplete } from './businessCompleteness';
 import { generateGarmentsForOrder } from './garment.service';
 
 const LAUNDRY_TYPE_CODE: Record<string, string> = { hotel: 'H', guest: 'G' };
@@ -98,6 +99,19 @@ async function createOrder(businessUserId: string): Promise<BusinessOrderResult>
   if (!cart) {
     throw new AppError('Cart not found', 404);
   }
+
+  // A business must have its mandatory establishment details on file
+  // before it can order. Checked here rather than in the UI so a direct
+  // API call is refused too, and checked before any of the cart work so
+  // an incomplete account fails fast.
+  const ownerResult = await query<{ business_id: string }>(
+    `SELECT business_id FROM business_users WHERE id = ?`,
+    [businessUserId]
+  );
+  if (!ownerResult.rows[0]) {
+    throw new AppError('Business account not found', 404);
+  }
+  await assertComplete(ownerResult.rows[0].business_id);
   if (!cart.laundry_type) {
     throw new AppError('Laundry type has not been selected', 400);
   }

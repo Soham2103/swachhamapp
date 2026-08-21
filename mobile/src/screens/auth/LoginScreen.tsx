@@ -207,15 +207,9 @@ export default function LoginScreen({ navigation, route }: any) {
               </TouchableOpacity>
             </View>
 
-            {/* Staff entry point. Separate screen and separate role — it does
-                not change anything about the customer or business login. */}
-            <TouchableOpacity
-              style={styles.staffLink}
-              onPress={() => navigation.navigate('SorterLoginScreen')}
-              activeOpacity={0.7}
-            >
-              <Text style={styles.staffLinkText}>Staff login (Sorter)</Text>
-            </TouchableOpacity>
+            {/* No staff links here any more. Everyone signs in through the
+                one mobile-number flow, and the server decides from the
+                number whether a password step is needed. */}
           </View>
         </ScrollView>
       </KeyboardAvoidingView>
