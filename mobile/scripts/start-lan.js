@@ -16,7 +16,6 @@
 
 const os = require('os');
 const path = require('path');
-const fs = require('fs');
 const { spawn } = require('child_process');
 
 // Adapters that exist on the host but are not the real LAN path to a phone.
@@ -66,20 +65,19 @@ console.log(`\n[start-lan] Dev server host: ${host}  (via ${detected.name})`);
 console.log(`[start-lan] Expo Go URL     : exp://${host}:8081`);
 console.log(`[start-lan] Backend expected: http://${host}:5000\n`);
 
-// Keep .env's fallback in sync so a bare `npx expo start --lan` also works.
-try {
-  const envPath = path.resolve(__dirname, '..', '.env');
-  if (fs.existsSync(envPath)) {
-    const original = fs.readFileSync(envPath, 'utf8');
-    const line = `REACT_NATIVE_PACKAGER_HOSTNAME=${host}`;
-    const updated = /^REACT_NATIVE_PACKAGER_HOSTNAME=.*$/m.test(original)
-      ? original.replace(/^REACT_NATIVE_PACKAGER_HOSTNAME=.*$/m, line)
-      : `${original.replace(/\s*$/, '')}\n${line}\n`;
-    if (updated !== original) fs.writeFileSync(envPath, updated);
-  }
-} catch {
-  // Non-fatal: the spawned process below gets the value via env anyway.
-}
+// The host is NOT written back to .env on purpose.
+//
+// Expo's env loader (@expo/env, SDK 54+) refuses to read machine-specific
+// variables such as REACT_NATIVE_PACKAGER_HOSTNAME from a shared .env and
+// aborts the whole `expo start` with:
+//
+//   Error: Refused to load personal environment variables from a
+//          non-.local env file. Move them to a .local env file.
+//
+// Writing it here used to make every single `npm start` fail. The value is
+// already handed to the child process via `env` below, which is all Expo
+// needs, so persisting it bought nothing. If you want a hand-set override,
+// put it in .env.local (git-ignored) or export it in your shell.
 
 // Resolve the CLI entry directly instead of shelling out to npx, so this works
 // the same on Windows (no .cmd/shell quoting) as on macOS/Linux.

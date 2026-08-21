@@ -5,8 +5,10 @@ import { query } from '../config/database';
 
 const router = Router();
 
-// Only ADMIN role can access these routes
-router.use(authenticate, requireRole(['ADMIN']));
+// SUPER_ADMIN is a superset of ADMIN, so both tiers are listed rather than
+// one replacing the other — introducing the higher tier must not revoke
+// access from the existing admins.
+router.use(authenticate, requireRole(['ADMIN', 'SUPER_ADMIN']));
 
 router.get('/dashboard', async (req: Request, res: Response, next: NextFunction) => {
   try {

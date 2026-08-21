@@ -1,4 +1,22 @@
 import apiClient from './api';
+
+/**
+ * What the server reports after a mobile number is proven.
+ *
+ * CUSTOMER_SESSION  already signed in -- go to Home.
+ * PASSWORD_REQUIRED staff or business -- ask for username + password.
+ * AMBIGUOUS         the number matches several accounts; refused.
+ */
+export interface SignInResult {
+  mode: 'CUSTOMER_SESSION' | 'PASSWORD_REQUIRED' | 'AMBIGUOUS';
+  user?: any;
+  accessToken?: string;
+  refreshToken?: string;
+  role?: string;
+  name?: string | null;
+  preAuthToken?: string;
+  message?: string;
+}
 import { ApiResponse, User, LoginPayload, RegisterPayload, BusinessRegisterPayload } from '../types';
 import { API_ENDPOINTS } from '../constants/api';
 import { getDeviceId } from '../utils/deviceId';
@@ -191,6 +209,92 @@ export const authApi = {
 
   logout: async (): Promise<ApiResponse<MessageResponse>> => {
     const response = await apiClient.post<ApiResponse<MessageResponse>>(API_ENDPOINTS.AUTH_LOGOUT);
+    return response.data;
+  },
+
+  /**
+   * Super admin sign-in, step 1: send the mobile OTP.
+   * The OTP goes out whatever the number is, so this call cannot be used
+   * to discover which numbers belong to super admins.
+   */
+  superAdminSendOtp: async (mobile: string): Promise<ApiResponse<null>> => {
+    const response = await apiClient.post<ApiResponse<null>>(
+      '/api/auth/super-admin/send-otp',
+      { mobile: normalizeMobile(mobile) }
+    );
+    return response.data;
+  },
+
+  /**
+   * Step 1b: verify it. Only a super admin gets a preAuthToken back;
+   * everyone else gets isSuperAdmin false and is sent to normal sign-in.
+   */
+  superAdminVerifyOtp: async (
+    mobile: string,
+    otp: string
+  ): Promise<ApiResponse<{ isSuperAdmin: boolean; preAuthToken: string | null; name: string | null }>> => {
+    const response = await apiClient.post<
+      ApiResponse<{ isSuperAdmin: boolean; preAuthToken: string | null; name: string | null }>
+    >('/api/auth/super-admin/verify-otp', {
+      mobile: normalizeMobile(mobile),
+      otp: otp.replace(/\D/g, ''),
+    });
+    return response.data;
+  },
+
+  /** Step 2: username + password, carrying the proof of step 1. */
+  superAdminLogin: async (
+    username: string,
+    password: string,
+    preAuthToken: string
+  ): Promise<AuthResponse> => {
+    const response = await apiClient.post<{ data: AuthResponse }>(
+      '/api/auth/super-admin/login',
+      { username, password, preAuthToken }
+    );
+    return (response.data as any).data ?? response.data;
+  },
+
+  /**
+   * Unified sign-in, step 1. One entry point for every kind of account.
+   */
+  signinSendOtp: async (mobile: string): Promise<ApiResponse<null>> => {
+    // deviceId is required by the entry-OTP validators and binds the code to
+    // this handset, exactly as the other OTP calls in this file do.
+    const response = await apiClient.post<ApiResponse<null>>('/api/auth/signin/send-otp', {
+      mobile: normalizeMobile(mobile),
+      deviceId: await getDeviceId(),
+    });
+    return response.data;
+  },
+
+  /**
+   * Step 2. The SERVER decides what this number is: a customer is signed
+   * in here and there is nothing more to do; staff and business accounts
+   * come back needing a password.
+   */
+  signinVerifyOtp: async (mobile: string, otp: string): Promise<ApiResponse<SignInResult>> => {
+    const response = await apiClient.post<ApiResponse<SignInResult>>(
+      '/api/auth/signin/verify-otp',
+      {
+        mobile: normalizeMobile(mobile),
+        otp: otp.replace(/[^0-9]/g, ''),
+        deviceId: await getDeviceId(),
+      }
+    );
+    return response.data;
+  },
+
+  /** Step 3, only for the roles that need it. */
+  signinPassword: async (
+    username: string,
+    password: string,
+    preAuthToken: string
+  ): Promise<ApiResponse<SignInResult>> => {
+    const response = await apiClient.post<ApiResponse<SignInResult>>(
+      '/api/auth/signin/password',
+      { username, password, preAuthToken }
+    );
     return response.data;
   },
 };

@@ -1,5 +1,6 @@
 import { query } from '../config/database';
 import { AppError } from '../utils/appError';
+import { getCompleteness, Completeness } from './businessCompleteness';
 
 export interface BusinessProfile {
   business_id: string;
@@ -18,6 +19,9 @@ export interface BusinessProfile {
   alternate_contact_person: string | null;
   alternate_mobile_no: string | null;
   status: string;
+  /** Whether the mandatory establishment details are all on file. */
+  is_complete?: boolean;
+  missing_fields?: Completeness['missing_fields'];
   account_name: string;
   account_email: string;
   created_at: Date;
@@ -77,7 +81,11 @@ async function getProfile(businessUserId: string): Promise<BusinessProfile> {
   if (!profile) {
     throw new AppError('Business profile not found', 404);
   }
-  return profile;
+
+  // Returned with the profile so the screen can prompt for exactly what
+  // is missing instead of only finding out at checkout.
+  const completeness = await getCompleteness(businessId);
+  return { ...profile, ...completeness };
 }
 
 export interface UpdateBusinessProfileInput {
@@ -103,15 +111,18 @@ function optionalText(value: unknown): string | null {
 }
 
 /**
- * Business name is intentionally not updatable here: it is set once at
- * registration and is the profile's identity.
+ * Turns a profile input into SQL assignments, with every field's
+ * validation in one place.
+ *
+ * Shared by the business's own profile update and by the super admin's
+ * Company / Establishment Details screen, so a record saved on the
+ * client's behalf is validated exactly like one the client saves
+ * itself — no second, drifting copy of these rules.
  */
-async function updateProfile(
-  businessUserId: string,
-  input: UpdateBusinessProfileInput
-): Promise<BusinessProfile> {
-  const businessId = await getOwnedBusinessId(businessUserId);
-
+export function buildBusinessProfileUpdate(
+  input: UpdateBusinessProfileInput & { establishmentName?: string },
+  options: { allowNameChange?: boolean } = {}
+): { fields: string[]; values: unknown[] } {
   const fields: string[] = [];
   const values: unknown[] = [];
 
@@ -219,6 +230,33 @@ async function updateProfile(
     fields.push('alternate_mobile_no = ?');
     values.push(value);
   }
+
+
+  // Only the super admin path may correct the establishment name; on the
+  // self-service path the name is the profile's identity and is fixed.
+  if (options.allowNameChange && input.establishmentName !== undefined) {
+    const value = String(input.establishmentName).trim();
+    if (value.length < 2 || value.length > 255) {
+      throw new AppError('Establishment name must be between 2 and 255 characters', 400);
+    }
+    fields.push('name = ?', 'establishment_name = ?');
+    values.push(value, value);
+  }
+
+  return { fields, values };
+}
+
+/**
+ * Business name is intentionally not updatable here: it is set once at
+ * registration and is the profile's identity.
+ */
+async function updateProfile(
+  businessUserId: string,
+  input: UpdateBusinessProfileInput
+): Promise<BusinessProfile> {
+  const businessId = await getOwnedBusinessId(businessUserId);
+
+  const { fields, values } = buildBusinessProfileUpdate(input);
 
   if (fields.length === 0) {
     return getProfile(businessUserId);

@@ -53,4 +53,54 @@ function verifyRefreshToken(token: string): DecodedToken {
   }
 }
 
-export { generateAccessToken, generateRefreshToken, verifyAccessToken, verifyRefreshToken };
+/**
+ * Pre-auth token for the two-step super admin sign-in.
+ *
+ * Step 1 (mobile OTP) hands back one of these; step 2 (username +
+ * password) will not run without it. That is what makes the flow
+ * genuinely two-step instead of two endpoints that can each be called
+ * on their own.
+ *
+ * It is signed with a SEPARATE derived secret, not JWT_SECRET. If it
+ * shared the access-token secret it would sail straight through the
+ * `authenticate` middleware — a half-authenticated token would be a
+ * full session. With its own secret, presenting it as a Bearer token
+ * fails signature verification like any other garbage string.
+ *
+ * Short-lived by design, but long enough for a human: the window has to
+ * survive leaving the app to look a password up, not just typing it. Five
+ * minutes turned out to be a machine's idea of that, so it is fifteen.
+ * The token still only ever unlocks a password attempt against one
+ * specific account.
+ */
+const PRE_AUTH_SECRET = config.JWT_SECRET + '_preauth';
+const PRE_AUTH_EXPIRES_IN = '15m';
+
+export interface PreAuthPayload {
+  /** The mobile number that actually passed OTP. */
+  mobile: string;
+  userId: string;
+  purpose: 'SUPER_ADMIN_LOGIN';
+}
+
+function generatePreAuthToken(payload: PreAuthPayload): string {
+  return jwt.sign(payload, PRE_AUTH_SECRET, { expiresIn: PRE_AUTH_EXPIRES_IN });
+}
+
+function verifyPreAuthToken(token: string): PreAuthPayload & JwtPayload {
+  try {
+    const decoded = jwt.verify(token, PRE_AUTH_SECRET) as PreAuthPayload & JwtPayload;
+    if (decoded.purpose !== 'SUPER_ADMIN_LOGIN') {
+      throw new Error('Invalid verification token');
+    }
+    return decoded;
+  } catch (error) {
+    if (error instanceof jwt.TokenExpiredError) {
+      throw new Error('Mobile verification expired. Please start again.');
+    }
+    throw new Error('Invalid verification token');
+  }
+}
+
+export { generateAccessToken, generateRefreshToken, verifyAccessToken, verifyRefreshToken,
+         generatePreAuthToken, verifyPreAuthToken };

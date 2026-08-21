@@ -179,6 +179,25 @@ const changePasswordValidation = [
     }),
 ];
 
+const superAdminLoginValidation = [
+  body('username')
+    .trim()
+    .notEmpty()
+    .withMessage('Username is required')
+    .isLength({ max: 255 })
+    .withMessage('Username is too long'),
+
+  body('password')
+    .notEmpty()
+    .withMessage('Password is required'),
+
+  // Proof that step 1 (mobile OTP) actually happened.
+  body('preAuthToken')
+    .trim()
+    .notEmpty()
+    .withMessage('Mobile verification is required before signing in'),
+];
+
 export { 
   customerRegisterValidation, 
   customerLoginValidation, 
@@ -190,7 +209,8 @@ export {
   changePasswordValidation,
   businessRegisterValidation,
   entryOtpSendValidation,
-  entryOtpVerifyValidation
+  entryOtpVerifyValidation,
+  superAdminLoginValidation
 };
 
 const businessRegisterValidation = [

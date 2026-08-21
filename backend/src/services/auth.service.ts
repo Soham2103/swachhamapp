@@ -1,7 +1,12 @@
 ﻿import bcrypt from 'bcrypt';
 import crypto from 'crypto';
 import { query } from '../config/database';
-import { generateAccessToken, generateRefreshToken } from '../utils/jwt';
+import {
+  generateAccessToken,
+  generateRefreshToken,
+  generatePreAuthToken,
+  verifyPreAuthToken,
+} from '../utils/jwt';
 import { logger } from '../utils/logger';
 import { smsService } from './sms.service';
 import { AppError } from '../utils/appError';
@@ -208,7 +213,16 @@ export async function businessLogin(email: string, password: string): Promise<Au
   if (!user || !user.password_hash) {
     throw new AppError('Invalid email or password', 401);
   }
-  if (!user.is_active || (user as any).business_status !== 'ACTIVE') {
+  const businessStatus = (user as any).business_status;
+  // A pending applicant is not the same thing as a disabled account, and
+  // saying so saves a support call.
+  if (businessStatus === 'PENDING') {
+    throw new AppError('Your business registration is awaiting approval. You will be notified once it is reviewed.', 403);
+  }
+  if (businessStatus === 'REJECTED') {
+    throw new AppError('Your business registration was not approved. Please contact support.', 403);
+  }
+  if (!user.is_active || businessStatus !== 'ACTIVE') {
     throw new AppError('Account or business is inactive', 403);
   }
 
@@ -274,6 +288,176 @@ export async function sorterLogin(username: string, password: string): Promise<A
   const refreshToken = generateRefreshToken(tokenPayload);
 
   // The hash never leaves this function.
+  const { password_hash, ...userWithoutPassword } = user;
+  return { user: userWithoutPassword as UserProfile, accessToken, refreshToken };
+}
+
+/**
+ * Admin sign-in.
+ *
+ * `users` holds CUSTOMER, ADMIN and SUPER_ADMIN rows in the same table, and
+ * customerLogin deliberately filters `role = 'CUSTOMER'` — so without this an
+ * admin row can authenticate nowhere. Both admin tiers sign in here; the token
+ * carries whichever role the row actually has, and the route guards decide what
+ * that role may reach. The filter is applied in SQL rather than checked after
+ * the fetch, so a customer can never obtain an admin token from this endpoint.
+ *
+ * Unlike customerLogin there is no mobile_verified gate: admins are created
+ * directly against the database and never pass through the mobile OTP flow.
+ */
+export async function adminLogin(email: string, password: string): Promise<AuthResult> {
+  logger.debug(`[AuthService] Admin login attempt for: ${email}`);
+  const userResult = await query<UserProfile & { password_hash: string }>(
+    `SELECT id, name, email, mobile_number as mobile, role, profile_image, is_active,
+            mobile_verified, password_hash, created_at, updated_at
+     FROM users WHERE email = ? AND role IN ('ADMIN', 'SUPER_ADMIN')`,
+    [email.toLowerCase()]
+  );
+  const user = userResult.rows[0];
+
+  // Same opaque message for "no such admin" and "wrong password", so this
+  // endpoint cannot be used to enumerate which emails are admins.
+  if (!user || !user.password_hash) {
+    throw new AppError('Invalid email or password', 401);
+  }
+  if (!user.is_active) {
+    throw new AppError('Account is inactive', 403);
+  }
+
+  const passwordMatch = await bcrypt.compare(password, user.password_hash);
+  if (!passwordMatch) {
+    throw new AppError('Invalid email or password', 401);
+  }
+
+  await query(`UPDATE users SET last_login_at = NOW() WHERE id = ?`, [user.id]);
+  const tokenPayload = { id: user.id.toString(), email: user.email, role: user.role };
+  const accessToken = generateAccessToken(tokenPayload);
+  const refreshToken = generateRefreshToken(tokenPayload);
+
+  const { password_hash, ...userWithoutPassword } = user;
+  return { user: userWithoutPassword as UserProfile, accessToken, refreshToken };
+}
+
+/**
+ * ===================================================================
+ * SUPER ADMIN SIGN-IN — step 1 of 2: mobile OTP
+ * ===================================================================
+ *
+ * Sending the OTP says nothing about whether the number belongs to a
+ * super admin. Refusing to send for an unknown number would turn this
+ * endpoint into an oracle for "which mobile numbers are super admins",
+ * so an OTP goes out either way and the role is only revealed after
+ * the code is actually proven.
+ */
+export async function superAdminSendOtp(mobile: string): Promise<void> {
+  await sendOtpInternal(normalizeMobile(mobile), 'LOGIN_VERIFICATION');
+}
+
+export interface SuperAdminOtpResult {
+  /** Whether step 2 (username + password) applies to this number. */
+  isSuperAdmin: boolean;
+  /** Only issued for a super admin; required by superAdminLogin. */
+  preAuthToken: string | null;
+  name: string | null;
+}
+
+/**
+ * Step 1 verification. The OTP is checked first and the role is read
+ * only afterwards, so the answer cannot be obtained without the code.
+ *
+ * A super admin gets a short-lived pre-auth token; anyone else gets a
+ * truthful `isSuperAdmin: false` and no token, and the client sends
+ * them down the ordinary sign-in path.
+ */
+export async function superAdminVerifyOtp(
+  mobile: string,
+  otp: string
+): Promise<SuperAdminOtpResult> {
+  const normalizedMobile = normalizeMobile(mobile);
+  await verifyOtpInternal(normalizedMobile, otp, 'LOGIN_VERIFICATION');
+
+  const result = await query<{ id: string; name: string; role: string; is_active: boolean }>(
+    `SELECT id, name, role, is_active FROM users WHERE mobile_number = ?`,
+    [normalizedMobile]
+  );
+  const user = result.rows[0];
+
+  if (!user || user.role !== 'SUPER_ADMIN') {
+    return { isSuperAdmin: false, preAuthToken: null, name: null };
+  }
+  if (!user.is_active) {
+    throw new AppError('Account is inactive', 403);
+  }
+
+  logger.info(`[AuthService] Super admin OTP verified for user ${user.id}`);
+  return {
+    isSuperAdmin: true,
+    preAuthToken: generatePreAuthToken({
+      mobile: normalizedMobile,
+      userId: String(user.id),
+      purpose: 'SUPER_ADMIN_LOGIN',
+    }),
+    name: user.name,
+  };
+}
+
+/**
+ * ===================================================================
+ * SUPER ADMIN SIGN-IN — step 2 of 2: username + password
+ * ===================================================================
+ *
+ * The username is the value stored in `users.email`, matching how
+ * sorterLogin already treats staff usernames — one convention for
+ * staff accounts rather than two.
+ *
+ * Three things must line up, not two: the pre-auth token has to be
+ * valid, the username has to resolve to a SUPER_ADMIN, and that row
+ * has to be the SAME id the OTP was proven against. Without the last
+ * check, passing step 1 on your own number would let you attempt
+ * passwords against somebody else's admin account.
+ */
+export async function superAdminLogin(
+  username: string,
+  password: string,
+  preAuthToken: string
+): Promise<AuthResult> {
+  const preAuth = (() => {
+    try {
+      return verifyPreAuthToken(preAuthToken);
+    } catch (error) {
+      throw new AppError((error as Error).message, 401);
+    }
+  })();
+
+  const userResult = await query<UserProfile & { password_hash: string }>(
+    `SELECT id, name, email, mobile_number as mobile, role, profile_image, is_active,
+            mobile_verified, password_hash, created_at, updated_at
+     FROM users WHERE email = ? AND role = 'SUPER_ADMIN'`,
+    [String(username || '').trim().toLowerCase()]
+  );
+  const user = userResult.rows[0];
+
+  if (!user || !user.password_hash) {
+    throw new AppError('Invalid username or password', 401);
+  }
+  if (String(user.id) !== String(preAuth.userId)) {
+    throw new AppError('This account does not match the verified mobile number', 401);
+  }
+  if (!user.is_active) {
+    throw new AppError('Account is inactive', 403);
+  }
+
+  const passwordMatch = await bcrypt.compare(password, user.password_hash);
+  if (!passwordMatch) {
+    throw new AppError('Invalid username or password', 401);
+  }
+
+  await query(`UPDATE users SET last_login_at = NOW() WHERE id = ?`, [user.id]);
+  const tokenPayload = { id: user.id.toString(), email: user.email, role: user.role };
+  const accessToken = generateAccessToken(tokenPayload);
+  const refreshToken = generateRefreshToken(tokenPayload);
+
+  logger.info(`[AuthService] Super admin logged in: ${user.id}`);
   const { password_hash, ...userWithoutPassword } = user;
   return { user: userWithoutPassword as UserProfile, accessToken, refreshToken };
 }
@@ -483,6 +667,27 @@ export async function sendEntryOtp(mobile: string, deviceId?: string): Promise<v
   await sendOtpInternal(normalizeMobile(mobile), 'LOGIN_VERIFICATION', deviceId);
 }
 
+/**
+ * Verifies an entry OTP and hands back the NORMALISED number.
+ *
+ * The unified sign-in needs the same normalisation the OTP was stored
+ * under, otherwise the account lookup that follows could miss a number
+ * that was typed as +91XXXXXXXXXX.
+ *
+ * `deviceId` is forwarded so an OTP issued to one handset still cannot be
+ * completed on another: the unified sign-in is bound to a device exactly
+ * like the older entry-OTP path.
+ */
+export async function verifyEntryOtpOnly(
+  mobile: string,
+  otp: string,
+  deviceId?: string
+): Promise<string> {
+  const normalized = normalizeMobile(mobile);
+  await verifyOtpInternal(normalized, otp, 'LOGIN_VERIFICATION', deviceId);
+  return normalized;
+}
+
 export async function verifyEntryOtp(mobile: string, otp: string, deviceId?: string): Promise<void> {
   await verifyOtpInternal(normalizeMobile(mobile), otp, 'LOGIN_VERIFICATION', deviceId);
 }
@@ -540,7 +745,9 @@ export async function businessRegister(data: {
       name, business_type, other_type_specify, address, gst_number, pan_number, website,
       contact_person_name, designation, mobile_number, whatsapp_number,
       alternate_contact_person, alternate_mobile_no, status
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'ACTIVE')`,
+     -- Signups now wait for a super admin decision instead of going
+     -- live on submit; the approval queue is what makes them ACTIVE.
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING')`,
     [
       data.establishmentName, data.customerType, data.otherTypeSpecify || null, data.establishmentAddress,
       data.gstNumber || null, data.panNumber || null, data.website || null,

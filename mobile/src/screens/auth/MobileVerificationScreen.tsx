@@ -33,8 +33,8 @@ export default function MobileVerificationScreen({ navigation }: any) {
   const inputRefs = useRef<Array<TextInput | null>>([]);
 
   const {
-    sendEntryOtp,
-    verifyEntryOtp,
+    signInSendOtp,
+    signInVerifyOtp,
     resendEntryOtp,
     isLoading,
   } = useAuthStore();
@@ -92,7 +92,7 @@ export default function MobileVerificationScreen({ navigation }: any) {
 
     try {
       setError('');
-      await sendEntryOtp(trimmedMobile);
+      await signInSendOtp(trimmedMobile);
       setIsOtpSent(true);
       setTimer(30);
       setOtp(['', '', '', '', '', '']);
@@ -142,13 +142,33 @@ export default function MobileVerificationScreen({ navigation }: any) {
     try {
       setError('');
       const verifiedMobile = mobile.trim();
-      await verifyEntryOtp(verifiedMobile, enteredOtp);
-      // The verified number travels with the flow so Business registration
-      // never has to ask for it a second time.
-      navigation.reset({
-        index: 0,
-        routes: [{ name: 'LoginScreen', params: { verifiedMobile } }],
-      });
+      const result = await signInVerifyOtp(verifiedMobile, enteredOtp);
+
+      // The SERVER decides what this number is; the app only routes.
+      //
+      // A customer is already signed in by this point -- the OTP was the
+      // credential -- so there is nothing to navigate to: AppNavigator
+      // swaps to the customer stack on its own once auth state flips.
+      if (result.mode === 'CUSTOMER_SESSION') {
+        return;
+      }
+
+      if (result.mode === 'PASSWORD_REQUIRED') {
+        navigation.navigate('SignInPasswordScreen', {
+          role: result.role,
+          name: result.name,
+          preAuthToken: result.preAuthToken,
+          mobile: verifiedMobile,
+        });
+        return;
+      }
+
+      // AMBIGUOUS: the number answers to several accounts, so it grants
+      // none of them. Say so plainly instead of failing silently.
+      setError(
+        result.message ||
+          'This mobile number is linked to more than one account. Please contact support.'
+      );
     } catch (err: any) {
       setError(err?.message || 'Invalid OTP. Please check the OTP and try again.');
     }

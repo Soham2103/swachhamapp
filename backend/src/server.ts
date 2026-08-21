@@ -23,6 +23,7 @@ import businessPublicRoutes from './routes/businessPublic.routes';
 import sorterRoutes from './routes/sorter.routes';
 import locationRoutes from './routes/location.routes';
 import chatRoutes from './routes/chat.routes';
+import superAdminRoutes from './routes/superAdmin.routes';
 import { UPLOAD_ROOT, UPLOAD_URL_PREFIX } from './utils/fileStorage';
 import adminRoutes from './routes/admin.routes';
 
@@ -83,6 +84,7 @@ app.use('/api/businesses', businessRoutes);
 app.use('/api/sorter', sorterRoutes);
 app.use('/api/location', locationRoutes);
 app.use('/api/chat', chatRoutes);
+app.use('/api/super-admin', superAdminRoutes);
 app.use('/api/admin', adminRoutes);
 
 // Error Handling Middleware
