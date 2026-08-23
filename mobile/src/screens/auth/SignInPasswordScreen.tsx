@@ -28,12 +28,27 @@ const ROLE_COPY: Record<string, { title: string; hint: string }> = {
  *
  * The role is shown, so somebody who did not expect a password prompt
  * can see why they are getting one.
+ *
+ * THIS IS THE BUSINESS LOGIN PAGE. A business contact who verified their
+ * number arrives here, and what they enter is the BUSINESS's email and
+ * password -- the primary contact's. An alternative contact has no password
+ * of their own, so there is nothing else they could enter, and the server
+ * refuses any email belonging to a different business than the one their
+ * number is registered to.
+ *
+ * The email is offered pre-filled because the server already told us which
+ * one this business signs in with; it is a convenience for an authorised
+ * contact, and it is still only half of a credential. It stays editable, for
+ * a business with more than one login account.
  */
 export default function SignInPasswordScreen({ navigation, route }: any) {
-  const { role, name, preAuthToken, mobile } = route.params || {};
+  const {
+    role, name, preAuthToken, mobile,
+    businessName, loginEmail, contactName, isPrimaryContact,
+  } = route.params || {};
   const { signInPassword, isLoading } = useAuthStore();
 
-  const [username, setUsername] = useState('');
+  const [username, setUsername] = useState(loginEmail || '');
   const [password, setPassword] = useState('');
   const [error, setError] = useState('');
 
@@ -79,6 +94,22 @@ export default function SignInPasswordScreen({ navigation, route }: any) {
             {mobile ? mobile + ' verified. ' : ''}This account also needs a password.
           </Text>
 
+          {/* Shown only when the business path was taken. It says which
+              business is about to be opened and, for an alternative contact,
+              why the email being asked for is not theirs. */}
+          {businessName ? (
+            <View style={styles.businessNote}>
+              <Ionicons name="business-outline" size={16} color={COLORS.Primary} />
+              <Text style={styles.businessNoteText}>
+                Signing in to <Text style={styles.businessNoteStrong}>{businessName}</Text>
+                {contactName ? ' as ' + contactName : ''}
+                {isPrimaryContact === false
+                  ? '. Enter the business email and password to continue.'
+                  : '.'}
+              </Text>
+            </View>
+          ) : null}
+
           <View style={styles.steps}>
             <View style={[styles.stepDot, styles.stepDotActive]} />
             <View style={[styles.stepDot, styles.stepDotActive]} />
@@ -93,7 +124,7 @@ export default function SignInPasswordScreen({ navigation, route }: any) {
             autoCorrect={false}
             placeholder={copy.hint}
             placeholderTextColor={COLORS.TextSecondary}
-            autoFocus
+            autoFocus={!loginEmail}
           />
 
           <Text style={styles.label}>Password</Text>
@@ -105,6 +136,7 @@ export default function SignInPasswordScreen({ navigation, route }: any) {
             placeholder="Password"
             placeholderTextColor={COLORS.TextSecondary}
             onSubmitEditing={submit}
+            autoFocus={Boolean(loginEmail)}
           />
 
           <TouchableOpacity
@@ -153,6 +185,16 @@ const styles = StyleSheet.create({
     fontFamily: TYPOGRAPHY.fontFamily, fontSize: TYPOGRAPHY.sizes.sm,
     color: COLORS.TextSecondary, marginTop: SPACING.xs, marginBottom: SPACING.lg,
   },
+  businessNote: {
+    flexDirection: 'row', alignItems: 'flex-start', gap: SPACING.xs,
+    backgroundColor: COLORS.Accent, borderRadius: BORDER_RADIUS.sm,
+    padding: SPACING.sm, marginBottom: SPACING.md,
+  },
+  businessNoteText: {
+    flex: 1, fontFamily: TYPOGRAPHY.fontFamily,
+    fontSize: TYPOGRAPHY.sizes.xs, color: COLORS.TextPrimary,
+  },
+  businessNoteStrong: { fontWeight: '700' },
   steps: { flexDirection: 'row', gap: SPACING.xs, marginBottom: SPACING.lg },
   stepDot: { height: 4, flex: 1, borderRadius: 2, backgroundColor: COLORS.Border },
   stepDotActive: { backgroundColor: COLORS.Primary },

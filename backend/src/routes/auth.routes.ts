@@ -31,6 +31,7 @@ import {
   resendEntryOtp,
   sorterLogin,
 } from '../services/auth.service';
+import { resolveLoginRoute } from '../services/businessContact.service';
 
 import {
   authenticate,
@@ -40,6 +41,8 @@ import {
 import {
   resolveAfterOtp,
   completeWithPassword,
+  sendBusinessSignInOtp,
+  verifyBusinessSignInOtp,
 } from '../services/unifiedAuth.service';
 
 import {
@@ -72,6 +75,142 @@ import {
 
 
 const router = Router();
+
+/**
+ * POST /api/auth/business-login-route   { mobile }
+ *
+ * WAYFINDING, NOT AUTHENTICATION.
+ *
+ * An alternative contact types their mobile number; this says which business
+ * login page to show them and which email they must sign in with. It issues
+ * NO token and starts NO session — the person still completes the existing
+ * business login with that email and its password.
+ *
+ * Public because it runs before anyone is signed in, which is the whole
+ * point. It reveals only a business name and the login email already printed
+ * on that business's own paperwork, and only for a number the Super Admin has
+ * left enabled.
+ */
+router.post('/business-login-route', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const route = await resolveLoginRoute(req.body?.mobile ?? req.body?.mobile_number);
+    // Both outcomes are answers, not failures: `routed` says which.
+    sendSuccess(
+      res,
+      route,
+      route.routed ? 'Business identified' : route.message || 'Not available'
+    );
+  } catch (error) {
+    next(error);
+  }
+});
+
+
+/* ===================================================================
+ * BUSINESS SIGN-IN  --  phone, OTP, then the business's own credentials
+ * ===================================================================
+ *
+ * THE FLOW, in three calls:
+ *
+ *   POST /api/auth/business/send-otp     { mobile, deviceId }
+ *   POST /api/auth/business/verify-otp   { mobile, otp, deviceId }  -> preAuthToken
+ *   POST /api/auth/signin/password       { username, password, preAuthToken }
+ *
+ * The third one is the EXISTING endpoint, unchanged and shared with every
+ * other role -- there is no separate business password step, and no separate
+ * session shape. What arrives at the end is the ordinary business JWT.
+ *
+ * WHO THIS IS FOR. Any of a business's registered contacts: the primary one,
+ * and up to three alternative contacts who have no account and no password of
+ * their own. Proving an alternative contact's number identifies the BUSINESS;
+ * the primary account's email and password are still what authenticate.
+ *
+ * These endpoints exist alongside the unified sign-in rather than replacing
+ * it, because "sign in" and "sign in to my business" have different right
+ * answers for an unrecognised number -- see the note in unifiedAuth.service.
+ *
+ * `authLimiter` is the app's existing rate limiter, the same one guarding
+ * every other OTP endpoint here.
+ */
+
+/**
+ * POST /api/auth/business/send-otp   { mobile, deviceId }
+ *
+ * The number is checked against the business contacts BEFORE anything is
+ * sent, so an unregistered number gets an error and no SMS. The response
+ * carries the business name and never the OTP.
+ */
+router.post(
+  '/business/send-otp',
+  authLimiter,
+  entryOtpSendValidation,
+  handleValidation,
+
+  async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      const result = await sendBusinessSignInOtp(req.body.mobile, req.body.deviceId);
+      sendSuccess(res, result, `OTP sent. Verify it to sign in to ${result.business_name}.`);
+    } catch (error) {
+      next(error);
+    }
+  }
+);
+
+/**
+ * POST /api/auth/business/verify-otp   { mobile, otp, deviceId }
+ *
+ * Verifies the OTP and identifies the business. NO SESSION IS ISSUED: the
+ * `preAuthToken` is signed with a separate secret, carries the business id and
+ * nothing else, and only unlocks a password attempt against THAT business.
+ *
+ * The business is resolved after the OTP passes, so nothing about which
+ * business a number belongs to is learnable without the code.
+ */
+router.post(
+  '/business/verify-otp',
+  authLimiter,
+  entryOtpVerifyValidation,
+  handleValidation,
+
+  async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      const result = await verifyBusinessSignInOtp(
+        req.body.mobile,
+        req.body.otp,
+        req.body.deviceId
+      );
+      sendSuccess(
+        res,
+        result,
+        `Mobile verified for ${result.business.name}. Please enter the business email and password.`
+      );
+    } catch (error) {
+      next(error);
+    }
+  }
+);
+
+/**
+ * POST /api/auth/business/resend-otp   { mobile, deviceId }
+ *
+ * The same send, re-run. The resend cooldown lives in the OTP service, so it
+ * applies here exactly as it does everywhere else.
+ */
+router.post(
+  '/business/resend-otp',
+  authLimiter,
+  entryOtpSendValidation,
+  handleValidation,
+
+  async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      const result = await sendBusinessSignInOtp(req.body.mobile, req.body.deviceId);
+      sendSuccess(res, result, `OTP resent for ${result.business_name}.`);
+    } catch (error) {
+      next(error);
+    }
+  }
+);
 
 
 // ======================================================

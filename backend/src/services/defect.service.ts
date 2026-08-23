@@ -49,7 +49,7 @@ export interface DefectRecord {
 const ORDER_CONTACT_SELECT = `
   SELECT o.id, o.order_number, o.status,
          COALESCE(b.name, u.name, 'Customer') AS customer_name,
-         COALESCE(bu.mobile_number, b.mobile_number, u.mobile_number) AS customer_contact
+         COALESCE(bu.mobile_number, u.mobile_number) AS customer_contact
     FROM orders o
     LEFT JOIN business_users bu ON bu.id = o.business_user_id
     LEFT JOIN businesses b ON b.id = bu.business_id

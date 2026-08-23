@@ -49,12 +49,17 @@ async function getCart(userId: string): Promise<Cart> {
     cart = newCart.rows[0];
   }
 
+  // Price comes from the global customer price list, never from
+  // `ci.price_at_add` (a staging value) and never from a column on
+  // `services` (there is no price column there -- base_price holds
+  // legacy placeholders). Every customer sees the same figure.
   const itemsResult = await query<CartItem>(
     `SELECT ci.id, ci.cart_id, ci.service_id, s.name AS service_name,
-            s.price, s.unit, s.image_url, ci.quantity,
-            (s.price * ci.quantity) AS item_total
+            cp.customer_price AS price, s.unit, s.image_url, ci.quantity,
+            (cp.customer_price * ci.quantity) AS item_total
      FROM cart_items ci
      JOIN services s ON s.id = ci.service_id
+     LEFT JOIN customer_price_list cp ON cp.item_id = s.id AND cp.is_active = true
      WHERE ci.cart_id = $1
      ORDER BY ci.created_at ASC`,
     [cart.id]

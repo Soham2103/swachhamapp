@@ -1,5 +1,6 @@
 import { query } from '../config/database';
 import { AppError } from '../utils/appError';
+import { lookupBusinessPrice } from './priceList.service';
 
 export type LaundryType = 'hotel' | 'guest';
 export type OrderType = 'standard' | 'quick';
@@ -189,14 +190,38 @@ async function addItem(
   // quantity and re-states the service that was asked for.
   const lineServiceId = await resolveItemServiceId(itemId, itemServiceType);
 
+  // price_at_add is a staging value only. It is filled from this
+  // business's own price list at the cart's laundry type where one
+  // exists, and left at 0 otherwise -- an item can still be put in the
+  // cart before Hotel/Guest is chosen or before its price is configured.
+  // Nothing bills from it: createOrder resolves the price again from
+  // business_price_list for the type the order is placed at, and refuses
+  // the order if it is missing. The business app never sees this column.
+  const owner = await query<{ business_id: string }>(
+    `SELECT business_id FROM business_users WHERE id = ?`,
+    [businessUserId]
+  );
+  const cartType = await query<{ laundry_type: string | null }>(
+    `SELECT laundry_type FROM carts WHERE id = ?`,
+    [cartId]
+  );
+  const stagedPrice = owner.rows[0]
+    ? await lookupBusinessPrice(
+        owner.rows[0].business_id,
+        itemId,
+        cartType.rows[0]?.laundry_type ?? null
+      )
+    : null;
+
   await query(
     `INSERT INTO cart_items (cart_id, service_id, laundry_service_id, quantity, price_at_add)
-     VALUES (?, ?, ?, ?, (SELECT base_price FROM services WHERE id = ?))
+     VALUES (?, ?, ?, ?, ?)
      ON DUPLICATE KEY UPDATE
        quantity = quantity + VALUES(quantity),
        laundry_service_id = COALESCE(VALUES(laundry_service_id), laundry_service_id),
+       price_at_add = VALUES(price_at_add),
        updated_at = NOW()`,
-    [cartId, itemId, lineServiceId, quantity, itemId]
+    [cartId, itemId, lineServiceId, quantity, stagedPrice ?? 0]
   );
 
   return getCart(businessUserId);

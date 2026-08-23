@@ -29,9 +29,15 @@ interface Props {
   visible: boolean;
   /** e.g. SWG#20082026000001 — shown as the receipt line. */
   orderNumber: string;
-  /** The booked schedule, shown under the order number. Omitted when unknown. */
+  /**
+   * The booked schedule, shown under the order number. Omitted when unknown.
+   *
+   * Pickup and delivery each carry their own date: they are separate days,
+   * so showing one date above both slots would misstate the booking.
+   */
   pickupDate?: string;
   pickupSlot?: string;
+  deliveryDate?: string;
   deliverySlot?: string;
   /** Primary action: takes the user to their orders. */
   onViewOrders: () => void;
@@ -44,6 +50,7 @@ export default function OrderConfirmationModal({
   orderNumber,
   pickupDate,
   pickupSlot,
+  deliveryDate,
   deliverySlot,
   onViewOrders,
   onClose,
@@ -184,22 +191,23 @@ export default function OrderConfirmationModal({
             </Text>
           </View>
 
-          {/* The slots the order was booked for, straight from the order. */}
+          {/* What was booked, straight from the order: each leg with its own
+              date above its own time. */}
           {pickupSlot || deliverySlot ? (
             <View style={styles.pickupBlock}>
-              {pickupDate ? <Text style={styles.pickupDate}>{pickupDate}</Text> : null}
-
-              {pickupSlot ? (
+              {pickupSlot || pickupDate ? (
                 <>
-                  <Text style={styles.pickupLabel}>Pickup Time</Text>
-                  <Text style={styles.pickupValue}>{pickupSlot}</Text>
+                  <Text style={styles.pickupLabel}>Pickup</Text>
+                  {pickupDate ? <Text style={styles.pickupDate}>{pickupDate}</Text> : null}
+                  {pickupSlot ? <Text style={styles.pickupValue}>{pickupSlot}</Text> : null}
                 </>
               ) : null}
 
-              {deliverySlot ? (
+              {deliverySlot || deliveryDate ? (
                 <>
-                  <Text style={styles.pickupLabel}>Delivery Time</Text>
-                  <Text style={styles.pickupValue}>{deliverySlot}</Text>
+                  <Text style={styles.pickupLabel}>Delivery</Text>
+                  {deliveryDate ? <Text style={styles.pickupDate}>{deliveryDate}</Text> : null}
+                  {deliverySlot ? <Text style={styles.pickupValue}>{deliverySlot}</Text> : null}
                 </>
               ) : null}
             </View>

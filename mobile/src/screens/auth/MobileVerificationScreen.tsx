@@ -30,6 +30,15 @@ export default function MobileVerificationScreen({ navigation }: any) {
   const [timer, setTimer] = useState(0);
   const [error, setError] = useState('');
 
+  /*
+   * NOBODY IS ASKED WHETHER THIS IS A BUSINESS.
+   *
+   * There is one field on this screen: a mobile number. The SERVER decides
+   * what that number is -- a business's primary contact, one of its
+   * alternative contacts, a member of staff, or a customer -- from the data,
+   * after the OTP has proven it. Asking the person to classify their own
+   * account was a question only the database could answer.
+   */
   const inputRefs = useRef<Array<TextInput | null>>([]);
 
   const {
@@ -92,6 +101,8 @@ export default function MobileVerificationScreen({ navigation }: any) {
 
     try {
       setError('');
+      // One call for everybody. Which kind of account this is has not been
+      // decided yet, and does not need to be to send a code.
       await signInSendOtp(trimmedMobile);
       setIsOtpSent(true);
       setTimer(30);
@@ -142,6 +153,7 @@ export default function MobileVerificationScreen({ navigation }: any) {
     try {
       setError('');
       const verifiedMobile = mobile.trim();
+
       const result = await signInVerifyOtp(verifiedMobile, enteredOtp);
 
       // The SERVER decides what this number is; the app only routes.
@@ -153,12 +165,24 @@ export default function MobileVerificationScreen({ navigation }: any) {
         return;
       }
 
+      /*
+       * A password is needed. For a BUSINESS number the server also says which
+       * business it is and which email to sign in with -- it worked that out
+       * from the contact rows, so an alternative contact reaches the same
+       * business login as the primary one without ever being asked.
+       */
       if (result.mode === 'PASSWORD_REQUIRED') {
         navigation.navigate('SignInPasswordScreen', {
           role: result.role,
           name: result.name,
           preAuthToken: result.preAuthToken,
           mobile: verifiedMobile,
+          businessName: result.business?.name,
+          // The email to sign in WITH, so an authorised contact does not have
+          // to know it by heart. It is the primary contact's, never a password.
+          loginEmail: result.business?.login_email,
+          contactName: result.contact?.name,
+          isPrimaryContact: result.contact?.is_primary,
         });
         return;
       }

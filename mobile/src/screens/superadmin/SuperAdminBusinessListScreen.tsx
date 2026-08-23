@@ -18,6 +18,7 @@ import superAdminApi, { BusinessCompletenessRow } from '../../services/superAdmi
  */
 export default function SuperAdminBusinessListScreen({ navigation }: any) {
   const [rows, setRows] = useState<BusinessCompletenessRow[]>([]);
+  /** The business whose invoice is being generated, if any. */
   const [onlyIncomplete, setOnlyIncomplete] = useState(true);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
@@ -109,10 +110,19 @@ export default function SuperAdminBusinessListScreen({ navigation }: any) {
                       Missing: {b.missing_fields.map((f) => f.label).join(', ')}
                     </Text>
                   )}
+                  {/* The GSTIN on file, from the record itself. */}
+                  {b.gst_number ? (
+                    <Text style={sa.cardMeta}>GSTIN: {b.gst_number}</Text>
+                  ) : null}
                   <Pill status={b.status} />
                 </View>
                 <Ionicons name="chevron-forward" size={18} color={COLORS.TextSecondary} />
               </View>
+
+              {/* Generate Invoice moved to Business Account -> Order Detail,
+                  where the business's orders are on screen beside it. The
+                  endpoints and the modal are unchanged; only the entry point
+                  is. */}
             </TouchableOpacity>
           ))}
         </ScrollView>

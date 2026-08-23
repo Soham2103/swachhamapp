@@ -5,7 +5,6 @@ import {
   StyleSheet,
   TouchableOpacity,
   FlatList,
-  TextInput,
   ActivityIndicator,
   Modal,
   Pressable,
@@ -20,9 +19,9 @@ import { COLORS, SPACING, TYPOGRAPHY, BORDER_RADIUS, SHADOWS } from '../../const
 import BusinessHeader from '../../components/business/BusinessHeader';
 import SwachhamChatLauncher from '../../components/chat/SwachhamChatLauncher';
 import CategoryGridCard from '../../components/business/CategoryGridCard';
-import businessOrderApi, { BusinessCategory, BusinessItem } from '../../services/businessOrderApi';
+import businessOrderApi, { BusinessCategory } from '../../services/businessOrderApi';
 import { getCategoryImage } from '../../constants/categoryImages';
-import { filterHiddenCategories, isHiddenCategory } from '../../constants/hiddenCategories';
+import { filterHiddenCategories } from '../../constants/hiddenCategories';
 import { extractErrorMessage } from '../../services/api';
 import { useBusinessOrderStore } from '../../store/businessOrderStore';
 
@@ -85,13 +84,8 @@ const MIN_CARD_SIZE = 140;
  */
 export default function BusinessCategoriesScreen({ navigation }: any) {
   const [categories, setCategories] = useState<BusinessCategory[]>([]);
-  const [search, setSearch] = useState('');
-  const [searchResults, setSearchResults] = useState<BusinessItem[]>([]);
-  const [isSearching, setIsSearching] = useState(false);
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState('');
-
-  const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // Long-pressing a card previews its full artwork.
   const [zoomed, setZoomed] = useState<BusinessCategory | null>(null);
@@ -100,8 +94,9 @@ export default function BusinessCategoriesScreen({ navigation }: any) {
   const { width, height } = useWindowDimensions();
 
   // Height of the area the grid actually gets, measured rather than guessed,
-  // so the header, the search bar and the tab bar are all accounted for on
-  // every screen size.
+  // so the header and the tab bar are both accounted for on every screen
+  // size — and so removing the search bar hands its space straight to the
+  // cards instead of leaving a gap.
   const [gridHeight, setGridHeight] = useState(0);
 
   // The card is square: the largest side that fits two columns across the
@@ -175,37 +170,6 @@ export default function BusinessCategoriesScreen({ navigation }: any) {
     return bundled ?? (category.image_url ? { uri: category.image_url } : null);
   };
 
-  const runSearch = useCallback(async (text: string) => {
-    if (!text.trim()) {
-      setSearchResults([]);
-      setIsSearching(false);
-      return;
-    }
-    try {
-      setError('');
-      setIsSearching(true);
-      const response = await businessOrderApi.searchItems({ search: text.trim() });
-      setSearchResults(
-        response.data.filter(
-          (item) =>
-            !isHiddenCategory(item.parent_category_name) && !isHiddenCategory(item.category_name)
-        )
-      );
-    } catch (err: any) {
-      setError(extractErrorMessage(err, 'Failed to search items'));
-    } finally {
-      setIsSearching(false);
-    }
-  }, []);
-
-  const handleSearchChange = (text: string) => {
-    setSearch(text);
-    if (debounceRef.current) clearTimeout(debounceRef.current);
-    debounceRef.current = setTimeout(() => runSearch(text), 350);
-  };
-
-  const searching = Boolean(search.trim());
-
   const renderCategory = ({ item }: { item: BusinessCategory }) => (
     <CategoryGridCard
       name={item.name}
@@ -217,61 +181,14 @@ export default function BusinessCategoriesScreen({ navigation }: any) {
     />
   );
 
-  const renderSearchResult = ({ item }: { item: BusinessItem }) => (
-    <TouchableOpacity
-      style={styles.resultCard}
-      activeOpacity={0.85}
-      onPress={() =>
-        navigation.navigate('BusinessItemsScreen', {
-          categoryId: item.category_id,
-          categoryName: item.category_name,
-          parentName: item.parent_category_name,
-        })
-      }
-    >
-      <View style={styles.resultIcon}>
-        <Ionicons name="shirt-outline" size={20} color={COLORS.Primary} />
-      </View>
-      <View style={{ flex: 1, minWidth: 0 }}>
-        <Text style={styles.resultName}>{item.name}</Text>
-        <Text style={styles.resultMeta}>
-          {item.parent_category_name ? `${item.parent_category_name} › ` : ''}
-          {item.category_name}
-        </Text>
-      </View>
-      <Ionicons name="chevron-forward" size={18} color={COLORS.TextSecondary} />
-    </TouchableOpacity>
-  );
-
-  // Rendered above both lists rather than inside them, so the grid area below
-  // can be measured on its own.
-  const searchBar = (
-    <View style={styles.searchWrap}>
-      <View style={styles.searchContainer}>
-        <Ionicons name="search-outline" size={20} color={COLORS.TextSecondary} />
-        <TextInput
-          style={styles.searchInput}
-          placeholder="Search items..."
-          placeholderTextColor={COLORS.TextSecondary}
-          value={search}
-          onChangeText={handleSearchChange}
-          returnKeyType="search"
-        />
-        {search ? (
-          <TouchableOpacity
-            onPress={() => {
-              setSearch('');
-              setSearchResults([]);
-            }}
-          >
-            <Ionicons name="close-circle" size={18} color={COLORS.TextSecondary} />
-          </TouchableOpacity>
-        ) : null}
-      </View>
-
-      {error ? <Text style={styles.errorText}>{error}</Text> : null}
+  /* The search bar was removed from the Business home screen. The grid
+     measures its own height through onLayout below, so it simply reclaims
+     the space rather than leaving a gap where the bar used to be. */
+  const errorBanner = error ? (
+    <View style={styles.errorWrap}>
+      <Text style={styles.errorText}>{error}</Text>
     </View>
-  );
+  ) : null;
 
   return (
     <SafeAreaView style={styles.container} edges={['top']}>
@@ -292,27 +209,12 @@ export default function BusinessCategoriesScreen({ navigation }: any) {
         }
       />
 
-      {searchBar}
+      {errorBanner}
 
       {isLoading ? (
         <View style={styles.centered}>
           <ActivityIndicator size="large" color={COLORS.Primary} />
         </View>
-      ) : searching ? (
-        <FlatList
-          data={searchResults}
-          keyExtractor={(item) => item.id}
-          renderItem={renderSearchResult}
-          contentContainerStyle={styles.listContent}
-          keyboardShouldPersistTaps="handled"
-          ListEmptyComponent={
-            isSearching ? (
-              <ActivityIndicator color={COLORS.Primary} style={{ marginTop: SPACING.lg }} />
-            ) : (
-              <Text style={styles.emptyText}>No items match your search</Text>
-            )
-          }
-        />
       ) : (
         // The grid owns all the remaining height; onLayout reports it so the
         // cards can be sized to fill it exactly.
@@ -398,7 +300,7 @@ const styles = StyleSheet.create({
   // is left over, instead of leaving one dead band at the bottom.
   gridContent: { padding: GRID_PADDING, flexGrow: 1, justifyContent: 'center' },
   row: { gap: GRID_GAP, marginBottom: GRID_GAP, justifyContent: 'center' },
-  searchWrap: { paddingHorizontal: GRID_PADDING, paddingTop: GRID_PADDING },
+  errorWrap: { paddingHorizontal: GRID_PADDING, paddingTop: SPACING.xs },
 
   cartButton: {
     width: 44,
@@ -422,58 +324,6 @@ const styles = StyleSheet.create({
     paddingHorizontal: 4,
   },
   badgeText: { color: COLORS.Surface, fontSize: 11, fontWeight: 'bold' },
-
-  searchContainer: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: SPACING.sm,
-    backgroundColor: COLORS.Surface,
-    borderRadius: BORDER_RADIUS.md,
-    paddingHorizontal: SPACING.md,
-    height: 48,
-    borderWidth: 1,
-    borderColor: COLORS.Border,
-    marginBottom: SPACING.md,
-    ...SHADOWS.light,
-  },
-  searchInput: {
-    flex: 1,
-    fontFamily: TYPOGRAPHY.fontFamily,
-    fontSize: TYPOGRAPHY.sizes.base,
-    color: COLORS.TextPrimary,
-  },
-
-  resultCard: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: SPACING.sm,
-    backgroundColor: COLORS.Surface,
-    borderRadius: BORDER_RADIUS.md,
-    padding: SPACING.md,
-    marginBottom: SPACING.sm,
-    borderWidth: 1,
-    borderColor: COLORS.Border,
-  },
-  resultIcon: {
-    width: 42,
-    height: 42,
-    borderRadius: BORDER_RADIUS.sm,
-    backgroundColor: COLORS.Background,
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  resultName: {
-    fontFamily: TYPOGRAPHY.fontFamily,
-    fontSize: TYPOGRAPHY.sizes.base,
-    fontWeight: '600',
-    color: COLORS.TextPrimary,
-  },
-  resultMeta: {
-    fontFamily: TYPOGRAPHY.fontFamily,
-    fontSize: TYPOGRAPHY.sizes.xs,
-    color: COLORS.TextSecondary,
-    marginTop: 2,
-  },
 
   errorText: {
     fontFamily: TYPOGRAPHY.fontFamily,

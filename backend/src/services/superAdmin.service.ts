@@ -1,14 +1,13 @@
-import bcrypt from 'bcrypt';
 import { query } from '../config/database';
 import { AppError } from '../utils/appError';
 import { logger } from '../utils/logger';
 import { getCompleteness, Completeness } from './businessCompleteness';
 import {
   buildBusinessProfileUpdate,
+  applyContactUpdate,
   UpdateBusinessProfileInput,
 } from './businessProfile.service';
-
-const SALT_ROUNDS = 10;
+import { HEAD_CONTACT_JOIN, HEAD_CONTACT_COLUMNS } from './businessContact.service';
 
 /**
  * B2B vs B2C is not a column — it is which owner column an order
@@ -196,6 +195,7 @@ export interface PendingBusiness {
   id: string;
   name: string;
   business_type: string;
+  registration_type: string;
   contact_person_name: string | null;
   mobile_number: string | null;
   email: string | null;
@@ -211,12 +211,13 @@ async function listBusinessApprovals(status: string = 'PENDING'): Promise<Pendin
     throw new AppError(`status must be one of: ${BUSINESS_STATUSES.join(', ')}`, 400);
   }
   const result = await query<PendingBusiness>(
-    `SELECT b.id, b.name, b.business_type, b.contact_person_name, b.mobile_number,
-            COALESCE(b.email, MIN(bu.email)) AS email, b.city, b.gst_number, b.status, b.created_at
+    `SELECT b.id, b.name, b.business_type, b.registration_type,
+            hbu.name AS contact_person_name, hbu.mobile_number,
+            COALESCE(hbu.email, b.email) AS email,
+            b.city, b.gst_number, b.status, b.created_at
        FROM businesses b
-       LEFT JOIN business_users bu ON bu.business_id = b.id
+       ${HEAD_CONTACT_JOIN}
       WHERE b.status = ?
-      GROUP BY b.id
       ORDER BY b.created_at DESC
       LIMIT 200`,
     [status]
@@ -287,7 +288,7 @@ async function decideBusiness(
 
   await query(
     `UPDATE businesses
-        SET status = ?, reviewed_at = NOW(), reviewed_by = ?, approval_note = ?, updated_at = NOW()
+        SET status = ?, reviewed_by = ?, approval_note = ?, updated_at = NOW()
       WHERE id = ?`,
     [nextStatus, reviewerId, note ? String(note).slice(0, 300) : null, businessId]
   );
@@ -334,139 +335,22 @@ async function decideRider(
 }
 
 /* ===================================================================
- * DIRECT ENTRY CREATION
+ * DIRECT ENTRY CREATION -- REMOVED
+ *
+ * `createBusiness` and `createRider` used to live here, behind
+ * POST /api/super-admin/businesses and POST /api/super-admin/riders.
+ *
+ * A Super Admin no longer creates either. Both now come into existence the
+ * one way: a MANAGER raises a creation request and the Super Admin approves
+ * it, which is `creationRequest.service` and is untouched. That leaves one
+ * path into `businesses` and one into `users`, both of which re-verify the
+ * GSTIN and set the credentials at approval time -- so removing these did
+ * not remove a capability, it removed the second, unreviewed copy of one.
+ *
+ * Everything else about a business and a rider is unchanged: listing,
+ * viewing, editing, approving, disabling, deleting, rider login, rider
+ * assignment and every rider API still work exactly as they did.
  * =================================================================== */
-
-function requireField(value: unknown, label: string): string {
-  const text = String(value ?? '').trim();
-  if (!text) throw new AppError(`${label} is required`, 400);
-  return text;
-}
-
-const MOBILE_PATTERN = /^[6-9]\d{9}$/;
-
-/** Same normalisation the auth service applies, so one number cannot
- *  enter the system in two shapes. */
-function requireMobile(value: unknown): string {
-  const mobile = String(value ?? '')
-    .replace(/[\s-]/g, '')
-    .replace(/^(\+91|91|0)/, '');
-  if (!MOBILE_PATTERN.test(mobile)) {
-    throw new AppError('Mobile must be a valid 10-digit Indian mobile number', 400);
-  }
-  return mobile;
-}
-
-export interface CreateBusinessInput {
-  name: string;
-  business_type?: string;
-  contact_person_name?: string;
-  mobile_number: string;
-  email?: string;
-  address: string;
-  city: string;
-  state?: string;
-  pincode?: string;
-  gst_number?: string;
-  pan_number?: string;
-}
-
-/**
- * A business entered directly by the super admin is ACTIVE at once —
- * it was created by the approver, so routing it into their own
- * approval queue would be theatre.
- */
-async function createBusiness(
-  creatorId: string,
-  input: CreateBusinessInput
-): Promise<{ id: string; name: string; status: string }> {
-  const name = requireField(input.name, 'Business name');
-  const address = requireField(input.address, 'Address');
-  const city = requireField(input.city, 'City');
-  const mobile = requireMobile(input.mobile_number);
-
-  if (input.gst_number) {
-    const dupe = await query(`SELECT id FROM businesses WHERE gst_number = ?`, [input.gst_number]);
-    if (dupe.rows.length > 0) throw new AppError('GST number already registered', 409);
-  }
-
-  const inserted = await query(
-    `INSERT INTO businesses
-       (name, business_type, contact_person_name, mobile_number, email, address, city, state,
-        pincode, gst_number, pan_number, status, created_by_admin_id, reviewed_at, reviewed_by)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'ACTIVE', ?, NOW(), ?)`,
-    [
-      name,
-      input.business_type || 'OTHER',
-      input.contact_person_name || null,
-      mobile,
-      input.email ? String(input.email).toLowerCase() : null,
-      address,
-      city,
-      input.state || null,
-      input.pincode || null,
-      input.gst_number || null,
-      input.pan_number || null,
-      creatorId,
-      creatorId,
-    ]
-  );
-
-  logger.info(`[SuperAdmin] Business ${inserted.insertId} created by ${creatorId}`);
-  return { id: String(inserted.insertId), name, status: 'ACTIVE' };
-}
-
-export interface CreateRiderInput {
-  name: string;
-  mobile_number: string;
-  email?: string;
-  password: string;
-}
-
-/**
- * Riders are ordinary `users` rows, so they inherit the same mobile
- * uniqueness, bcrypt hashing and OTP machinery as every other account
- * instead of needing a parallel identity system.
- */
-async function createRider(
-  creatorId: string,
-  input: CreateRiderInput
-): Promise<{ id: string; name: string; mobile_number: string; approval_status: string }> {
-  const name = requireField(input.name, 'Rider name');
-  const mobile = requireMobile(input.mobile_number);
-  const password = String(input.password ?? '');
-  if (password.length < 8) {
-    throw new AppError('Password must be at least 8 characters long', 400);
-  }
-
-  const dupe = await query(`SELECT id FROM users WHERE mobile_number = ?`, [mobile]);
-  if (dupe.rows.length > 0) {
-    throw new AppError('That mobile number is already registered', 409);
-  }
-  if (input.email) {
-    const emailDupe = await query(`SELECT id FROM users WHERE email = ?`, [
-      String(input.email).toLowerCase(),
-    ]);
-    if (emailDupe.rows.length > 0) throw new AppError('That email is already registered', 409);
-  }
-
-  const passwordHash = await bcrypt.hash(password, SALT_ROUNDS);
-  const inserted = await query(
-    `INSERT INTO users
-       (name, email, mobile_number, password_hash, role, is_active, mobile_verified,
-        approval_status, reviewed_at, reviewed_by)
-     VALUES (?, ?, ?, ?, 'RIDER', true, true, 'APPROVED', NOW(), ?)`,
-    [name, input.email ? String(input.email).toLowerCase() : null, mobile, passwordHash, creatorId]
-  );
-
-  logger.info(`[SuperAdmin] Rider ${inserted.insertId} created by ${creatorId}`);
-  return {
-    id: String(inserted.insertId),
-    name,
-    mobile_number: mobile,
-    approval_status: 'APPROVED',
-  };
-}
 
 export {
   getSalesSummary,
@@ -475,8 +359,6 @@ export {
   listRiderApprovals,
   decideBusiness,
   decideRider,
-  createBusiness,
-  createRider,
 };
 
 /* ===================================================================
@@ -492,7 +374,10 @@ export {
 export interface BusinessDetail {
   business_id: string;
   business_name: string;
+  /** The establishment CATEGORY, from businesses.business_type. */
   customer_type: string | null;
+  /** B2B or B2C. */
+  registration_type: string;
   other_type_specify: string | null;
   establishment_address: string | null;
   gst_number: string | null;
@@ -517,19 +402,22 @@ async function getBusinessDetail(
   const result = await query<BusinessDetail>(
     `SELECT b.id AS business_id,
             COALESCE(NULLIF(TRIM(b.establishment_name), ''), b.name) AS business_name,
-            b.business_type AS customer_type, b.other_type_specify,
+            b.business_type AS customer_type,
+            b.registration_type,
+            b.other_type_specify,
             COALESCE(b.establishment_address, b.address) AS establishment_address,
             b.gst_number, b.pan_number, b.website,
-            b.contact_person_name, b.designation,
-            COALESCE(b.mobile_number, MIN(bu.mobile_number)) AS mobile_number,
-            b.whatsapp_number,
-            COALESCE(b.email_id, b.email, MIN(bu.email)) AS email_id,
-            b.alternate_contact_person, b.alternate_mobile_no,
+            ${HEAD_CONTACT_COLUMNS},
+            (SELECT a.name FROM business_users a
+              WHERE a.business_id = b.id AND a.contact_type = 'ALTERNATIVE'
+              ORDER BY a.id LIMIT 1) AS alternate_contact_person,
+            (SELECT a.mobile_number FROM business_users a
+              WHERE a.business_id = b.id AND a.contact_type = 'ALTERNATIVE'
+              ORDER BY a.id LIMIT 1) AS alternate_mobile_no,
             b.status, b.created_at, b.updated_at
        FROM businesses b
-       LEFT JOIN business_users bu ON bu.business_id = b.id
-      WHERE b.id = ?
-      GROUP BY b.id`,
+       ${HEAD_CONTACT_JOIN}
+      WHERE b.id = ?`,
     [businessId]
   );
   const detail = result.rows[0];
@@ -543,6 +431,8 @@ export interface BusinessCompletenessRow {
   business_id: string;
   business_name: string;
   status: string;
+  /** Shown on the account card, and the number an invoice is billed under. */
+  gst_number: string | null;
   is_complete: boolean;
   missing_fields: Completeness['missing_fields'];
 }
@@ -555,8 +445,8 @@ export interface BusinessCompletenessRow {
 async function listBusinessCompleteness(
   onlyIncomplete = false
 ): Promise<BusinessCompletenessRow[]> {
-  const idsResult = await query<{ id: string; name: string; status: string }>(
-    `SELECT id, COALESCE(NULLIF(TRIM(establishment_name), ''), name) AS name, status
+  const idsResult = await query<{ id: string; name: string; status: string; gst_number: string | null }>(
+    `SELECT id, COALESCE(NULLIF(TRIM(establishment_name), ''), name) AS name, status, gst_number
        FROM businesses ORDER BY created_at DESC LIMIT 500`
   );
 
@@ -568,6 +458,7 @@ async function listBusinessCompleteness(
       business_id: String(business.id),
       business_name: business.name,
       status: business.status,
+      gst_number: business.gst_number || null,
       ...completeness,
     });
   }
@@ -594,21 +485,23 @@ async function updateBusinessDetail(
     throw new AppError('Business not found', 404);
   }
 
-  const { fields, values } = buildBusinessProfileUpdate(input, { allowNameChange: true });
+  const plan = buildBusinessProfileUpdate(input, { allowNameChange: true });
 
-  if (fields.length > 0) {
-    fields.push('updated_at = NOW()');
-    await query(`UPDATE businesses SET ${fields.join(', ')} WHERE id = ?`, [...values, businessId]);
+  if (plan.fields.length > 0) {
+    await query(`UPDATE businesses SET ${plan.fields.join(', ')}, updated_at = NOW() WHERE id = ?`, [
+      ...plan.values,
+      businessId,
+    ]);
   }
 
-  // The authenticated account row carries the mobile number that the
-  // order summary and PDF read, so it has to move with the profile.
-  if (input.mobileNumber !== undefined) {
-    await query(
-      `UPDATE business_users SET mobile_number = ?, updated_at = NOW() WHERE business_id = ?`,
-      [String(input.mobileNumber).trim(), businessId]
-    );
-  }
+  // The contact half goes to the business's PRIMARY row -- the same row the
+  // business edits itself, and the one the order summary and PDF read.
+  const head = await query<{ id: string }>(
+    `SELECT id FROM business_users WHERE business_id = ?
+      ORDER BY FIELD(contact_type,'PRIMARY','ALTERNATIVE'), id LIMIT 1`,
+    [businessId]
+  );
+  await applyContactUpdate(businessId, head.rows[0] ? String(head.rows[0].id) : null, plan);
 
   logger.info(`[SuperAdmin] Establishment details updated for business ${businessId}`);
   return getBusinessDetail(businessId);

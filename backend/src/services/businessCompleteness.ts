@@ -9,11 +9,16 @@ import { AppError } from '../utils/appError';
  * business's own profile response and the super admin's Company /
  * Establishment Details screen all read it, so "complete" can never
  * mean one thing in one place and something else in another.
+ *
+ * GST IS REQUIRED OF A B2B REGISTRATION ONLY. A B2C business has no GSTIN
+ * by definition, so counting one as missing would leave every B2C account
+ * permanently blocked from ordering. `requiredFor` is what encodes that,
+ * rather than a second list.
  */
 export const MANDATORY_FIELDS = [
   { key: 'establishment_name', label: 'Establishment name' },
   { key: 'establishment_address', label: 'Address' },
-  { key: 'gst_number', label: 'GST number' },
+  { key: 'gst_number', label: 'GST number', requiredFor: 'B2B' },
   { key: 'contact_person_name', label: 'Contact person name' },
   { key: 'mobile_number', label: 'Mobile number' },
   { key: 'email_id', label: 'Email ID' },
@@ -27,18 +32,20 @@ export type MandatoryFieldKey = (typeof MANDATORY_FIELDS)[number]['key'];
  * as a NULL, and treating the two differently is how a "complete"
  * business ends up with a blank GST number.
  *
- * The COALESCE chains mirror businessProfile.getProfile exactly, so a
- * value the profile screen displays is a value this counts as present.
+ * The contact fields come from `business_users`, which since migration 031
+ * is the only place a contact lives. `MIN(...)` over the business's rows
+ * answers "does this business have a contact person at all", which is what
+ * completeness is asking; the profile screens show the specific row.
  */
 const PRESENCE_SQL = `
   SELECT b.id,
+         b.registration_type,
          COALESCE(NULLIF(TRIM(b.establishment_name), ''), NULLIF(TRIM(b.name), ''))            AS establishment_name,
          COALESCE(NULLIF(TRIM(b.establishment_address), ''), NULLIF(TRIM(b.address), ''))      AS establishment_address,
          NULLIF(TRIM(b.gst_number), '')                                                        AS gst_number,
-         NULLIF(TRIM(b.contact_person_name), '')                                               AS contact_person_name,
-         COALESCE(NULLIF(TRIM(b.mobile_number), ''), MIN(NULLIF(TRIM(bu.mobile_number), '')))  AS mobile_number,
-         COALESCE(NULLIF(TRIM(b.email_id), ''), NULLIF(TRIM(b.email), ''),
-                  MIN(NULLIF(TRIM(bu.email), '')))                                             AS email_id
+         MIN(NULLIF(TRIM(bu.name), ''))                                                        AS contact_person_name,
+         MIN(NULLIF(TRIM(bu.mobile_number), ''))                                               AS mobile_number,
+         COALESCE(MIN(NULLIF(TRIM(bu.email), '')), NULLIF(TRIM(b.email), ''))                  AS email_id
     FROM businesses b
     LEFT JOIN business_users bu ON bu.business_id = b.id
    WHERE b.id = ?
@@ -57,7 +64,14 @@ async function getCompleteness(businessId: string): Promise<Completeness> {
     throw new AppError('Business not found', 404);
   }
 
-  const missing = MANDATORY_FIELDS.filter((field) => !row[field.key]).map((field) => ({
+  const registrationType = String(row.registration_type || 'B2B').toUpperCase();
+
+  const missing = MANDATORY_FIELDS.filter((field) => {
+    // A field scoped to one registration type is simply not asked of the
+    // other; it is not "missing", it does not apply.
+    if ('requiredFor' in field && field.requiredFor !== registrationType) return false;
+    return !row[field.key];
+  }).map((field) => ({
     key: field.key,
     label: field.label,
   }));

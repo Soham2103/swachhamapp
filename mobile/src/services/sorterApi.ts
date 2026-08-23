@@ -9,13 +9,29 @@ import { ApiResponse } from '../types';
  */
 
 /** The three stages the Sorter works with, in workflow order. */
-export type SorterStage = 'confirmed' | 'accepted' | 'ready' | 'out_for_delivery';
+/**
+ * `partially_completed` is an OUTCOME, never a request: an order reaches it by
+ * having pending items, and the server refuses it as a target.
+ */
+export type SorterStage =
+  | 'confirmed'
+  | 'accepted'
+  | 'ready'
+  | 'partially_completed'
+  | 'out_for_delivery';
 
 export interface SorterOrderSummary {
   id: string;
   order_number: string;
   customer_name: string;
+  /** The number to CALL about this job -- the account's own. */
   customer_contact: string | null;
+  /**
+   * The number the order was PLACED ON (`orders.placed_by_mobile`) -- what
+   * passed OTP for that session. What the Order Confirmation PDF prints, and
+   * a different question from `customer_contact`. NULL for older orders.
+   */
+  placed_by_mobile: string | null;
   laundry_type: string | null;
   order_type: string | null;
   /** The raw pipeline status, e.g. ORDER_PLACED. */
@@ -68,17 +84,144 @@ export interface SorterOrderItem {
   /** The laundry service for this line; null when it cannot be resolved. */
   laundry_service_name: string | null;
   category_name: string | null;
+  /** The BILLABLE quantity: original_quantity - defective_quantity. */
   quantity: number;
+  /** The pieces the order was placed for. The PHYSICAL count. */
+  original_quantity: number;
+  /** Pieces found damaged. 0 until an adjustment is recorded. */
+  defective_quantity: number;
+  /**
+   * Where this line stands on its own, derived from the quantities below.
+   *
+   * Holding pieces back is NOT the same as finding them defective — pieces
+   * can be pending with nothing wrong with them, and pending never moves an
+   * amount.
+   */
+  item_status: ItemStatus;
+  /** Pieces being held back for more processing. */
+  pending_quantity: number;
+  /** ordered - pending: the pieces going out with the next dispatch. */
+  delivery_quantity: number;
+  /** Why they are being held, when they are. */
+  pending_reason: string | null;
   unit: string;
   weight_kg: number | null;
   total_weight_kg: number;
 }
 
+/**
+ * Derived from the quantities, never chosen: READY when nothing is held,
+ * PENDING when every piece is, PARTIALLY_PENDING in between.
+ */
+export type ItemStatus = 'PROCESSING' | 'READY' | 'PARTIALLY_PENDING' | 'PENDING';
+
+/**
+ * One recorded defective-piece adjustment, as the Sorter is allowed to see it.
+ *
+ * NO PRICE FIELDS, and not because they are hidden here — the Sorter
+ * endpoints do not send them. The backend still calculates the line amount,
+ * the order total and the payment position, and still stores them; the shop
+ * floor's job is pieces, and what those pieces are worth is a billing
+ * question it has no decision resting on.
+ */
+export interface OrderItemAdjustment {
+  id: string;
+  order_id: string;
+  order_item_id: string;
+  item_name: string;
+  original_quantity: number;
+  previous_defective_quantity: number;
+  defective_quantity: number;
+  final_quantity: number;
+  reason: string | null;
+  adjusted_by: string | null;
+  adjusted_by_name: string | null;
+  adjusted_at: string;
+}
+
+/** One attempt to tell the customer about an adjustment. */
+export interface AdjustmentNotification {
+  id: string;
+  order_id: string;
+  last_adjustment_id: string | null;
+  status: 'PENDING' | 'SENT' | 'FAILED';
+  sent_to: string | null;
+  message_id: string | null;
+  error: string | null;
+  template_name: string | null;
+  sent_at: string | null;
+  created_at: string;
+}
+
+/**
+ * Where the money stands after an adjustment. Computed by the server and
+ * never written: an adjustment does not touch a payment record.
+ */
 export interface SorterOrderDetail extends SorterOrderSummary {
   items: SorterOrderItem[];
   confirmation_pdf_url: string | null;
   /** Newest first. */
   defects: DefectRecord[];
+  /** Newest first. */
+  adjustments: OrderItemAdjustment[];
+  adjustment_notifications: AdjustmentNotification[];
+  has_adjustment: boolean;
+  /** True when any piece anywhere on the order is being held back. */
+  has_pending_items: boolean;
+  /** Pieces held, and pieces going out, across the whole order. */
+  pending_quantity: number;
+  delivery_quantity: number;
+}
+
+/** What comes back after saving a defective quantity. Pieces, no money. */
+export interface AdjustmentResult {
+  order_id: string;
+  order_number: string;
+  item: {
+    id: string;
+    item_name: string;
+    original_quantity: number;
+    defective_quantity: number;
+    final_quantity: number;
+    weight_kg: number | null;
+    total_weight_kg: number | null;
+  };
+  adjustment: OrderItemAdjustment;
+}
+
+/** What comes back after a stage change. */
+export interface StatusResult {
+  id: string;
+  order_number: string;
+  status: string;
+  stage: SorterStage;
+  /** Pieces held back and pieces going out, across the order. */
+  pending_quantity: number;
+  delivery_quantity: number;
+  /** The per-line split, for the summary the Sorter confirms against. */
+  items: ItemSplit[];
+}
+
+/** The split for one line, as the server calculated it. */
+export interface ItemSplit {
+  id: string;
+  item_name: string;
+  ordered_quantity: number;
+  pending_quantity: number;
+  /** ordered - pending. Computed by the server; never sent to it. */
+  delivery_quantity: number;
+  item_status: ItemStatus;
+}
+
+/** What comes back after changing how many pieces of one line are held. */
+export interface ItemPendingResult {
+  order_id: string;
+  order_number: string;
+  order_status: string;
+  item: ItemSplit;
+  /** Across the whole order, after this change. */
+  pending_quantity: number;
+  delivery_quantity: number;
 }
 
 export interface SorterQueue {
@@ -107,8 +250,14 @@ export interface Garment {
 export interface ScanStatus {
   order_id: string;
   order_number: string;
+  /**
+   * Acceptance counts every piece the order was placed for;
+   * `expected_delivery_count` counts only the pieces leaving with this
+   * dispatch. They are equal unless the Sorter is holding some back.
+   */
   status: string;
   expected_count: number;
+  expected_delivery_count: number;
   acceptance_scanned: number;
   delivery_scanned: number;
   acceptance_matched: boolean;
@@ -186,11 +335,29 @@ export const sorterApi = {
    */
   updateStatus: async (
     orderId: string,
-    status: Exclude<SorterStage, 'confirmed'>
-  ): Promise<ApiResponse<{ id: string; order_number: string; status: string; stage: SorterStage }>> => {
-    const response = await apiClient.patch<
-      ApiResponse<{ id: string; order_number: string; status: string; stage: SorterStage }>
-    >(`/api/sorter/orders/${orderId}/status`, { status });
+    status: Exclude<SorterStage, 'confirmed' | 'partially_completed'>,
+    /**
+     * The answer to "are there any pending items in this order?", sent with
+     * the `ready` step.
+     *
+     *   omitted        the question was not asked; item statuses are untouched
+     *                  and the order completes exactly as it always has.
+     *   { itemIds: [] }        "No, all items completed"
+     *   { itemIds: [...] }     "Yes, pending items" — those are held back and
+     *                          the order becomes PARTIALLY_COMPLETED so the
+     *                          ready items can still go.
+     *
+     * Omitting it and sending an empty list mean different things, so the
+     * field is only included when the question was actually answered.
+     */
+    pending?: { items: Array<{ orderItemId: string; pendingQuantity: number }>; reason?: string }
+  ): Promise<ApiResponse<StatusResult>> => {
+    const response = await apiClient.patch<ApiResponse<StatusResult>>(
+      `/api/sorter/orders/${orderId}/status`,
+      pending === undefined
+        ? { status }
+        : { status, pendingItems: pending.items, pendingReason: pending.reason },
+    );
     return response.data;
   },
 
@@ -299,6 +466,104 @@ export const sorterApi = {
       // guard carries no record and is rethrown as an error.
       const saved = defectFromFailure(error);
       if (saved) return saved;
+      throw error;
+    }
+  },
+
+  /* ---- Defective piece adjustment ---- */
+
+  /**
+   * Records the defective quantity for ONE line and re-prices the order.
+   *
+   * The body carries a quantity and a reason and NOTHING ELSE. The price is
+   * read from the order line on the server, inside the transaction, so this
+   * call cannot change what an item costs — only how many pieces are billed.
+   *
+   * The new figure REPLACES the previous one rather than adding to it, so
+   * correcting 2 to 3 leaves 3 defective and not 5.
+   */
+  adjustDefectiveQuantity: async (
+    orderId: string,
+    orderItemId: string,
+    defectiveQuantity: number,
+    reason?: string
+  ): Promise<ApiResponse<AdjustmentResult>> => {
+    const response = await apiClient.patch<ApiResponse<AdjustmentResult>>(
+      `/api/sorter/orders/${orderId}/items/${orderItemId}/defective`,
+      { defectiveQuantity, reason: reason || undefined }
+    );
+    return response.data;
+  },
+
+  /** Every adjustment on an order, the notifications sent, and the money position. */
+  getAdjustments: async (
+    orderId: string
+  ): Promise<
+    ApiResponse<{
+      adjustments: OrderItemAdjustment[];
+      notifications: AdjustmentNotification[];
+    }>
+  > => {
+    const response = await apiClient.get<
+      ApiResponse<{
+        adjustments: OrderItemAdjustment[];
+        notifications: AdjustmentNotification[];
+      }>
+    >(`/api/sorter/orders/${orderId}/adjustments`);
+    return response.data;
+  },
+
+  /* ---- Pending items / partial completion ---- */
+
+  /**
+   * Sets how many PIECES of one line are being held.
+   *
+   * `0` releases the line: the Sorter has finished the held pieces, so the
+   * whole line goes with the next dispatch and the order returns to
+   * READY_FOR_DELIVERY once nothing anywhere on it is held.
+   *
+   * It REPLACES rather than accumulates — sending 2 after 3 leaves 2 held.
+   *
+   * Nothing financial moves: holding pieces back or releasing them does not
+   * touch price, billed quantity, invoice or payment.
+   */
+  setItemPendingQuantity: async (
+    orderId: string,
+    orderItemId: string,
+    pendingQuantity: number,
+    reason?: string
+  ): Promise<ApiResponse<ItemPendingResult>> => {
+    const response = await apiClient.patch<ApiResponse<ItemPendingResult>>(
+      `/api/sorter/orders/${orderId}/items/${orderItemId}/pending`,
+      { pendingQuantity, reason: reason || undefined }
+    );
+    return response.data;
+  },
+
+  /**
+   * Tells the customer or business about the adjustment.
+   *
+   * A SEPARATE action from saving, so correcting a figure three times does
+   * not send three messages. A second send for the same adjustment is refused
+   * with 409; recording a new defective quantity makes one allowed again.
+   */
+  sendAdjustmentWhatsApp: async (
+    orderId: string,
+    force = false
+  ): Promise<ApiResponse<AdjustmentNotification>> => {
+    try {
+      const response = await apiClient.post<ApiResponse<AdjustmentNotification>>(
+        `/api/sorter/orders/${orderId}/defective-notification`,
+        { force },
+        { timeout: 60000 }
+      );
+      return response.data;
+    } catch (error: any) {
+      // A refused send comes back 502 WITH the record, so the screen can show
+      // the real reason Meta gave. The 409 duplicate guard carries no record
+      // and is rethrown for the caller to surface as a message.
+      const body = error?.response?.data;
+      if (error?.response?.status === 502 && body?.data) return body;
       throw error;
     }
   },

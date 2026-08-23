@@ -9,18 +9,26 @@ import { Ionicons } from '@expo/vector-icons';
 import { COLORS, SPACING } from '../../constants/theme';
 import { sa } from './styles';
 import { Pill } from './SuperAdminApprovalsScreen';
-import BusinessMobilesSection from './BusinessMobilesSection';
 import superAdminApi, { BusinessDetail } from '../../services/superAdminApi';
+import { downloadBusinessProfilePdf } from '../../utils/businessProfilePdf';
 
-/** The six the server refuses to let a business order without. */
+/**
+ * What the server refuses to let a business order without.
+ *
+ * `gst_number` is on the list for a B2B registration ONLY. A B2C account has
+ * no GSTIN by definition, so marking it required there would put a red
+ * asterisk on a field the server does not ask for -- and the server, which
+ * returns `missing_fields`, is the authority either way.
+ */
 const MANDATORY = [
   'establishment_name',
   'establishment_address',
-  'gst_number',
   'contact_person_name',
   'mobile_number',
   'email_id',
 ];
+
+const B2B_ONLY_MANDATORY = ['gst_number'];
 
 /**
  * Company / Establishment Details, as the super admin sees it.
@@ -33,6 +41,9 @@ const MANDATORY = [
  * The server is the authority on what is missing -- this screen renders
  * `missing_fields` from the API rather than deciding for itself, so the
  * two can never disagree.
+ *
+ * PRINT PDF lives on this page, not on the business list. The document is one
+ * business's profile, so the action belongs where that profile is on screen.
  */
 export default function SuperAdminBusinessDetailsScreen({ navigation, route }: any) {
   const businessId: string = route.params.businessId;
@@ -41,6 +52,7 @@ export default function SuperAdminBusinessDetailsScreen({ navigation, route }: a
   const [form, setForm] = useState<Record<string, string>>({});
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
+  const [printing, setPrinting] = useState(false);
   const [error, setError] = useState('');
 
   const load = useCallback(async () => {
@@ -71,6 +83,32 @@ export default function SuperAdminBusinessDetailsScreen({ navigation, route }: a
 
   const isMissing = (key: string) =>
     !!detail?.missing_fields?.some((f) => f.key === key);
+
+  /**
+   * Print PDF, for the business currently on screen.
+   *
+   * The document is built on the server from this one business's record, so
+   * what is printed is what is stored rather than what this form happens to
+   * be showing — an unsaved edit is not in it.
+   */
+  const printPdf = async () => {
+    setPrinting(true);
+    try {
+      const result = await downloadBusinessProfilePdf(
+        businessId,
+        detail?.business_name || 'Business'
+      );
+      if (!result.shared) {
+        Alert.alert('PDF saved', `Saved to ${result.uri}`);
+      }
+    } catch (e: any) {
+      Alert.alert('Could not generate PDF', e?.response?.data?.message || e.message);
+    } finally {
+      setPrinting(false);
+    }
+  };
+
+  const isB2B = (detail?.registration_type || 'B2B') === 'B2B';
 
   const save = async () => {
     setSaving(true);
@@ -114,7 +152,9 @@ export default function SuperAdminBusinessDetailsScreen({ navigation, route }: a
     serverKey: string,
     opts: { keyboardType?: any; autoCapitalize?: any; multiline?: boolean } = {}
   ) => {
-    const mandatory = MANDATORY.includes(serverKey);
+    const mandatory =
+      MANDATORY.includes(serverKey) ||
+      (isB2B && B2B_ONLY_MANDATORY.includes(serverKey));
     const missing = isMissing(serverKey);
     return (
       <View key={key}>
@@ -155,6 +195,10 @@ export default function SuperAdminBusinessDetailsScreen({ navigation, route }: a
         <ScrollView contentContainerStyle={sa.scroll} keyboardShouldPersistTaps="handled">
           <View style={sa.card}>
             <Text style={sa.cardTitle}>{detail?.business_name}</Text>
+            <Text style={sa.cardMeta}>
+              {detail?.registration_type || 'B2B'} registration
+              {isB2B ? '' : ' — no GST number is collected for a B2C account'}
+            </Text>
             <Pill status={detail?.status || 'ACTIVE'} />
           </View>
 
@@ -185,7 +229,12 @@ export default function SuperAdminBusinessDetailsScreen({ navigation, route }: a
 
           {field('Establishment name', 'establishmentName', 'establishment_name')}
           {field('Address', 'establishmentAddress', 'establishment_address', { multiline: true })}
-          {field('GST number', 'gstNumber', 'gst_number', { autoCapitalize: 'characters' })}
+          {/* Shown for a B2B record only. The registration type itself is
+              changed on the full Business form, where switching to B2C also
+              clears the GSTIN server-side. */}
+          {isB2B
+            ? field('GST number', 'gstNumber', 'gst_number', { autoCapitalize: 'characters' })
+            : null}
           {field('Contact person name', 'contactPersonName', 'contact_person_name')}
           {field('Mobile number', 'mobileNumber', 'mobile_number', { keyboardType: 'number-pad' })}
           {field('Email ID', 'emailId', 'email_id', {
@@ -193,11 +242,36 @@ export default function SuperAdminBusinessDetailsScreen({ navigation, route }: a
             autoCapitalize: 'none',
           })}
 
-          {/* The Mobile number field above is the business's primary
-              contact; every other number it answers on lives here. */}
-          <View style={{ marginTop: SPACING.lg }}>
-            <BusinessMobilesSection businessId={businessId} />
-          </View>
+          {/* Every other number this business answers on is an alternative
+              contact, edited on the full Business form rather than as a bare
+              list of digits: a number with no name and no login switch is not
+              something the Super Admin can act on. */}
+          <TouchableOpacity
+            style={[sa.buttonGhost, { marginTop: SPACING.lg }]}
+            onPress={() => navigation.navigate('SuperAdminEditBusiness', { businessId })}
+          >
+            <Text style={sa.buttonGhostText}>Edit full business record & contacts</Text>
+          </TouchableOpacity>
+
+          {/* Print PDF lives here, on the page showing the profile it prints.
+              It reads the SAVED record, so it is offered whether or not the
+              form above has unsaved edits — and prints the stored one. */}
+          <TouchableOpacity
+            style={[sa.buttonGhost, printing && sa.buttonDisabled]}
+            onPress={printPdf}
+            disabled={printing}
+            accessibilityRole="button"
+            accessibilityLabel={`Print the business profile PDF for ${detail?.business_name || 'this business'}`}
+          >
+            {printing ? (
+              <ActivityIndicator color={COLORS.Primary} />
+            ) : (
+              <View style={{ flexDirection: 'row', alignItems: 'center', gap: SPACING.xs }}>
+                <Ionicons name="print-outline" size={18} color={COLORS.Primary} />
+                <Text style={sa.buttonGhostText}>Print PDF</Text>
+              </View>
+            )}
+          </TouchableOpacity>
 
           <Text style={[sa.label, { marginTop: 24 }]}>OPTIONAL</Text>
           {field('PAN number', 'panNumber', 'pan_number', { autoCapitalize: 'characters' })}

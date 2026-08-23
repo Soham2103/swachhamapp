@@ -49,10 +49,25 @@ export const LAUNDRY_TYPE_REQUIRED_MESSAGE = 'Please select Hotel Laundry or Gue
 
 export const CART_EMPTY_MESSAGE = 'Add at least one item to your cart before placing your order.';
 
-/** The three things the Time Slot page must have before an order is sent. */
-export const DAY_REQUIRED_MESSAGE = 'Please select a day.';
+/**
+ * The four things the Pickup & Delivery page must have before an order is
+ * sent. The same wording comes back from the server when a request that
+ * skipped the screen is refused, so a rejection reads identically wherever
+ * the user meets it.
+ */
+export const PICKUP_DATE_REQUIRED_MESSAGE = 'Please select a pickup date.';
 export const PICKUP_TIME_REQUIRED_MESSAGE = 'Please select a pickup time.';
+export const DELIVERY_DATE_REQUIRED_MESSAGE = 'Please select a delivery date.';
 export const DELIVERY_TIME_REQUIRED_MESSAGE = 'Please select a delivery time.';
+
+/**
+ * Shown when Continue is pressed without a complete pickup. Only the pickup
+ * can block Continue -- the delivery may be left for later.
+ */
+export const SCHEDULE_REQUIRED_MESSAGE = 'Please select pickup date and time.';
+
+/** The delivery day must be strictly later than the pickup day. */
+export const DELIVERY_AFTER_PICKUP_MESSAGE = 'Delivery date must be after pickup date.';
 
 interface BusinessOrderState {
   laundryType: LaundryType | null;
@@ -228,9 +243,23 @@ export const useBusinessOrderStore = create<BusinessOrderState>((set, get) => ({
     if (!laundryType) throw new Error(LAUNDRY_TYPE_REQUIRED_MESSAGE);
     // The server refuses an unscheduled order too; this stops the request
     // being sent at all.
-    if (!schedule?.pickupDate) throw new Error(DAY_REQUIRED_MESSAGE);
+    if (!schedule?.pickupDate) throw new Error(PICKUP_DATE_REQUIRED_MESSAGE);
     if (!schedule?.pickupSlot) throw new Error(PICKUP_TIME_REQUIRED_MESSAGE);
-    if (!schedule?.deliverySlot) throw new Error(DELIVERY_TIME_REQUIRED_MESSAGE);
+
+    // Delivery is OPTIONAL, but all-or-nothing: an order may be placed with
+    // the pickup alone and the delivery arranged later, yet half a delivery
+    // is a mistake rather than a choice.
+    if (schedule.deliveryDate && !schedule.deliverySlot) {
+      throw new Error(DELIVERY_TIME_REQUIRED_MESSAGE);
+    }
+    if (!schedule.deliveryDate && schedule.deliverySlot) {
+      throw new Error(DELIVERY_DATE_REQUIRED_MESSAGE);
+    }
+    // Checked here as well as on the screen, so a caller that builds its own
+    // schedule object cannot slip a same-day delivery past the store.
+    if (schedule.deliveryDate && schedule.deliveryDate <= schedule.pickupDate) {
+      throw new Error(DELIVERY_AFTER_PICKUP_MESSAGE);
+    }
 
     try {
       set({ isPlacingOrder: true });

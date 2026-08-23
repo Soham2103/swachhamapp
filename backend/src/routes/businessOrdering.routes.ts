@@ -1,6 +1,10 @@
 import { Router, Request, Response, NextFunction } from 'express';
 import { logger } from '../utils/logger';
-import { PICKUP_SLOTS, resolveSchedule } from '../services/pickupSlot.service';
+import {
+  getSlotsForDate,
+  slotStartMinutes,
+  resolveSchedule,
+} from '../services/pickupSlot.service';
 import {
   getMainCategories,
   getSubCategories,
@@ -8,6 +12,7 @@ import {
   searchItems,
   getServiceCategory,
   getServiceTypes,
+  PriceScope,
 } from '../services/businessCatalog.service';
 import {
   getCart,
@@ -20,6 +25,7 @@ import {
 import { getNearbyStores } from '../services/store.service';
 import {
   createOrder,
+  scheduleDelivery,
   getOrders,
   getOrderById,
   getOrderTracking,
@@ -27,12 +33,6 @@ import {
   cancelOrder,
 } from '../services/businessOrder.service';
 import { getProfile, updateProfile, getOwnedBusinessId } from '../services/businessProfile.service';
-import {
-  listMobiles,
-  addMobile,
-  removeMobile,
-  setPrimary,
-} from '../services/businessMobiles.service';
 import { sendSuccess } from '../utils/response';
 import { query } from '../config/database';
 import { AppError } from '../utils/appError';
@@ -77,14 +77,29 @@ router.use(async (req: Request, res: Response, next: NextFunction) => {
 // ---- Pickup scheduling ----
 
 /**
- * The pickup slots the app offers. Served from the same list that validates
- * an order, so the buttons on screen and the rule on the server cannot drift.
+ * The slots the app offers, for pickup and for delivery alike.
+ *
+ * Served from the same list that validates an order, so the buttons on screen
+ * and the rule on the server cannot drift.
+ *
+ * `?date=YYYY-MM-DD` marks each slot available or not FOR THAT DAY, decided
+ * in the business timezone: on today, a slot whose start has already passed
+ * comes back `available: false`. Without the parameter every slot is returned
+ * as available, which is the plain working-day list.
  */
-router.get('/time-slots', async (_req: Request, res: Response, next: NextFunction) => {
+router.get('/time-slots', async (req: Request, res: Response, next: NextFunction) => {
   try {
+    const slots = await getSlotsForDate(req.query.date);
     sendSuccess(
       res,
-      PICKUP_SLOTS.map((slot) => ({ id: slot.id, label: slot.label })),
+      slots.map((slot) => ({
+        id: slot.id,
+        label: slot.label,
+        // Minutes since midnight, so the app can apply the same cutoff
+        // between polls without re-fetching.
+        start_minutes: slotStartMinutes(slot),
+        available: slot.available,
+      })),
       'Time slots fetched successfully'
     );
   } catch (error) {
@@ -114,59 +129,45 @@ router.put('/profile', async (req: Request, res: Response, next: NextFunction) =
   }
 });
 
-// ---- The business's own mobile numbers ----
-//
-// A business manages its own list, but only within the allowance the
-// super admin set; raising that limit is not something it can do to
-// itself.
-
-router.get('/profile/mobiles', async (req: Request, res: Response, next: NextFunction) => {
-  try {
-    const authReq = req as AuthenticatedRequest;
-    const businessId = await getOwnedBusinessId(authReq.user!.id);
-    sendSuccess(res, await listMobiles(businessId), 'Mobile numbers fetched successfully');
-  } catch (error) {
-    next(error);
-  }
-});
-
-router.post('/profile/mobiles', async (req: Request, res: Response, next: NextFunction) => {
-  try {
-    const authReq = req as AuthenticatedRequest;
-    const businessId = await getOwnedBusinessId(authReq.user!.id);
-    const result = await addMobile(businessId, req.body, authReq.user!.id);
-    sendSuccess(res, result, result.warning || 'Mobile number added', 201);
-  } catch (error) {
-    next(error);
-  }
-});
-
-router.delete('/profile/mobiles/:mobileId', async (req: Request, res: Response, next: NextFunction) => {
-  try {
-    const authReq = req as AuthenticatedRequest;
-    const businessId = await getOwnedBusinessId(authReq.user!.id);
-    sendSuccess(res, await removeMobile(businessId, req.params.mobileId), 'Mobile number removed');
-  } catch (error) {
-    next(error);
-  }
-});
-
-router.patch('/profile/mobiles/primary', async (req: Request, res: Response, next: NextFunction) => {
-  try {
-    const authReq = req as AuthenticatedRequest;
-    const businessId = await getOwnedBusinessId(authReq.user!.id);
-    sendSuccess(
-      res,
-      await setPrimary(businessId, req.body?.mobile_number),
-      'Primary mobile number updated'
-    );
-  } catch (error) {
-    next(error);
-  }
-});
-
-
 // ---- Laundry service structure ----
+
+/**
+ * Which business is browsing, and at which rate.
+ *
+ * The business comes from the authenticated token — never a query parameter,
+ * so one business cannot browse another's catalogue. The laundry type comes
+ * from the cart the user has already set up; `?laundryType=` is accepted as
+ * an override for the case where the catalogue is browsed before the cart
+ * context is chosen, and is validated against the enum.
+ *
+ * Defaults to 'hotel', which is the type an order carries when nothing else
+ * has been said.
+ */
+async function priceScope(req: Request): Promise<PriceScope> {
+  const authReq = req as AuthenticatedRequest;
+  const owner = await query<{ business_id: string }>(
+    `SELECT business_id FROM business_users WHERE id = ?`,
+    [authReq.user!.id]
+  );
+  if (!owner.rows[0]) {
+    throw new AppError('Business account not found', 404);
+  }
+
+  const requested = String(req.query.laundryType ?? '').trim().toLowerCase();
+  if (requested === 'hotel' || requested === 'guest') {
+    return { businessId: String(owner.rows[0].business_id), laundryType: requested };
+  }
+
+  const cart = await query<{ laundry_type: string | null }>(
+    `SELECT laundry_type FROM carts WHERE business_user_id = ?`,
+    [authReq.user!.id]
+  );
+  const fromCart = cart.rows[0]?.laundry_type;
+  return {
+    businessId: String(owner.rows[0].business_id),
+    laundryType: fromCart === 'guest' ? 'guest' : 'hotel',
+  };
+}
 
 router.get('/services', async (req: Request, res: Response, next: NextFunction) => {
   try {
@@ -179,7 +180,10 @@ router.get('/services', async (req: Request, res: Response, next: NextFunction) 
 
 router.get('/categories', async (req: Request, res: Response, next: NextFunction) => {
   try {
-    const categories = await getMainCategories(req.query.serviceType as string | undefined);
+    const categories = await getMainCategories(
+      await priceScope(req),
+      req.query.serviceType as string | undefined
+    );
     sendSuccess(res, categories, 'Categories fetched successfully');
   } catch (error) {
     next(error);
@@ -190,6 +194,7 @@ router.get('/categories/:categoryId/subcategories', async (req: Request, res: Re
   try {
     const subcategories = await getSubCategories(
       req.params.categoryId,
+      await priceScope(req),
       req.query.serviceType as string | undefined
     );
     sendSuccess(res, subcategories, 'Sub-categories fetched successfully');
@@ -202,6 +207,7 @@ router.get('/categories/:categoryId/items', async (req: Request, res: Response, 
   try {
     const items = await getItemsByCategory(
       req.params.categoryId,
+      await priceScope(req),
       req.query.serviceType as string | undefined
     );
     sendSuccess(res, items, 'Items fetched successfully');
@@ -218,6 +224,7 @@ router.get('/items', async (req: Request, res: Response, next: NextFunction) => 
       search: req.query.search as string | undefined,
       categoryId: req.query.categoryId as string | undefined,
       serviceType: req.query.serviceType as string | undefined,
+      scope: await priceScope(req),
     });
     sendSuccess(res, items, 'Items fetched successfully');
   } catch (error) {
@@ -343,6 +350,26 @@ router.get('/orders/:orderId/tracking', async (req: Request, res: Response, next
   }
 });
 
+/**
+ * PATCH /api/businesses/orders/:orderId/delivery   { deliveryDate, deliverySlot }
+ *
+ * Books the delivery for an order placed with the pickup alone. Both fields
+ * are required here — this call exists to schedule a delivery — and the
+ * server checks them against the pickup stored on the order.
+ */
+router.patch('/orders/:orderId/delivery', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const authReq = req as AuthenticatedRequest;
+    const result = await scheduleDelivery(authReq.user!.id, req.params.orderId, {
+      deliveryDate: req.body?.deliveryDate,
+      deliverySlot: req.body?.deliverySlot,
+    });
+    sendSuccess(res, result, 'Delivery scheduled successfully');
+  } catch (error) {
+    next(error);
+  }
+});
+
 router.post('/orders/:orderId/repeat', async (req: Request, res: Response, next: NextFunction) => {
   try {
     const authReq = req as AuthenticatedRequest;
@@ -387,18 +414,24 @@ router.post('/orders', async (req: Request, res: Response, next: NextFunction) =
     const schedule = await resolveSchedule({
       pickupDate: req.body?.pickupDate,
       pickupSlot: req.body?.pickupSlot,
+      deliveryDate: req.body?.deliveryDate,
       deliverySlot: req.body?.deliverySlot,
       pickupNotes: req.body?.pickupNotes,
       serviceNotes: req.body?.serviceNotes,
     });
     logger.info(
-      `[BusinessOrder] schedule validated: ${schedule.date} pickup ${schedule.pickup.label}, delivery ${schedule.delivery.label}`
+      `[BusinessOrder] schedule validated: pickup ${schedule.pickupDate} ${schedule.pickup.label}, ` +
+        (schedule.deliveryDate && schedule.delivery
+          ? `delivery ${schedule.deliveryDate} ${schedule.delivery.label}`
+          : 'delivery not scheduled yet')
     );
     logger.info('[BusinessOrder] validating cart and creating order');
 
     // Cart validation and the insert both live in the service, inside one
     // transaction; anything invalid throws with its own status code.
-    const order = await createOrder(businessUserId, schedule);
+    // The number this session was proven on, from the verified token -- never
+    // from the request body, which the caller controls.
+    const order = await createOrder(businessUserId, schedule, authReq.user?.mobile);
 
     logger.info(
       `[BusinessOrder] order created: ${order.order_number} (id ${order.id}) for user ${businessUserId}`

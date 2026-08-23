@@ -165,6 +165,10 @@ import { useChatStore } from '../store/chatStore';
 import SignInPasswordScreen from '../screens/auth/SignInPasswordScreen';
 import ServiceCategoryScreen from '../screens/home/ServiceCategoryScreen';
 
+// One screen renders both legal documents; which one is a route param, so
+// neither section needs a stack of its own for them.
+import LegalDocumentScreen from '../screens/legal/LegalDocumentScreen';
+
 // =========================================================
 // SUPER ADMIN SCREENS
 // =========================================================
@@ -174,8 +178,32 @@ import SuperAdminDashboardScreen from '../screens/superadmin/SuperAdminDashboard
 import SuperAdminApprovalsScreen from '../screens/superadmin/SuperAdminApprovalsScreen';
 import SuperAdminBusinessListScreen from '../screens/superadmin/SuperAdminBusinessListScreen';
 import SuperAdminBusinessDetailsScreen from '../screens/superadmin/SuperAdminBusinessDetailsScreen';
-import SuperAdminCreateBusinessScreen from '../screens/superadmin/SuperAdminCreateBusinessScreen';
-import SuperAdminCreateRiderScreen from '../screens/superadmin/SuperAdminCreateRiderScreen';
+import SuperAdminManageBusinessesScreen from '../screens/superadmin/SuperAdminManageBusinessesScreen';
+import SuperAdminBusinessAccountScreen from '../screens/superadmin/SuperAdminBusinessAccountScreen';
+import SuperAdminEditBusinessScreen from '../screens/superadmin/SuperAdminEditBusinessScreen';
+/* SuperAdminCreateBusinessScreen and SuperAdminCreateRiderScreen are gone.
+   A Super Admin no longer creates a business or a rider: a Manager raises a
+   creation request and the Super Admin approves it, which is
+   SuperAdminRequestsScreen below. The routes are removed rather than merely
+   unlinked, so `navigate('SuperAdminCreateBusiness')` cannot reach them from
+   anywhere -- and the endpoints behind them are gone from the server too. */
+import SuperAdminPriceListScreen from '../screens/superadmin/SuperAdminPriceListScreen';
+import SuperAdminCustomerPricesScreen from '../screens/superadmin/SuperAdminCustomerPricesScreen';
+import SuperAdminBusinessPricesScreen from '../screens/superadmin/SuperAdminBusinessPricesScreen';
+import SuperAdminRequestsScreen from '../screens/superadmin/SuperAdminRequestsScreen';
+import SuperAdminManagersScreen from '../screens/superadmin/SuperAdminManagersScreen';
+
+// =========================================================
+// MANAGER SCREENS
+//
+// A Manager proposes; a Super Admin disposes. Nothing in this
+// stack can approve anything — the server would refuse it too.
+// =========================================================
+
+import ManagerDashboardScreen from '../screens/manager/ManagerDashboardScreen';
+import ManagerNewBusinessScreen from '../screens/manager/ManagerNewBusinessScreen';
+import ManagerNewStaffScreen from '../screens/manager/ManagerNewStaffScreen';
+import ManagerRequestsScreen from '../screens/manager/ManagerRequestsScreen';
 
 
 // =========================================================
@@ -302,6 +330,12 @@ function CustomerStack() {
         component={ProfileSetupScreen}
       />
 
+      {/* Privacy Policy / Terms & Conditions, opened from Profile. */}
+      <Stack.Screen
+        name="LegalDocument"
+        component={LegalDocumentScreen}
+      />
+
       <Stack.Screen
         name="AddressList"
         component={AddressListScreen}
@@ -395,6 +429,9 @@ function BusinessProfileStack() {
       <Stack.Screen name="BusinessProfileScreen" component={BusinessProfileScreen} />
       <Stack.Screen name="BusinessProfileDetailsScreen" component={BusinessProfileDetailsScreen} />
       <Stack.Screen name="StoreLocatorScreen" component={StoreLocatorScreen} />
+      {/* Same screen as the customer section registers, pushed onto this
+          stack so it keeps the Business tab bar and its own back behaviour. */}
+      <Stack.Screen name="LegalDocument" component={LegalDocumentScreen} />
     </Stack.Navigator>
   );
 }
@@ -452,6 +489,29 @@ function BusinessTabs() {
 // everything else is opened from it and closed again.
 // =========================================================
 
+/**
+ * The Manager section.
+ *
+ * One stack, like the Super Admin's: a dashboard that everything else opens
+ * from and closes back to. There is no tab bar because there are four
+ * destinations and they are all tasks, not places.
+ */
+function ManagerStack() {
+  return (
+    <Stack.Navigator
+      initialRouteName="ManagerDashboard"
+      screenOptions={{ headerShown: false }}
+    >
+      <Stack.Screen name="ManagerDashboard" component={ManagerDashboardScreen} />
+      <Stack.Screen name="ManagerNewBusiness" component={ManagerNewBusinessScreen} />
+      {/* Rider and sorter share a screen; `kind` says which. */}
+      <Stack.Screen name="ManagerNewStaff" component={ManagerNewStaffScreen} />
+      <Stack.Screen name="ManagerRequests" component={ManagerRequestsScreen} />
+    </Stack.Navigator>
+  );
+}
+
+
 function SuperAdminStack() {
   return (
     <Stack.Navigator
@@ -462,8 +522,16 @@ function SuperAdminStack() {
       <Stack.Screen name="SuperAdminApprovals" component={SuperAdminApprovalsScreen} />
       <Stack.Screen name="SuperAdminBusinessList" component={SuperAdminBusinessListScreen} />
       <Stack.Screen name="SuperAdminBusinessDetails" component={SuperAdminBusinessDetailsScreen} />
-      <Stack.Screen name="SuperAdminCreateBusiness" component={SuperAdminCreateBusinessScreen} />
-      <Stack.Screen name="SuperAdminCreateRider" component={SuperAdminCreateRiderScreen} />
+      <Stack.Screen name="SuperAdminManageBusinesses" component={SuperAdminManageBusinessesScreen} />
+      <Stack.Screen name="SuperAdminBusinessAccount" component={SuperAdminBusinessAccountScreen} />
+      <Stack.Screen name="SuperAdminEditBusiness" component={SuperAdminEditBusinessScreen} />
+      {/* Price List: the menu, then one screen per list. */}
+      <Stack.Screen name="SuperAdminPriceList" component={SuperAdminPriceListScreen} />
+      <Stack.Screen name="SuperAdminCustomerPrices" component={SuperAdminCustomerPricesScreen} />
+      <Stack.Screen name="SuperAdminBusinessPrices" component={SuperAdminBusinessPricesScreen} />
+      {/* Creation requests: one screen, the kind chosen by route param. */}
+      <Stack.Screen name="SuperAdminRequests" component={SuperAdminRequestsScreen} />
+      <Stack.Screen name="SuperAdminManagers" component={SuperAdminManagersScreen} />
     </Stack.Navigator>
   );
 }
@@ -744,6 +812,23 @@ export default function AppNavigator() {
           <Stack.Screen
             name="SuperAdmin"
             component={SuperAdminStack}
+          />
+        )}
+
+
+        {/* =================================================
+            MANAGER APPLICATION
+
+            Signs in through the same password flow as the
+            other staff roles; the role decides which stack
+            is mounted, so a Manager cannot navigate into the
+            Super Admin one at all.
+        ================================================= */}
+
+        {isAuthenticated && role === 'manager' && (
+          <Stack.Screen
+            name="Manager"
+            component={ManagerStack}
           />
         )}
 

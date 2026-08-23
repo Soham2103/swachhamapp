@@ -47,20 +47,31 @@ const ROWS: Row[] = [
     subtitle: 'Find the nearest Swachham store',
     onPress: (nav) => nav.navigate('StoreLocatorScreen'),
   },
-  { key: 'privacy', icon: 'shield-checkmark-outline', title: 'Privacy Policy', subtitle: 'Privacy Policy' },
+  {
+    key: 'privacy',
+    icon: 'shield-checkmark-outline',
+    title: 'Privacy Policy',
+    subtitle: 'How Swachham handles your data',
+    onPress: (nav) => nav.navigate('LegalDocument', { document: 'privacy' }),
+  },
   {
     key: 'express',
     icon: 'rocket-outline',
     title: 'Know About Express Service',
     subtitle: 'Express Service',
   },
-  { key: 'terms', icon: 'document-text-outline', title: 'Terms & Conditions', subtitle: 'Term & Condition' },
   {
-    key: 'faq',
-    icon: 'help-circle-outline',
-    title: 'FAQ',
-    subtitle: 'Find answers to common questions and support',
+    key: 'terms',
+    icon: 'document-text-outline',
+    title: 'Terms & Conditions',
+    subtitle: 'The terms you agree to when ordering',
+    onPress: (nav) => nav.navigate('LegalDocument', { document: 'terms' }),
   },
+  /* FAQ was removed from the Business Profile. It had no screen behind it —
+     the row rendered without an `onPress` and did nothing when tapped — and
+     no FAQ content, component or API existed anywhere else in the app, so
+     there is nothing left over to clean up. The customer profile keeps its
+     own list; only the Business one changed. */
   {
     key: 'delete',
     icon: 'trash-outline',
@@ -101,18 +112,26 @@ export default function BusinessProfileScreen({ navigation }: any) {
         <View style={styles.headerCard}>
           {/* Swachham logo, top-left, matching the shared Business header. */}
           <View style={styles.headerTopRow}>
+            {/* Back sits first, where a back control is looked for. It is
+                always offered: Profile is a tab root, so there is usually
+                nothing on its own stack to pop — it then returns to Select
+                Items, the Business section's home. */}
+            <TouchableOpacity
+              style={styles.headerBack}
+              onPress={() =>
+                navigation.canGoBack() ? navigation.goBack() : navigation.navigate('BusinessHome')
+              }
+              accessibilityRole="button"
+              accessibilityLabel="Go back"
+            >
+              <Ionicons name="arrow-back" size={22} color={COLORS.Surface} />
+            </TouchableOpacity>
             <Image
               source={require('../../../assets/swachham-logo.png')}
               style={styles.headerLogo}
               resizeMode="contain"
               accessibilityLabel="Swachham"
             />
-            {/* Profile is a tab root, so only show back when a screen was pushed. */}
-            {navigation.canGoBack() ? (
-              <TouchableOpacity style={styles.headerBack} onPress={() => navigation.goBack()}>
-                <Ionicons name="arrow-back" size={22} color={COLORS.Surface} />
-              </TouchableOpacity>
-            ) : null}
           </View>
 
           {isLoading ? (

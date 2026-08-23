@@ -19,6 +19,15 @@ import { AppError } from '../utils/appError';
  * CUSTOMER-scope rows at all, so these endpoints correctly return an
  * empty catalogue rather than quietly serving hotel items -- pool
  * towels and banquet linen -- to a retail customer.
+ *
+ * PRICE. Every price here comes from `customer_price_list`, the global
+ * customer price list: one row per item, the same figure for every
+ * customer. `services.base_price` is no longer read -- it holds 0.00 /
+ * 1.00 placeholders and was never a price list.
+ *
+ * `business_price_list` is deliberately absent from this file. A
+ * customer endpoint must never see a business's price, so the table is
+ * not joined, not selected and not exposed on any shape below.
  */
 
 const VALID_SCOPES = ['CUSTOMER', 'BUSINESS'];
@@ -57,10 +66,15 @@ export interface Service {
   category_name: string | null;
   name: string;
   description: string | null;
-  /** Null when the catalogue has no price yet, so the client can say
-   *  "price on request" instead of showing a confident zero. */
+  /** The global customer price. Always greater than zero: an item without a
+   *  positive price is not returned by these endpoints at all. */
   price: number | null;
-  discounted_price: number | null;
+  /** The same figure under its explicit name. */
+  customer_price: number | null;
+  /** The struck-through "was" price, when the item has one. */
+  original_price: number | null;
+  /** The laundry services this item supports, e.g. ['wash_iron']. */
+  service_types: string[];
   unit: string;
   image_url: string | null;
   icon_name: string | null;
@@ -77,10 +91,54 @@ export interface ServiceQueryParams {
   scope?: string;
 }
 
-/** `base_price` is 0 across the whole catalogue today, which is not the
- *  same as "free"; it is unpriced. NULLIF keeps that distinction. */
-const PRICE_SELECT = `NULLIF(s.base_price, 0) AS price,
-                      NULLIF(s.discounted_price, 0) AS discounted_price`;
+/** The global customer price, joined in from the customer price list.
+ *  An item with no active row there stays NULL, which the client reads
+ *  as "price on request" rather than as free. */
+const PRICE_SELECT = `cp.customer_price AS price,
+                      cp.customer_price,
+                      cp.original_price`;
+
+/** Joined onto every catalogue query, so one item can never carry two
+ *  different prices depending on which endpoint asked.
+ *
+ *  An INNER JOIN, not a LEFT one: an item with no active customer price is
+ *  not in the catalogue at all. See PRICED_ONLY below. */
+const PRICE_JOIN = `JOIN customer_price_list cp
+                         ON cp.item_id = s.id AND cp.is_active = true`;
+
+/**
+ * ZERO AND MISSING PRICES ARE NOT SHOWN.
+ *
+ * An item a customer cannot be charged for is an item they must not be
+ * offered — a 0 in the price list means "not on sale", not "free". Enforced
+ * HERE, in the query, so the item never reaches the client at all; hiding it
+ * in the UI would still ship the row and still let it be ordered directly.
+ *
+ * The order path enforces the same rule independently, so the two cannot
+ * disagree about what is buyable.
+ */
+const PRICED_ONLY = `cp.customer_price > 0`;
+
+const SERVICE_TYPES_SELECT = `
+            (SELECT GROUP_CONCAT(st.code ORDER BY st.display_order ASC, st.name ASC)
+               FROM item_service_types m
+               JOIN services st ON st.id = m.service_id
+              WHERE m.item_id = s.id AND st.kind = 'SERVICE_TYPE' AND st.is_active = true
+            ) AS service_types`;
+
+interface ServiceQueryRow extends Omit<Service, 'service_types'> {
+  service_types: string | null;
+}
+
+function toService(row: ServiceQueryRow): Service {
+  return {
+    ...row,
+    price: row.price === null ? null : Number(row.price),
+    customer_price: row.customer_price === null ? null : Number(row.customer_price),
+    original_price: row.original_price === null ? null : Number(row.original_price),
+    service_types: (row.service_types || '').split(',').filter(Boolean),
+  };
+}
 
 /** Item categories that actually have something live in them. */
 async function getCategories(scope?: string): Promise<Category[]> {
@@ -90,10 +148,14 @@ async function getCategories(scope?: string): Promise<Category[]> {
   const result = await query<Category>(
     `SELECT c.id, c.name, c.slug, c.description, c.icon_name, c.image_url,
             c.display_order,
-            COUNT(s.id) AS item_count
+            COUNT(cp.id) AS item_count
        FROM service_categories c
        LEFT JOIN services s
               ON s.category_id = c.id AND s.is_active = true AND s.kind = 'ITEM'
+       -- Same rule as the item list: a category whose items are all unpriced
+       -- reports zero and is not offered.
+       LEFT JOIN customer_price_list cp
+              ON cp.item_id = s.id AND cp.is_active = true AND cp.customer_price > 0
       WHERE c.is_active = true
         AND c.kind = 'ITEM_CATEGORY'
         AND c.scope = ?
@@ -110,7 +172,7 @@ async function getServices(
   const resolved = resolveScope(params.scope);
   const { limit, offset, page } = safePaging(params.page, params.limit);
 
-  const conditions = [`s.is_active = true`, `s.kind = 'ITEM'`, `s.scope = ?`];
+  const conditions = [`s.is_active = true`, `s.kind = 'ITEM'`, `s.scope = ?`, PRICED_ONLY];
   const values: unknown[] = [resolved];
 
   if (params.categoryId) {
@@ -125,36 +187,43 @@ async function getServices(
 
   const where = `WHERE ${conditions.join(' AND ')}`;
 
+  // The same join and the same predicate as the listing below: a total that
+  // counted unpriced rows would page over items the caller never receives.
   const countResult = await query<{ total: number }>(
-    `SELECT COUNT(*) AS total FROM services s ${where}`,
+    `SELECT COUNT(*) AS total FROM services s ${PRICE_JOIN} ${where}`,
     values
   );
   const total = Number(countResult.rows[0]?.total || 0);
 
-  const result = await query<Service>(
+  const result = await query<ServiceQueryRow>(
     `SELECT s.id, s.category_id, c.name AS category_name, s.name, s.description,
             ${PRICE_SELECT},
+            ${SERVICE_TYPES_SELECT},
             s.unit, s.image_url, s.icon_name, s.weight_kg, s.is_popular, s.is_active
        FROM services s
        LEFT JOIN service_categories c ON c.id = s.category_id
+       ${PRICE_JOIN}
        ${where}
       ORDER BY s.is_popular DESC, s.display_order ASC, s.name ASC
       LIMIT ${limit} OFFSET ${offset}`,
     values
   );
 
-  return { services: result.rows, total, page, limit };
+  return { services: result.rows.map(toService), total, page, limit };
 }
 
 async function getServiceById(id: string, scope?: string): Promise<Service> {
   const resolved = resolveScope(scope);
-  const result = await query<Service>(
+  const result = await query<ServiceQueryRow>(
     `SELECT s.id, s.category_id, c.name AS category_name, s.name, s.description,
             ${PRICE_SELECT},
+            ${SERVICE_TYPES_SELECT},
             s.unit, s.image_url, s.icon_name, s.weight_kg, s.is_popular, s.is_active
        FROM services s
        LEFT JOIN service_categories c ON c.id = s.category_id
-      WHERE s.id = ? AND s.is_active = true AND s.kind = 'ITEM' AND s.scope = ?`,
+       ${PRICE_JOIN}
+      WHERE s.id = ? AND s.is_active = true AND s.kind = 'ITEM' AND s.scope = ?
+        AND ${PRICED_ONLY}`,
     [id, resolved]
   );
 
@@ -164,24 +233,27 @@ async function getServiceById(id: string, scope?: string): Promise<Service> {
   if (!service) {
     throw new AppError('Service not found', 404);
   }
-  return service;
+  return toService(service);
 }
 
 async function getPopularServices(scope?: string): Promise<Service[]> {
   const resolved = resolveScope(scope);
-  const result = await query<Service>(
+  const result = await query<ServiceQueryRow>(
     `SELECT s.id, s.category_id, c.name AS category_name, s.name, s.description,
             ${PRICE_SELECT},
+            ${SERVICE_TYPES_SELECT},
             s.unit, s.image_url, s.icon_name, s.weight_kg, s.is_popular, s.is_active
        FROM services s
        LEFT JOIN service_categories c ON c.id = s.category_id
+       ${PRICE_JOIN}
       WHERE s.is_active = true AND s.kind = 'ITEM'
         AND s.is_popular = true AND s.scope = ?
+        AND ${PRICED_ONLY}
       ORDER BY s.display_order ASC, s.name ASC
       LIMIT 10`,
     [resolved]
   );
-  return result.rows;
+  return result.rows.map(toService);
 }
 
 export { getCategories, getServices, getServiceById, getPopularServices };

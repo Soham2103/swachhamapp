@@ -236,8 +236,10 @@ export default function BusinessOrderDetailsScreen({ navigation, route }: any) {
             <Text style={styles.cardTitle}>Business Information</Text>
           </View>
           <Row label="Business Name" value={order.business_name} />
-          {/* Loaded from the authenticated Business record, never re-entered. */}
-          <Row label="Mobile Number" value={order.business_mobile || '—'} />
+          {/* The number this order was placed on -- orders.placed_by_mobile,
+              the one that passed OTP for that session. "N/A" for orders from
+              before the field existed rather than a substituted number. */}
+          <Row label="Mobile Number" value={order.placed_by_mobile || 'N/A'} />
           <Row label="Contact Person" value={order.contact_person_name || '—'} />
           <Row label="Address" value={order.business_address || '—'} />
         </View>
@@ -284,6 +286,37 @@ export default function BusinessOrderDetailsScreen({ navigation, route }: any) {
                 <Text style={styles.itemMeta}>
                   Service: {item.laundry_service_name || '—'}
                 </Text>
+                {/*
+                  THE DEFECTIVE ADJUSTMENT, WHEN THERE IS ONE.
+
+                  Read-only, and shown here so the quantity above is never a
+                  stale or unexplained figure: the line bills the FINAL count,
+                  and this says what it was reduced from. Only the Sorter can
+                  record or change it — the server refuses the endpoint to
+                  every other role, so there is nothing to hide here beyond
+                  not offering it.
+                */}
+                {item.defective_quantity > 0 ? (
+                  <Text style={styles.itemAdjust}>
+                    Ordered {item.original_quantity} · Defective{' '}
+                    {item.defective_quantity} · Final {item.quantity}
+                  </Text>
+                ) : null}
+                {/*
+                  WHETHER THIS ITEM HAS GONE, when the order is split.
+
+                  Read-only: only a Sorter can move an item between ready and
+                  pending, through an endpoint this session cannot reach.
+                  Pending is not defective — the item is charged as ordered
+                  and is simply still being worked on.
+                */}
+                {item.pending_quantity > 0 ? (
+                  <Text style={styles.itemPending}>
+                    {item.delivery_quantity > 0
+                      ? `${item.delivery_quantity} sent · ${item.pending_quantity} still being processed`
+                      : `All ${item.pending_quantity} still being processed at Swachham`}
+                  </Text>
+                ) : null}
               </View>
               <Text style={styles.itemWeight}>{formatWeightKg(item.total_weight_kg)}</Text>
             </View>
@@ -452,6 +485,23 @@ const styles = StyleSheet.create({
     color: COLORS.TextPrimary,
   },
   itemMeta: { fontFamily: TYPOGRAPHY.fontFamily, fontSize: TYPOGRAPHY.sizes.sm, color: COLORS.TextSecondary },
+  /* The defective adjustment line under an item. Coloured, because a
+     quantity that changed after the order was placed is worth noticing. */
+  itemAdjust: {
+    fontFamily: TYPOGRAPHY.fontFamily,
+    fontSize: TYPOGRAPHY.sizes.xs,
+    color: COLORS.Error,
+    fontWeight: '600',
+    marginTop: 2,
+  },
+  /* An item the order is still waiting on. */
+  itemPending: {
+    fontFamily: TYPOGRAPHY.fontFamily,
+    fontSize: TYPOGRAPHY.sizes.xs,
+    color: '#8A5200',
+    fontWeight: '600',
+    marginTop: 2,
+  },
   itemWeight: {
     fontFamily: TYPOGRAPHY.fontFamily,
     fontSize: TYPOGRAPHY.sizes.sm,

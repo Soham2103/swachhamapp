@@ -5,6 +5,19 @@ export interface TokenPayload {
   id: string;
   email: string;
   role: string;
+  /**
+   * The mobile number this session was PROVEN on, by OTP.
+   *
+   * For a business it is not necessarily the account's own number: any of the
+   * business's registered contacts may sign in, and each of them proves their
+   * own. It is carried so an action taken in this session can record which
+   * number the person was actually reachable on — an order stamps it, and the
+   * order's documents print it.
+   *
+   * Optional: sessions minted before this existed carry none, and every
+   * reader falls back to the account's number for them.
+   */
+  mobile?: string;
 }
 
 export interface DecodedToken extends JwtPayload, TokenPayload {}
@@ -80,6 +93,18 @@ export interface PreAuthPayload {
   /** The mobile number that actually passed OTP. */
   mobile: string;
   userId: string;
+  /**
+   * The BUSINESS the proven number belongs to, for a business sign-in.
+   *
+   * This is the whole of what an alternative contact's OTP earns them: not an
+   * account, not a password, just "this number belongs to business 25". The
+   * password step then refuses any email whose own business_id is not this
+   * one, which is what stops a contact of one business signing in with
+   * another business's credentials.
+   *
+   * Absent for staff sign-ins, which are bound to `userId` instead.
+   */
+  businessId?: string;
   purpose: 'SUPER_ADMIN_LOGIN';
 }
 

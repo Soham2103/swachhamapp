@@ -2,6 +2,14 @@ import { Asset } from 'expo-asset';
 import * as Print from 'expo-print';
 import * as FileSystem from 'expo-file-system/legacy';
 import { BusinessOrderDetail } from '../services/businessOrderApi';
+import { buildBusinessOrderPdfHtml, buildPdfFileName } from './businessOrderPdfHtml';
+
+/*
+ * The document itself lives in `businessOrderPdfHtml`, which has no Expo
+ * imports and can therefore be built and checked off-device. It is re-exported
+ * here so every existing import of this module keeps working unchanged.
+ */
+export * from './businessOrderPdfHtml';
 
 /**
  * Business Order PDF.
@@ -17,228 +25,6 @@ import { BusinessOrderDetail } from '../services/businessOrderApi';
  * Brand mark is always the capitalised word SWACHHAM with "Business of
  * Laundering" directly beneath it, and the existing Swachham logo alongside.
  */
-export const LAUNDRY_LABEL: Record<string, string> = { hotel: 'Hotel Laundry', guest: 'Guest Laundry' };
-export const ORDER_LABEL: Record<string, string> = { standard: 'Standard Order', quick: 'Quick Order' };
-export const SERVICE_LABEL: Record<string, string> = { wash_iron: 'Wash & Iron', dry_clean: 'Dry Clean' };
-
-/**
- * Weights are stored numerically in kilograms, so the unit is always rendered
- * next to the number. Trailing zeros are trimmed: 2.500 -> "2.5 kg".
- */
-export function formatWeightKg(value: unknown) {
-  const kg = Number(value ?? 0);
-  if (!Number.isFinite(kg)) return '0 kg';
-  return `${Number(kg.toFixed(3))} kg`;
-}
-
-export function formatDateTime(value: string) {
-  const date = new Date(value);
-  if (Number.isNaN(date.getTime())) return { date: '', time: '' };
-  return {
-    date: date.toLocaleDateString(undefined, { day: '2-digit', month: 'short', year: 'numeric' }),
-    time: date.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' }),
-  };
-}
-
-const escapeHtml = (value: unknown) =>
-  String(value ?? '').replace(/[&<>"']/g, (ch) =>
-    ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[ch] as string)
-  );
-
-/**
- * PDF file name: the order number exactly as the Order Details page shows it,
- * plus `.pdf` — e.g. order SWH#16082026000001 becomes
- * "SWH#16082026000001.pdf". No prefix, no id, no timestamp.
- *
- * Only characters a filesystem actually rejects are removed, so the order
- * number survives as far as possible. `#` and `-` are legal file-name
- * characters on Android and iOS, so they are kept.
- */
-// Reserved on Windows and/or POSIX, plus control characters.
-const INVALID_FILENAME_CHARS = /[<>:"/\\|?*\u0000-\u001F]/g;
-
-/** The order number, cleaned for use as a file name, with no extension. */
-export function buildPdfBaseName(orderNumber: string) {
-  return String(orderNumber ?? '')
-    .replace(INVALID_FILENAME_CHARS, '')
-    .trim() || 'Order';
-}
-
-/** The file name both Share PDF and Download PDF use. */
-export function buildPdfFileName(orderNumber: string) {
-  return `${buildPdfBaseName(orderNumber)}.pdf`;
-}
-
-/** Amounts are only rendered when the order actually carries any. */
-function formatAmount(value: unknown) {
-  const amount = Number(value ?? 0);
-  if (!Number.isFinite(amount)) return '₹0.00';
-  return `₹${amount.toFixed(2)}`;
-}
-
-/**
- * The service for one line. `laundry_service_name` is what the API resolved
- * for that item; there is no order-wide service printed against the rows.
- */
-function itemServiceLabel(item: BusinessOrderDetail['items'][number]) {
-  return item.laundry_service_name || '-';
-}
-
-export function buildBusinessOrderPdfHtml(
-  data: BusinessOrderDetail,
-  logo: string | null
-) {
-    const { date, time } = formatDateTime(data.created_at);
-
-    // Business orders are weight-based and often carry no amounts at all. The
-    // pricing column and the amounts summary appear only when the order really
-    // has values, so the document never shows a wall of ₹0.00.
-    const hasPricing =
-      Number(data.total || 0) > 0 ||
-      Number(data.subtotal || 0) > 0 ||
-      data.items.some((item) => Number(item.total_price || 0) > 0);
-
-    const rows = data.items
-      .map(
-        (item, index) => `
-      <tr>
-        <td>${index + 1}</td>
-        <td class="wrap">${escapeHtml(item.service_name)}</td>
-        <td class="wrap">${escapeHtml(item.category_name || '-')}</td>
-        <td class="wrap">${escapeHtml(itemServiceLabel(item))}</td>
-        <td class="num">${escapeHtml(item.quantity)}</td>
-        <td>${escapeHtml(item.unit)}</td>
-        <td class="num">${escapeHtml(formatWeightKg(item.weight_kg))}</td>
-        <td class="num">${escapeHtml(formatWeightKg(item.total_weight_kg))}</td>
-        ${
-          hasPricing
-            ? `<td class="num">${escapeHtml(formatAmount(item.unit_price))}</td>
-        <td class="num">${escapeHtml(formatAmount(item.total_price))}</td>`
-            : ''
-        }
-      </tr>`
-      )
-      .join('');
-
-    // Only the amount rows the order actually has are printed — nothing is
-    // invented and nothing empty is shown.
-    const amountRow = (label: string, value: number) =>
-      Number(value || 0) !== 0
-        ? `<div class="cell"><span class="k">${label}:</span> <span class="v">${escapeHtml(
-            formatAmount(value)
-          )}</span></div>`
-        : '';
-
-    const summary = `
-  <h2>Order Summary</h2>
-  <div class="grid">
-    <div class="cell"><span class="k">Total Items:</span> <span class="v">${escapeHtml(
-      data.item_count
-    )}</span></div>
-    <div class="cell"><span class="k">Total Quantity:</span> <span class="v">${escapeHtml(
-      data.total_quantity
-    )}</span></div>
-    <div class="cell"><span class="k">Total Weight:</span> <span class="v">${escapeHtml(
-      formatWeightKg(data.total_weight_kg)
-    )}</span></div>
-    ${
-      hasPricing
-        ? `${amountRow('Subtotal', data.subtotal)}
-    ${amountRow('Delivery Charge', data.delivery_charge)}
-    ${amountRow('Tax', data.tax)}
-    ${amountRow('Discount', data.coupon_discount)}
-    <div class="cell"><span class="k">Grand Total:</span> <span class="v">${escapeHtml(
-      formatAmount(data.total)
-    )}</span></div>`
-        : ''
-    }
-  </div>`;
-
-    return `<!DOCTYPE html><html><head><meta charset="utf-8" />
-<style>
-  * { box-sizing: border-box; }
-  body { font-family: -apple-system, Roboto, Helvetica, Arial, sans-serif; color: #1B1B1B; padding: 28px; }
-  .head { display: flex; align-items: center; gap: 14px; border-bottom: 3px solid #2D6A4F; padding-bottom: 14px; }
-  .brand { font-size: 26px; font-weight: 700; color: #2D6A4F; margin: 0; letter-spacing: 1px; }
-  .tagline { display: block; font-size: 12px; color: #6B7280; font-weight: 400; letter-spacing: .4px; margin: 2px 0 0; }
-  .logo { width: 62px; height: 62px; object-fit: contain; }
-  h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .6px; color: #2D6A4F; margin: 22px 0 8px; }
-  .grid { display: flex; flex-wrap: wrap; }
-  .cell { width: 50%; padding: 5px 0; font-size: 12px; }
-  .k { color: #6B7280; }
-  .v { font-weight: 600; }
-  table { width: 100%; border-collapse: collapse; margin-top: 6px; font-size: 12px; }
-  th { background: #F1F7F3; text-align: left; padding: 8px; border-bottom: 2px solid #D8E6DD; font-size: 11px; text-transform: uppercase; color: #2D6A4F; }
-  td { padding: 8px; border-bottom: 1px solid #EDF2EF; vertical-align: top; }
-  .num { text-align: right; white-space: nowrap; }
-  /* Long orders paginate cleanly: the column headers repeat on every page,
-     a row is never split across a page break, and long item or service names
-     wrap instead of overflowing. */
-  thead { display: table-header-group; }
-  tfoot { display: table-row-group; }
-  tr { page-break-inside: avoid; }
-  h2 { page-break-after: avoid; }
-  .wrap { word-break: break-word; overflow-wrap: anywhere; }
-  tfoot td { border-top: 2px solid #D8E6DD; border-bottom: none; padding-top: 10px; }
-  .tfoot-label { text-align: right; text-transform: uppercase; font-size: 11px; letter-spacing: .5px; color: #2D6A4F; font-weight: 700; }
-  .tfoot-value { font-weight: 700; color: #1B4332; }
-  .pill { display: inline-block; background: #E8F3EC; color: #1B4332; border-radius: 10px; padding: 3px 10px; font-size: 11px; font-weight: 700; }
-  footer { margin-top: 28px; border-top: 1px solid #E5E7EB; padding-top: 10px; text-align: center; color: #9AA3AE; font-size: 10px; }
-</style></head><body>
-  <div class="head">
-    ${logo ? `<img class="logo" src="${logo}" />` : ''}
-    <div>
-      <p class="brand">SWACHHAM</p>
-      <p class="tagline">Business of Laundering</p>
-    </div>
-  </div>
-
-  <h2>Business Information</h2>
-  <div class="grid">
-    <div class="cell"><span class="k">Business Name:</span> <span class="v">${escapeHtml(data.business_name)}</span></div>
-    <div class="cell"><span class="k">Mobile Number:</span> <span class="v">${escapeHtml(data.business_mobile || '-')}</span></div>
-    <div class="cell"><span class="k">Contact Person:</span> <span class="v">${escapeHtml(data.contact_person_name || '-')}</span></div>
-    <div class="cell" style="width:100%"><span class="k">Address:</span> <span class="v">${escapeHtml(data.business_address || '-')}</span></div>
-  </div>
-
-  <h2>Order Information</h2>
-  <div class="grid">
-    <div class="cell"><span class="k">Order Number:</span> <span class="v">${escapeHtml(data.order_number)}</span></div>
-    <div class="cell"><span class="k">Order Status:</span> <span class="pill">${escapeHtml((data.status || '').replace(/_/g, ' '))}</span></div>
-    <div class="cell"><span class="k">Order Date:</span> <span class="v">${escapeHtml(date)}</span></div>
-    <div class="cell"><span class="k">Order Time:</span> <span class="v">${escapeHtml(time)}</span></div>
-    <div class="cell"><span class="k">Laundry Type:</span> <span class="v">${escapeHtml(LAUNDRY_LABEL[data.laundry_type || ''] || '-')}</span></div>
-    <div class="cell"><span class="k">Order Type:</span> <span class="v">${escapeHtml(ORDER_LABEL[data.order_type || ''] || '-')}</span></div>
-    <div class="cell"><span class="k">Items:</span> <span class="v">${escapeHtml(data.item_count)} (Qty ${escapeHtml(data.total_quantity)})</span></div>
-    <div class="cell"><span class="k">Total Weight:</span> <span class="v">${escapeHtml(formatWeightKg(data.total_weight_kg))}</span></div>
-  </div>
-
-  <h2>Items</h2>
-  <table>
-    <thead><tr>
-      <th>#</th><th>Item</th><th>Category</th><th>Service</th><th class="num">Qty</th><th>Unit</th>
-      <th class="num">Std. Weight</th><th class="num">Weight</th>
-      ${hasPricing ? '<th class="num">Price</th><th class="num">Item Total</th>' : ''}
-    </tr></thead>
-    <tbody>${rows}</tbody>
-    <tfoot>
-      <tr>
-        <td colspan="6" class="tfoot-label">Total Weight</td>
-        <td></td>
-        <td class="num tfoot-value">${escapeHtml(formatWeightKg(data.total_weight_kg))}</td>
-        ${
-          hasPricing
-            ? `<td></td><td class="num tfoot-value">${escapeHtml(formatAmount(data.total))}</td>`
-            : ''
-        }
-      </tr>
-    </tfoot>
-  </table>
-${summary}
-
-  <footer>Generated by SWACHHAM · ${escapeHtml(date)} ${escapeHtml(time)}</footer>
-</body></html>`;
-}
 
 /**
  * The single PDF generator behind both actions.
@@ -257,7 +43,8 @@ export async function generateOrderPdf(
     html: buildBusinessOrderPdfHtml(order, logo),
   });
 
-  const fileName = buildPdfFileName(order.order_number);
+  // Named for the business first, then the order. See buildPdfFileName.
+  const fileName = buildPdfFileName(order.order_number, order.business_name);
   const targetUri = `${FileSystem.cacheDirectory}${encodeURIComponent(fileName)}`;
   try {
     await FileSystem.deleteAsync(targetUri, { idempotent: true });

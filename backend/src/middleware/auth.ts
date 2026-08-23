@@ -78,6 +78,21 @@ function authenticate(
       id: decoded.id,
       email: decoded.email,
       role: decoded.role,
+      /*
+       * THE NUMBER THIS SESSION WAS PROVEN ON, carried through.
+       *
+       * The token has always carried it -- it is set from the number that
+       * actually passed the OTP, which for a business is whichever contact
+       * signed in and not necessarily the account's own. Dropping it here
+       * meant every consumer saw `undefined`, and an order stamped with it
+       * recorded NULL. It is copied across so `orders.placed_by_mobile` can
+       * be taken from the session rather than from the request body.
+       *
+       * Absent on sessions minted before the claim existed, and on the
+       * password-only logins that never prove a number; readers must treat
+       * it as optional rather than assuming one is always present.
+       */
+      mobile: decoded.mobile,
     };
 
 

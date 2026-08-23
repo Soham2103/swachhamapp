@@ -30,6 +30,13 @@ export default function ProfileScreen({ navigation }: any) {
       case 'orders':
         navigation.navigate('Orders');
         break;
+      // Both legal documents are one screen; the id says which to render.
+      case 'privacy':
+        navigation.navigate('LegalDocument', { document: 'privacy' });
+        break;
+      case 'terms':
+        navigation.navigate('LegalDocument', { document: 'terms' });
+        break;
       case 'delete':
         Alert.alert('Delete Account', 'Are you sure you want to delete your account?', [
           { text: 'Cancel', style: 'cancel' },

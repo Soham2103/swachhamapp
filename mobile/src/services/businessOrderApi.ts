@@ -73,21 +73,38 @@ export interface BusinessCart {
 export interface BusinessTimeSlot {
   id: string;
   label: string;
+  /** Minutes since midnight at which the slot opens, e.g. 9:00 AM -> 540. */
+  start_minutes: number;
+  /**
+   * False when this slot cannot be booked on the date that was asked about —
+   * on today, one whose start time has already passed in IST. The server
+   * decides this, and refuses the same slot at order time.
+   */
+  available: boolean;
 }
 
 /**
- * What the user picked on the Time Slot page, sent with the order.
+ * What the user picked on the Pickup & Delivery page, sent with the order.
  *
- * One day, two independent slots. The field names are the ones the order
- * endpoint already reads — nothing parallel was invented for delivery.
+ * Pickup and delivery each carry their own date AND their own slot: they are
+ * separate bookings on separate days, never one date shared between them.
+ * The server re-validates every field.
  */
 export interface BusinessPickupSchedule {
-  /** YYYY-MM-DD, from the device's own calendar. */
+  /** YYYY-MM-DD in IST. */
   pickupDate: string;
   /** Pickup slot id, e.g. "11-13". */
   pickupSlot: string;
-  /** Delivery slot id, chosen independently of the pickup. */
-  deliverySlot: string;
+  /**
+   * YYYY-MM-DD in IST, always a later day than `pickupDate`.
+   *
+   * OPTIONAL: an order may be placed with the pickup alone and the delivery
+   * scheduled afterwards through `scheduleDelivery`. Null together with
+   * `deliverySlot` or set together with it -- never one without the other.
+   */
+  deliveryDate?: string | null;
+  /** Delivery slot id, chosen independently of the pickup. Optional, as above. */
+  deliverySlot?: string | null;
   /** Optional note for the driver on both legs. */
   pickupNotes?: string;
   /** Optional note about the laundry itself. */
@@ -97,15 +114,17 @@ export interface BusinessPickupSchedule {
 export interface BusinessOrderResult {
   id: string;
   order_number: string;
-  /** The pickup and delivery booked with this order. */
+  /** The pickup booked with this order. */
   pickup: { date: string; slot_label: string; slot_start: string; slot_end: string };
-  delivery: { date: string; slot_label: string; slot_start: string; slot_end: string };
+  /** The delivery, or null when it has not been scheduled yet. */
+  delivery: { date: string; slot_label: string; slot_start: string; slot_end: string } | null;
   laundry_type: string;
   order_type: string;
   service_type: string;
   status: string;
-  subtotal: number;
-  total: number;
+  /* No amounts. The business app never shows a price, so the backend
+     sends none: an order is priced server-side from business_price_list
+     and the figures live on the order, not in this response. */
   total_weight_kg: number;
   items: Array<{
     item_id: string;
@@ -134,7 +153,6 @@ export interface BusinessOrderSummary {
   service_type: string | null;
   service_name: string | null;
   status: string;
-  total: number;
   item_count: number;
   total_quantity: number;
   /** SUM(item weight x quantity) for the order, in kg. */
@@ -160,25 +178,65 @@ export interface BusinessOrderItem {
   category_id: string | null;
   category_name: string | null;
   image_url: string | null;
+  /** The BILLABLE quantity: original_quantity - defective_quantity. */
   quantity: number;
+  /**
+   * The pieces the order was placed for. Equal to `quantity` until a Sorter
+   * records a defective piece against the line.
+   */
+  original_quantity: number;
+  /** Pieces the Sorter found damaged. 0 on a line never adjusted. */
+  defective_quantity: number;
+  /**
+   * Where this line stands on its own.
+   *
+   *   PROCESSING  with Swachham, being worked on
+   *   READY       finished, and going out with the next dispatch
+   *   PENDING     held back because it needs more time, while the rest of the
+   *               order goes out
+   *
+   * READ-ONLY here. Only a Sorter can change it, through an endpoint a
+   * business token cannot reach.
+   */
+  item_status: 'PROCESSING' | 'READY' | 'PARTIALLY_PENDING' | 'PENDING';
+  /** Pieces still being processed at Swachham. */
+  pending_quantity: number;
+  /** ordered - pending: the pieces going out with the next dispatch. */
+  delivery_quantity: number;
+  /** Why they are being held, when they are. */
+  pending_reason: string | null;
   unit: string;
   weight_kg: number | null;
   total_weight_kg: number;
-  unit_price: number;
-  total_price: number;
 }
 
 export interface BusinessOrderDetail extends BusinessOrderSummary {
   business_name: string;
   contact_person_name: string | null;
-  business_mobile: string | null;
+  /**
+   * The number this order was PLACED ON -- `orders.placed_by_mobile`.
+   *
+   * Not the business's number and not the account's: it is what the person
+   * who placed the order proved by OTP for that session, so an order placed
+   * by an alternative contact carries the alternative contact's number.
+   *
+   * NULL for orders placed before the field existed. Nothing substitutes the
+   * account's number for it; those orders show "N/A".
+   */
+  placed_by_mobile: string | null;
   business_email: string | null;
   business_address: string | null;
-  subtotal: number;
-  delivery_charge: number;
-  tax: number;
-  coupon_discount: number;
   items: BusinessOrderItem[];
+  /**
+   * True when any line carries a defective adjustment.
+   *
+   * The documents use it to decide whether to print the Ordered / Defective /
+   * Final columns at all, so an order nobody adjusted reads exactly as it
+   * always did rather than carrying three columns explaining nothing.
+   */
+  has_adjustment: boolean;
+  /** True when some of this order is finished and some is still in process. */
+  has_pending_items: boolean;
 }
 
 export interface BusinessOrderTracking {
@@ -195,7 +253,10 @@ export interface BusinessOrderTracking {
 export interface BusinessProfile {
   business_id: string;
   business_name: string;
+  /** The establishment CATEGORY (hotel, restaurant…), from businesses.business_type. */
   customer_type: string | null;
+  /** B2B or B2C — the registration type. A B2C account carries no GST number. */
+  registration_type: 'B2B' | 'B2C';
   other_type_specify: string | null;
   establishment_address: string | null;
   gst_number: string | null;
@@ -409,9 +470,35 @@ export const businessOrderApi = {
   },
 
   /** The pickup slots on offer, defined by the server. */
-  getTimeSlots: async (): Promise<ApiResponse<BusinessTimeSlot[]>> => {
+  /**
+   * The bookable slots. Passing a date asks the server which of them are
+   * still available on THAT day, so the app never offers a slot the order
+   * endpoint would reject.
+   */
+  /**
+   * Books the delivery for an order that was placed with the pickup alone.
+   * Both fields are required here — this call exists to schedule a delivery.
+   */
+  scheduleDelivery: async (
+    orderId: string,
+    deliveryDate: string,
+    deliverySlot: string
+  ): Promise<ApiResponse<{ order_id: string; order_number: string; delivery: BusinessOrderResult['delivery'] }>> => {
+    const response = await apiClient.patch(
+      `/api/businesses/orders/${orderId}/delivery`,
+      { deliveryDate, deliverySlot }
+    );
+    return response.data as ApiResponse<{
+      order_id: string;
+      order_number: string;
+      delivery: BusinessOrderResult['delivery'];
+    }>;
+  },
+
+  getTimeSlots: async (date?: string): Promise<ApiResponse<BusinessTimeSlot[]>> => {
     const response = await apiClient.get<ApiResponse<BusinessTimeSlot[]>>(
-      '/api/businesses/time-slots'
+      '/api/businesses/time-slots',
+      { params: date ? { date } : {} }
     );
     return response.data;
   },
@@ -432,7 +519,9 @@ export const businessOrderApi = {
       {
         pickupDate: schedule.pickupDate,
         pickupSlot: schedule.pickupSlot,
-        deliverySlot: schedule.deliverySlot,
+        // Sent as null rather than omitted, so "not scheduled" is explicit.
+        deliveryDate: schedule.deliveryDate || null,
+        deliverySlot: schedule.deliverySlot || null,
         pickupNotes: schedule.pickupNotes,
         serviceNotes: schedule.serviceNotes,
       }

@@ -2,13 +2,13 @@ import { create } from 'zustand';
 import * as SecureStore from 'expo-secure-store';
 
 import authApi from '../services/authApi';
-import type { SignInResult } from '../services/authApi';
+import type { SignInResult, BusinessSignInTarget } from '../services/authApi';
 import { extractErrorMessage } from '../services/api';
 import { User, LoginPayload, RegisterPayload, BusinessRegisterPayload } from '../types';
 
 interface AuthState {
   user: User | null;
-  userType: 'customer' | 'business' | 'sorter' | 'super_admin' | null;
+  userType: 'customer' | 'business' | 'sorter' | 'super_admin' | 'manager' | null;
   token: string | null;
   isAuthenticated: boolean;
   isLoading: boolean;
@@ -28,6 +28,17 @@ interface AuthState {
   signInSendOtp: (mobile: string) => Promise<void>;
   signInVerifyOtp: (mobile: string, otp: string) => Promise<SignInResult>;
   signInPassword: (username: string, password: string, preAuthToken: string) => Promise<void>;
+
+  /**
+   * Business sign-in, for a business's registered contacts.
+   *
+   * Step 3 is `signInPassword` above — the same call, with the business's own
+   * email and password. There is no separate business password action,
+   * because there is no separate business password.
+   */
+  businessSendOtp: (mobile: string) => Promise<{ business_name: string }>;
+  businessVerifyOtp: (mobile: string, otp: string) => Promise<BusinessSignInTarget>;
+  businessResendOtp: (mobile: string) => Promise<{ business_name: string }>;
 
   /** Super admin step 1: OTP out, then verify to learn if step 2 applies. */
   superAdminSendOtp: (mobile: string) => Promise<void>;
@@ -50,18 +61,21 @@ interface AuthState {
   clearStoredSession: () => Promise<void>;
   logout: () => Promise<void>;
   updateUser: (user: Partial<User>) => void;
-  setUserType: (type: 'customer' | 'business' | 'sorter' | 'super_admin' | null) => void;
+  setUserType: (type: 'customer' | 'business' | 'sorter' | 'super_admin' | 'manager' | null) => void;
 }
 
 const TOKEN_KEY = 'swachham_access_token';
 const USER_KEY = 'swachham_user';
 
 /** Maps the role on the account to the stack the app should show. */
-function userTypeFor(role?: string | null): 'customer' | 'business' | 'sorter' | 'super_admin' {
+function userTypeFor(role?: string | null): 'customer' | 'business' | 'sorter' | 'super_admin' | 'manager' {
   const value = String(role || '').toLowerCase();
   if (value === 'business') return 'business';
   if (value === 'sorter') return 'sorter';
   if (value === 'super_admin') return 'super_admin';
+  // MANAGER signs in through the same password flow as the other staff
+  // roles; without this it would fall through to the customer app.
+  if (value === 'manager') return 'manager';
   return 'customer';
 }
 
@@ -247,6 +261,47 @@ export const useAuthStore = create<AuthState>((set, get) => ({
       await authApi.signinSendOtp(mobile);
     } catch (error: any) {
       throw new Error(extractErrorMessage(error, 'Failed to send OTP'));
+    } finally {
+      set({ isLoading: false });
+    }
+  },
+
+  businessSendOtp: async (mobile: string) => {
+    try {
+      set({ isLoading: true });
+      const response = await authApi.businessSendOtp(mobile);
+      return response.data;
+    } catch (error: any) {
+      // The server's own wording is kept: it distinguishes "not a business
+      // contact" from "that business is not active", and those are different
+      // things for whoever is holding the phone.
+      throw new Error(extractErrorMessage(error, 'Failed to send OTP'));
+    } finally {
+      set({ isLoading: false });
+    }
+  },
+
+  businessVerifyOtp: async (mobile: string, otp: string) => {
+    try {
+      set({ isLoading: true });
+      const response = await authApi.businessVerifyOtp(mobile, otp);
+      // NO SESSION IS STORED HERE. Verifying the number identifies the
+      // business; the password step is what signs anybody in.
+      return response.data;
+    } catch (error: any) {
+      throw new Error(extractErrorMessage(error, 'Invalid OTP'));
+    } finally {
+      set({ isLoading: false });
+    }
+  },
+
+  businessResendOtp: async (mobile: string) => {
+    try {
+      set({ isLoading: true });
+      const response = await authApi.businessResendOtp(mobile);
+      return response.data;
+    } catch (error: any) {
+      throw new Error(extractErrorMessage(error, 'Unable to resend OTP'));
     } finally {
       set({ isLoading: false });
     }

@@ -1,6 +1,43 @@
 import { query } from '../config/database';
 import { AppError } from '../utils/appError';
 
+/**
+ * PRICE-GATED CATALOGUE.
+ *
+ * A business is shown only the items it can actually order: those with an
+ * ACTIVE, POSITIVE price in `business_price_list` for that business AND the
+ * laundry type being browsed. A zero means "not on offer", not "free", and a
+ * missing row means the same.
+ *
+ * The gate lives in the SQL, so an unpriced item never reaches the app —
+ * filtering it in the UI would still ship the row and still leave it
+ * orderable through a direct call. `businessOrder.createOrder` applies the
+ * same rule independently, so the catalogue and the order path cannot
+ * disagree about what is buyable.
+ *
+ * NO PRICE IS EVER SELECTED HERE. The gate tests for existence only; the
+ * business app still receives no amounts.
+ */
+
+/** Which business and which rate the catalogue is being browsed for. */
+export interface PriceScope {
+  businessId: string;
+  laundryType: 'hotel' | 'guest';
+}
+
+/**
+ * EXISTS(...) rather than a JOIN: it answers "is this orderable" without
+ * putting the price on the row, so no amount can leak into a response by
+ * someone later adding the column to a SELECT.
+ */
+const PRICED_FOR_BUSINESS = `EXISTS (
+  SELECT 1 FROM business_price_list bpl
+   WHERE bpl.item_id = i.id
+     AND bpl.business_id = ?
+     AND bpl.laundry_type = ?
+     AND bpl.is_active = true
+     AND bpl.price > 0)`;
+
 export type BusinessServiceType = 'wash_iron' | 'dry_clean';
 
 const SERVICE_TYPES: BusinessServiceType[] = ['wash_iron', 'dry_clean'];
@@ -79,6 +116,7 @@ const ITEM_COUNT_SQL = `
      JOIN service_categories ic ON ic.id = i.category_id
     WHERE i.kind = 'ITEM' AND i.is_active = true
       AND (i.category_id = c.id OR ic.parent_id = c.id)
+      AND ${PRICED_FOR_BUSINESS}
       AND (? IS NULL OR EXISTS (
             SELECT 1 FROM item_service_types m
               JOIN services st ON st.id = m.service_id
@@ -86,6 +124,7 @@ const ITEM_COUNT_SQL = `
 
 async function attachPreviews(
   categories: BusinessCategory[],
+  scope: PriceScope,
   serviceType?: BusinessServiceType
 ): Promise<BusinessCategory[]> {
   if (categories.length === 0) return categories;
@@ -103,12 +142,13 @@ async function attachPreviews(
        JOIN service_categories ic ON ic.id = i.category_id
       WHERE i.kind = 'ITEM' AND i.is_active = true
         AND (ic.id IN (${placeholders}) OR ic.parent_id IN (${placeholders}))
+        AND ${PRICED_FOR_BUSINESS}
         AND (? IS NULL OR EXISTS (
               SELECT 1 FROM item_service_types m
                 JOIN services st ON st.id = m.service_id
                WHERE m.item_id = i.id AND st.code = ? AND st.is_active = true))
       ORDER BY i.display_order ASC, i.name ASC`,
-    [...ids, ...ids, ...ids, st, st]
+    [...ids, ...ids, ...ids, scope.businessId, scope.laundryType, st, st]
   );
 
   const byRoot = new Map<string, string[]>();
@@ -126,7 +166,10 @@ async function attachPreviews(
 }
 
 /** Main categories (top level of the tree). */
-async function getMainCategories(serviceTypeInput?: string): Promise<BusinessCategory[]> {
+async function getMainCategories(
+  scope: PriceScope,
+  serviceTypeInput?: string
+): Promise<BusinessCategory[]> {
   const serviceType = assertServiceType(serviceTypeInput);
   const st = serviceType ?? null;
 
@@ -140,7 +183,7 @@ async function getMainCategories(serviceTypeInput?: string): Promise<BusinessCat
         AND c.parent_id IS NULL AND c.is_active = true
      HAVING item_count > 0
       ORDER BY c.display_order ASC, c.name ASC`,
-    [st, st]
+    [scope.businessId, scope.laundryType, st, st]
   );
 
   return attachPreviews(
@@ -150,6 +193,7 @@ async function getMainCategories(serviceTypeInput?: string): Promise<BusinessCat
       item_count: Number(row.item_count),
       preview_items: [],
     })),
+    scope,
     serviceType
   );
 }
@@ -157,6 +201,7 @@ async function getMainCategories(serviceTypeInput?: string): Promise<BusinessCat
 /** Sub-categories of a main category. Empty array means items come next. */
 async function getSubCategories(
   parentId: string,
+  scope: PriceScope,
   serviceTypeInput?: string
 ): Promise<BusinessCategory[]> {
   const serviceType = assertServiceType(serviceTypeInput);
@@ -171,7 +216,7 @@ async function getSubCategories(
         AND c.parent_id = ? AND c.is_active = true
      HAVING item_count > 0
       ORDER BY c.display_order ASC, c.name ASC`,
-    [st, st, parentId]
+    [scope.businessId, scope.laundryType, st, st, parentId]
   );
 
   return attachPreviews(
@@ -181,6 +226,7 @@ async function getSubCategories(
       item_count: Number(row.item_count),
       preview_items: [],
     })),
+    scope,
     serviceType
   );
 }
@@ -205,6 +251,7 @@ const ITEM_SELECT = `
  */
 async function getItemsByCategory(
   categoryId: string,
+  scope: PriceScope,
   serviceTypeInput?: string
 ): Promise<BusinessItem[]> {
   const serviceType = assertServiceType(serviceTypeInput);
@@ -214,12 +261,13 @@ async function getItemsByCategory(
     `${ITEM_SELECT}
      WHERE i.scope = 'BUSINESS' AND i.kind = 'ITEM' AND i.is_active = true
        AND (i.category_id = ? OR c.parent_id = ?)
+       AND ${PRICED_FOR_BUSINESS}
        AND (? IS NULL OR EXISTS (
              SELECT 1 FROM item_service_types m
                JOIN services st ON st.id = m.service_id
               WHERE m.item_id = i.id AND st.code = ? AND st.is_active = true))
      ORDER BY i.display_order ASC, i.name ASC`,
-    [categoryId, categoryId, st, st]
+    [categoryId, categoryId, scope.businessId, scope.laundryType, st, st]
   );
   return result.rows.map(toItem);
 }
@@ -228,10 +276,16 @@ async function searchItems(params: {
   search?: string;
   categoryId?: string;
   serviceType?: string;
+  scope: PriceScope;
 }): Promise<BusinessItem[]> {
   const serviceType = assertServiceType(params.serviceType);
-  const conditions: string[] = [`i.scope = 'BUSINESS'`, `i.kind = 'ITEM'`, `i.is_active = true`];
-  const values: unknown[] = [];
+  const conditions: string[] = [
+    `i.scope = 'BUSINESS'`,
+    `i.kind = 'ITEM'`,
+    `i.is_active = true`,
+    PRICED_FOR_BUSINESS,
+  ];
+  const values: unknown[] = [params.scope.businessId, params.scope.laundryType];
 
   if (params.categoryId) {
     conditions.push('(i.category_id = ? OR c.parent_id = ?)');

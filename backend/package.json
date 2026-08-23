@@ -6,6 +6,7 @@
   "scripts": {
     "dev": "ts-node-dev --respawn --transpile-only src/server.ts",
     "build": "tsc",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
     "start": "node dist/server.js",
     "migrate": "ts-node migrate.ts",
     "whatsapp:templates": "node scripts/whatsapp_templates.js",
@@ -17,6 +18,8 @@
     "test:watch": "jest --watch"
   },
   "dependencies": {
+    "@types/nodemailer": "^8.0.1",
+    "@types/pdfkit": "^0.17.6",
     "bcrypt": "^5.1.1",
     "cors": "^2.8.5",
     "dotenv": "^16.4.5",
@@ -27,6 +30,8 @@
     "jsonwebtoken": "^9.0.2",
     "morgan": "^1.10.0",
     "mysql2": "^3.23.3",
+    "nodemailer": "^9.0.5",
+    "pdfkit": "^0.19.1",
     "socket.io": "^4.7.5",
     "uuid": "^10.0.0",
     "winston": "^3.13.0",

@@ -107,6 +107,9 @@ const STATUS_LABEL: Record<string, string> = {
   RECEIVED_AT_FACILITY: 'Confirmed — received at the facility',
   IN_PROCESS: 'Processing',
   READY_FOR_DELIVERY: 'Ready',
+  // Some of the order is finished and some is still being worked on. Worded
+  // for the person waiting on it, not in the database's vocabulary.
+  PARTIALLY_COMPLETED: 'Partly ready — some items still in process',
   OUT_FOR_DELIVERY: 'Out for Delivery',
   DELIVERED: 'Completed',
   COMPLETED: 'Completed',

@@ -43,7 +43,14 @@ export interface ScanStatus {
   order_id: string;
   order_number: string;
   status: string;
+  /** Every piece the order was placed for — what acceptance counts. */
   expected_count: number;
+  /**
+   * The pieces going out with the next dispatch — what delivery counts.
+   *
+   * Equal to `expected_count` unless the Sorter is holding some back.
+   */
+  expected_delivery_count: number;
   acceptance_scanned: number;
   delivery_scanned: number;
   acceptance_matched: boolean;
@@ -131,8 +138,22 @@ async function generateGarmentsForOrder(
     // The order's own service is the line service when every line shared one;
     // otherwise the item's single supported service is used, exactly as the
     // order detail resolves it. Nothing is invented.
+    /*
+     * PIECES, NOT BILLABLE QUANTITY.
+     *
+     * `original_quantity` is how many physical garments the order has, and
+     * `quantity` is how many of them are billed — the two differ once a
+     * defective adjustment has been recorded, because a damaged towel is
+     * still a towel that arrived and still needs a barcode. Generating from
+     * `quantity` would leave the defective pieces unlabelled and make the
+     * acceptance scan unmatchable.
+     *
+     * COALESCE for lines written before migration 033, where the current
+     * quantity IS the original.
+     */
     const [lines]: any = await connection.execute(
-      `SELECT oi.id, oi.service_id, oi.service_name, oi.quantity, oi.weight_kg,
+      `SELECT oi.id, oi.service_id, oi.service_name, oi.weight_kg,
+              COALESCE(oi.original_quantity, oi.quantity) AS quantity,
               COALESCE(
                 (SELECT st.name FROM services st WHERE st.id = o.service_id),
                 (SELECT MIN(st.name)
@@ -198,10 +219,39 @@ async function generateGarmentsForOrder(
   }
 }
 
-/** Expected garment count = the sum of the order's line quantities. */
-async function getExpectedCount(orderId: string): Promise<number> {
+/**
+ * Expected garment count = the PHYSICAL pieces of the order.
+ *
+ * `original_quantity`, not `quantity`: a defective piece is damaged, not
+ * missing. It was collected, it carries a barcode and it will be scanned, so
+ * counting only the billable pieces would report a fully scanned order as
+ * 10/8 and refuse to match. Billing reads `quantity`; the shop floor counts
+ * what is on the shelf.
+ */
+async function getExpectedCount(orderId: string, stage?: ScanStage): Promise<number> {
+  /*
+   * DELIVERY COUNTS ONLY WHAT IS GOING OUT.
+   *
+   * Acceptance asks "did everything arrive?", and the answer is every piece
+   * the order was placed for. Delivery asks "is everything that is leaving on
+   * the van?", and pieces the Sorter is holding back are, by definition, not
+   * leaving -- so counting them would make a correctly loaded van read 7/10
+   * and refuse to match.
+   *
+   * `pending_quantity` is 0 on every line nobody has held, so an ordinary
+   * order gives the same number for both stages, exactly as before. Callers
+   * that pass no stage keep the acceptance meaning, which is what they always
+   * had.
+   */
+  const forDelivery = stage === 'DELIVERY';
   const result = await query<{ expected: number }>(
-    `SELECT COALESCE(SUM(quantity), 0) AS expected FROM order_items WHERE order_id = ?`,
+    forDelivery
+      ? `SELECT COALESCE(SUM(GREATEST(
+                  COALESCE(original_quantity, quantity) - COALESCE(pending_quantity, 0), 0)), 0)
+                AS expected
+           FROM order_items WHERE order_id = ?`
+      : `SELECT COALESCE(SUM(COALESCE(original_quantity, quantity)), 0) AS expected
+           FROM order_items WHERE order_id = ?`,
     [orderId]
   );
   return Number(result.rows[0]?.expected || 0);
@@ -245,7 +295,12 @@ async function getScanStatus(orderId: string): Promise<ScanStatus> {
 
   // Expected comes from the order lines, not from the garment rows, so a
   // failed or partial generation shows up as a mismatch rather than passing.
+  //
+  // Two figures, because the two stages ask different questions: acceptance
+  // counts everything that arrived, delivery counts only what is leaving.
+  // They are equal on any order with nothing held back.
   const expected = await getExpectedCount(orderId);
+  const expectedForDelivery = await getExpectedCount(orderId, 'DELIVERY');
   const acceptanceScanned = garments.filter((g) => g.accepted_scan_at).length;
   const deliveryScanned = garments.filter((g) => g.delivery_scan_at).length;
 
@@ -254,10 +309,11 @@ async function getScanStatus(orderId: string): Promise<ScanStatus> {
     order_number: order.order_number,
     status: order.status,
     expected_count: expected,
+    expected_delivery_count: expectedForDelivery,
     acceptance_scanned: acceptanceScanned,
     delivery_scanned: deliveryScanned,
     acceptance_matched: expected > 0 && acceptanceScanned === expected,
-    delivery_matched: expected > 0 && deliveryScanned === expected,
+    delivery_matched: expectedForDelivery > 0 && deliveryScanned === expectedForDelivery,
     garments,
   };
 }
@@ -357,7 +413,15 @@ async function scanGarment(
       [orderId, stage]
     );
     const [expectedRows]: any = await connection.execute(
-      `SELECT COALESCE(SUM(quantity), 0) AS expected FROM order_items WHERE order_id = ?`,
+      // The same split as getExpectedCount: acceptance counts every piece
+      // that arrived, delivery counts only the pieces that are leaving.
+      stage === 'DELIVERY'
+        ? `SELECT COALESCE(SUM(GREATEST(
+                    COALESCE(original_quantity, quantity) - COALESCE(pending_quantity, 0), 0)), 0)
+                  AS expected
+             FROM order_items WHERE order_id = ?`
+        : `SELECT COALESCE(SUM(COALESCE(original_quantity, quantity)), 0) AS expected
+             FROM order_items WHERE order_id = ?`,
       [orderId]
     );
 
@@ -404,7 +468,9 @@ async function scanGarment(
  * crafted API call cannot skip verification the way a disabled button could.
  */
 async function assertStageComplete(orderId: string, stage: ScanStage): Promise<void> {
-  const expected = await getExpectedCount(orderId);
+  // Stage-aware: a delivery run is complete when everything LEAVING has been
+  // scanned, not when every piece the order ever had has been.
+  const expected = await getExpectedCount(orderId, stage);
   if (expected === 0) {
     throw new AppError('This order has no items to verify.', 409);
   }

@@ -61,10 +61,24 @@ PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
 
 -- Reviewed-at/by, so an approval decision is auditable rather than
 -- just a status that silently flipped.
+--
+-- ONE GUARD PER COLUMN. Guarding several ADDs behind a check on only
+-- the first one is not idempotent: if a previous run added some of
+-- them and stopped, the check passes and the ALTER then fails on the
+-- column that already exists. That is exactly what happened here --
+-- `businesses` ended up with reviewed_by and approval_note but no
+-- reviewed_at -- so each column is now added on its own.
 SET @x = (SELECT COUNT(*) FROM information_schema.COLUMNS
   WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'users' AND COLUMN_NAME = 'reviewed_at');
 SET @sql = IF(@x = 0,
-  'ALTER TABLE users ADD COLUMN reviewed_at DATETIME NULL, ADD COLUMN reviewed_by BIGINT UNSIGNED NULL',
+  'ALTER TABLE users ADD COLUMN reviewed_at DATETIME NULL',
+  'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+SET @x = (SELECT COUNT(*) FROM information_schema.COLUMNS
+  WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'users' AND COLUMN_NAME = 'reviewed_by');
+SET @sql = IF(@x = 0,
+  'ALTER TABLE users ADD COLUMN reviewed_by BIGINT UNSIGNED NULL',
   'SELECT 1');
 PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
 
@@ -79,6 +93,20 @@ PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
 SET @x = (SELECT COUNT(*) FROM information_schema.COLUMNS
   WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'businesses' AND COLUMN_NAME = 'reviewed_at');
 SET @sql = IF(@x = 0,
-  'ALTER TABLE businesses ADD COLUMN reviewed_at DATETIME NULL, ADD COLUMN reviewed_by BIGINT UNSIGNED NULL, ADD COLUMN approval_note VARCHAR(300) NULL',
+  'ALTER TABLE businesses ADD COLUMN reviewed_at DATETIME NULL',
+  'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+SET @x = (SELECT COUNT(*) FROM information_schema.COLUMNS
+  WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'businesses' AND COLUMN_NAME = 'reviewed_by');
+SET @sql = IF(@x = 0,
+  'ALTER TABLE businesses ADD COLUMN reviewed_by BIGINT UNSIGNED NULL',
+  'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+SET @x = (SELECT COUNT(*) FROM information_schema.COLUMNS
+  WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'businesses' AND COLUMN_NAME = 'approval_note');
+SET @sql = IF(@x = 0,
+  'ALTER TABLE businesses ADD COLUMN approval_note VARCHAR(300) NULL',
   'SELECT 1');
 PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;

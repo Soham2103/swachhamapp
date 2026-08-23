@@ -297,7 +297,21 @@ export default function BusinessProfileDetailsScreen({ navigation }: any) {
                 : null}
 
               {renderField('Establishment Address', 'establishmentAddress', { multiline: true })}
-              {renderField('GST Number', 'gstNumber', { autoCapitalize: 'characters', maxLength: 15 })}
+
+              {/* The registration type is shown, never edited here: whether an
+                  account is B2B or B2C is set at registration and changed by a
+                  Super Admin, because it decides whether a GSTIN is required. */}
+              <Text style={styles.fieldLabel}>Registration Type</Text>
+              <Text style={styles.fieldValue}>{profile?.registration_type || '—'}</Text>
+
+              {/* A B2C account has no GST number, so the field is not offered
+                  rather than shown permanently blank. */}
+              {profile?.registration_type === 'B2C'
+                ? null
+                : renderField('GST Number', 'gstNumber', {
+                    autoCapitalize: 'characters',
+                    maxLength: 15,
+                  })}
               {renderField('PAN Number', 'panNumber', { autoCapitalize: 'characters', maxLength: 10 })}
               {renderField('Website', 'website', { autoCapitalize: 'none' })}
             </View>

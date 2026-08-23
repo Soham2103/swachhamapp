@@ -202,19 +202,73 @@ export default function SuperAdminDashboardScreen({ navigation }: any) {
           </>
         )}
 
-        <Text style={styles.sectionTitle}>Create</Text>
+        {/* The "Create" section is gone. A Super Admin does not create a
+            business or a rider -- a Manager proposes one and this screen's
+            Requests section is where it is approved, which is the same
+            workflow that already existed. Everything else about managing an
+            existing business or rider is unchanged. */}
+
+        {/* Requests raised by Managers, waiting on a decision here. */}
+        <Text style={styles.sectionTitle}>Requests</Text>
         <View style={styles.row}>
           <ActionTile
-            icon="add-circle-outline"
-            label="New business"
-            onPress={() => navigation.navigate('SuperAdminCreateBusiness')}
+            icon="business-outline"
+            label="Business requests"
+            onPress={() => navigation.navigate('SuperAdminRequests', { type: 'BUSINESS' })}
           />
           <ActionTile
-            icon="person-add-outline"
-            label="New rider"
-            onPress={() => navigation.navigate('SuperAdminCreateRider')}
+            icon="bicycle-outline"
+            label="Rider requests"
+            onPress={() => navigation.navigate('SuperAdminRequests', { type: 'RIDER' })}
           />
         </View>
+        <View style={styles.row}>
+          <ActionTile
+            icon="shirt-outline"
+            label="Sorter requests"
+            onPress={() => navigation.navigate('SuperAdminRequests', { type: 'SORTER' })}
+          />
+          <ActionTile
+            icon="people-outline"
+            label="Managers"
+            onPress={() => navigation.navigate('SuperAdminManagers')}
+          />
+        </View>
+
+        <Text style={styles.sectionTitle}>Manage</Text>
+
+        {/* One business's orders, invoices and payments, in one place. */}
+        <TouchableOpacity
+          style={[styles.wideAction, { marginBottom: SPACING.sm }]}
+          onPress={() => navigation.navigate('SuperAdminBusinessAccount')}
+        >
+          <Ionicons name="wallet-outline" size={18} color={COLORS.Primary} />
+          <Text style={styles.wideActionText}>Business Account</Text>
+          <Ionicons name="chevron-forward" size={18} color={COLORS.TextSecondary} />
+        </TouchableOpacity>
+
+        {/* Price List: the customer list and the per-business lists, both
+            behind one entry because they are one job. */}
+        <TouchableOpacity
+          style={[styles.wideAction, { marginBottom: SPACING.sm }]}
+          onPress={() => navigation.navigate('SuperAdminPriceList')}
+        >
+          <Ionicons name="pricetags-outline" size={18} color={COLORS.Primary} />
+          <Text style={styles.wideActionText}>Price List</Text>
+          <Ionicons name="chevron-forward" size={18} color={COLORS.TextSecondary} />
+        </TouchableOpacity>
+
+        {/* Edit, enable, disable and delete a business, and its contacts.
+            Separate from "All businesses" below, which answers the narrower
+            question of which records are still missing details. */}
+        <TouchableOpacity
+          style={[styles.wideAction, { marginBottom: SPACING.sm }]}
+          onPress={() => navigation.navigate('SuperAdminManageBusinesses')}
+        >
+          <Ionicons name="business-outline" size={18} color={COLORS.Primary} />
+          <Text style={styles.wideActionText}>Manage businesses</Text>
+          <Ionicons name="chevron-forward" size={18} color={COLORS.TextSecondary} />
+        </TouchableOpacity>
 
         <TouchableOpacity
           style={styles.wideAction}

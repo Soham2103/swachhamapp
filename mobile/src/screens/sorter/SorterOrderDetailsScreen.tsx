@@ -16,11 +16,14 @@ import * as Sharing from 'expo-sharing';
 import { COLORS, SPACING, TYPOGRAPHY, BORDER_RADIUS, SHADOWS } from '../../constants/theme';
 import sorterApi, {
   SorterOrderDetail,
+  SorterOrderItem,
   SorterStage,
   ScanStatus,
   ScanStageName,
   DefectRecord,
 } from '../../services/sorterApi';
+import MarkDefectiveModal from './MarkDefectiveModal';
+import PendingItemsModal from './PendingItemsModal';
 import { API_BASE_URL } from '../../constants/api';
 import { extractErrorMessage } from '../../services/api';
 import { BusinessOrderDetail } from '../../services/businessOrderApi';
@@ -45,6 +48,16 @@ const NEXT_ACTION: Record<
   confirmed: { target: 'accepted', label: 'ACCEPT ORDER', scan: 'acceptance' },
   accepted: { target: 'ready', label: 'MARK AS READY' },
   ready: { target: 'out_for_delivery', label: 'OUT FOR DELIVERY', scan: 'delivery' },
+  /*
+   * A PART-FINISHED ORDER STILL MOVES. Its ready items go with this dispatch
+   * and the pending ones stay behind — holding the whole order because one
+   * item needs more time is exactly what this must not do.
+   */
+  partially_completed: {
+    target: 'out_for_delivery',
+    label: 'SEND READY ITEMS',
+    scan: 'delivery',
+  },
   out_for_delivery: null,
 };
 
@@ -64,8 +77,171 @@ export default function SorterOrderDetailsScreen({ navigation, route }: any) {
   const [isUpdating, setIsUpdating] = useState(false);
   const [isBuildingPdf, setIsBuildingPdf] = useState(false);
   const [error, setError] = useState('');
+  /** The line whose Mark Defective form is open, or null. */
+  const [defectiveFor, setDefectiveFor] = useState<SorterOrderItem | null>(null);
+  const [savingAdjustment, setSavingAdjustment] = useState(false);
+  const [sendingAdjustmentWhatsApp, setSendingAdjustmentWhatsApp] = useState(false);
+  /** The item whose status is being changed, so only its own row spins. */
+  const [itemBusyId, setItemBusyId] = useState<string | null>(null);
+  /** Open while the Sorter answers the pending-items question. */
+  const [pendingPrompt, setPendingPrompt] = useState(false);
   /** Synchronous lock: two taps in one frame cannot both fire a transition. */
   const busyRef = useRef(false);
+
+  /**
+   * Releases one held-back item once the Sorter has finished it.
+   *
+   * The server re-derives the ORDER's status from its items afterwards, so
+   * the order returns to READY_FOR_DELIVERY as soon as nothing is pending —
+   * which is why this reloads rather than patching state locally.
+   *
+   * Nothing financial moves: an item needing more time is not a defect, and
+   * releasing it changes no quantity, price, invoice or payment.
+   */
+  const setItemReady = async (item: SorterOrderItem) => {
+    if (itemBusyId) return;
+    setItemBusyId(item.id);
+    setError('');
+    try {
+      // 0 held = the whole line is finished and goes with the next dispatch.
+      const response = await sorterApi.setItemPendingQuantity(String(orderId), item.id, 0);
+      await load();
+      const left = response.data.pending_quantity;
+      Alert.alert(
+        'Item completed',
+        `All ${item.original_quantity} piece(s) of ${item.item_name} are ready.` +
+          (left > 0
+            ? `\n\n${left} piece(s) still pending on this order.`
+            : '\n\nEvery piece on this order is now ready.')
+      );
+    } catch (err: any) {
+      Alert.alert('Not saved', extractErrorMessage(err, 'Could not update the item'));
+    } finally {
+      setItemBusyId(null);
+    }
+  };
+
+  /**
+   * The pending-items answer, then the `ready` step.
+   *
+   * `itemIds` empty is "No, all items completed" and is NOT the same as not
+   * asking: it marks every line READY explicitly. The distinction is the
+   * server's, and it is what keeps every other caller's behaviour unchanged.
+   */
+  const finishWithPending = async (
+    pendingItems: Array<{ orderItemId: string; pendingQuantity: number }>,
+    reason: string
+  ) => {
+    if (busyRef.current) return;
+    busyRef.current = true;
+    setIsUpdating(true);
+    setError('');
+    try {
+      const response = await sorterApi.updateStatus(String(orderId), 'ready', {
+        items: pendingItems,
+        reason: reason || undefined,
+      });
+      setPendingPrompt(false);
+      await load();
+      const { pending_quantity: held, delivery_quantity: going } = response.data;
+      Alert.alert(
+        held > 0 ? 'Ready pieces sent forward' : 'Order marked ready',
+        held > 0
+          ? `${going} piece(s) go out for delivery.\n` +
+            `${held} piece(s) stay with Swachham for further processing.`
+          : 'Every piece on this order is ready.'
+      );
+    } catch (err: any) {
+      // The sheet stays open on failure, so the figures the Sorter typed are
+      // still there to correct rather than having to be entered again.
+      setError(extractErrorMessage(err, 'Could not update the order'));
+      Alert.alert('Not saved', extractErrorMessage(err, 'Could not update the order'));
+    } finally {
+      setIsUpdating(false);
+      busyRef.current = false;
+    }
+  };
+
+  /**
+   * Saves a defective quantity, then RELOADS the order from the server.
+   *
+   * The reload is the point: the server re-prices the line, the order total
+   * and the weights inside its transaction, so the screen shows what was
+   * actually stored rather than a locally patched copy that could drift from
+   * it — particularly if another Sorter adjusted the same order meanwhile.
+   */
+  const saveAdjustment = async (defectiveQuantity: number, reason: string) => {
+    if (!defectiveFor || savingAdjustment) return;
+    setSavingAdjustment(true);
+    setError('');
+    try {
+      const response = await sorterApi.adjustDefectiveQuantity(
+        String(orderId),
+        defectiveFor.id,
+        defectiveQuantity,
+        reason
+      );
+      setDefectiveFor(null);
+      await load();
+
+      // Pieces only. No amount is shown, and none is sent — see the note at
+      // the top of MarkDefectiveModal.
+      const saved = response.data.item;
+      Alert.alert(
+        'Defective adjustment saved',
+        `${saved.item_name}
+
+` +
+          `Original: ${saved.original_quantity}
+` +
+          `Defective: ${saved.defective_quantity}
+` +
+          `Final: ${saved.final_quantity}`,
+        [
+          { text: 'Done', style: 'cancel' },
+          { text: 'Send WhatsApp', onPress: sendAdjustmentWhatsApp },
+        ]
+      );
+    } catch (err: any) {
+      // The server's message is the useful one — it names which rule was
+      // broken, or why the order can no longer be adjusted.
+      setError(extractErrorMessage(err, 'Could not save the defective quantity'));
+      Alert.alert(
+        'Not saved',
+        extractErrorMessage(err, 'Could not save the defective quantity')
+      );
+    } finally {
+      setSavingAdjustment(false);
+    }
+  };
+
+  /**
+   * Tells the customer or business about the adjustment.
+   *
+   * A DELIBERATE, separate action: saving never sends, so correcting a figure
+   * three times does not send three messages. The server refuses a second
+   * send for the same adjustment, which is what makes a stray tap harmless.
+   */
+  const sendAdjustmentWhatsApp = async () => {
+    if (sendingAdjustmentWhatsApp) return;
+    setSendingAdjustmentWhatsApp(true);
+    setError('');
+    try {
+      const response = await sorterApi.sendAdjustmentWhatsApp(String(orderId));
+      await load();
+      if (response.data?.status === 'SENT') {
+        Alert.alert('Sent', `The adjustment was sent to ${response.data.sent_to || 'the customer'}.`);
+      } else {
+        // Meta refused it. The reason is shown as it came back, never softened
+        // into a success.
+        Alert.alert('Not sent', response.data?.error || 'WhatsApp did not accept the message.');
+      }
+    } catch (err: any) {
+      Alert.alert('Not sent', extractErrorMessage(err, 'Could not send the notification'));
+    } finally {
+      setSendingAdjustmentWhatsApp(false);
+    }
+  };
 
   const load = useCallback(async () => {
     try {
@@ -133,8 +309,34 @@ export default function SorterOrderDetailsScreen({ navigation, route }: any) {
     const action = NEXT_ACTION[order.stage];
     if (!action || busyRef.current) return;
 
+    /*
+     * THE PENDING-ITEMS QUESTION, asked at the step where the shop floor
+     * finishes with an order.
+     *
+     * It is ASKED, never assumed, because assuming "all done" is precisely
+     * how a half-finished order gets marked complete. Both answers are a
+     * deliberate tap, and neither is the default.
+     */
+    if (action.target === 'ready') {
+      Alert.alert(
+        'Pending items',
+        `Order #${order.order_number}\n\nAre there any pending items in this order?`,
+        [
+          { text: 'Cancel', style: 'cancel' },
+          { text: 'YES, PENDING ITEMS', onPress: () => setPendingPrompt(true) },
+          {
+            // The explicit "no": every line is marked READY and the order
+            // completes exactly as it always has.
+            text: 'NO, ALL COMPLETED',
+            onPress: () => finishWithPending([], ''),
+          },
+        ]
+      );
+      return;
+    }
+
     Alert.alert(
-      action.label === 'ACCEPT ORDER' ? 'Accept order' : 'Mark as ready',
+      action.label === 'ACCEPT ORDER' ? 'Accept order' : 'Confirm',
       `Order #${order.order_number}\n\nSet this order to "${action.target}"?`,
       [
         { text: 'Cancel', style: 'cancel' },
@@ -266,29 +468,186 @@ export default function SorterOrderDetailsScreen({ navigation, route }: any) {
 
         <View style={styles.card}>
           <Text style={styles.cardTitle}>Items ({order.item_count})</Text>
-          {order.items.map((item) => (
-            <View key={item.id} style={styles.itemRow}>
-              <View style={{ flex: 1, minWidth: 0 }}>
-                <Text style={styles.itemName}>{item.item_name}</Text>
-                <Text style={styles.itemMeta}>
-                  Service: {item.laundry_service_name || '—'}
-                </Text>
-                <Text style={styles.itemMeta}>
-                  {item.category_name || '—'} · {formatWeightKg(item.weight_kg)} each
-                </Text>
+          {order.items.map((item) => {
+            const isAdjusted = item.defective_quantity > 0;
+            return (
+              <View key={item.id} style={styles.itemBlock}>
+                <View style={styles.itemRow}>
+                  <View style={{ flex: 1, minWidth: 0 }}>
+                    <Text style={styles.itemName}>{item.item_name}</Text>
+                    <Text style={styles.itemMeta}>
+                      Service: {item.laundry_service_name || '—'}
+                    </Text>
+                    <Text style={styles.itemMeta}>
+                      {item.category_name || '—'} · {formatWeightKg(item.weight_kg)} each
+                    </Text>
+                  </View>
+                  <View style={styles.itemRight}>
+                    <Text style={styles.itemQty}>× {item.quantity}</Text>
+                    <Text style={styles.itemWeight}>
+                      {formatWeightKg(item.total_weight_kg)}
+                    </Text>
+                    {/* WHERE THIS LINE STANDS, on its own. This is what makes
+                        one item able to lag behind the rest of the order. */}
+                    <View
+                      style={[
+                        styles.itemStatusPill,
+                        item.pending_quantity > 0 && styles.itemStatusPending,
+                        item.item_status === 'READY' && styles.itemStatusReady,
+                      ]}
+                    >
+                      <Text
+                        style={[
+                          styles.itemStatusText,
+                          item.pending_quantity > 0 && styles.itemStatusTextPending,
+                          item.item_status === 'READY' && styles.itemStatusTextReady,
+                        ]}
+                      >
+                        {item.item_status === 'PARTIALLY_PENDING'
+                          ? `${item.delivery_quantity} GOING · ${item.pending_quantity} HELD`
+                          : item.item_status}
+                      </Text>
+                    </View>
+                  </View>
+                </View>
+
+                {/* Held pieces, and the one action that releases them. */}
+                {item.pending_quantity > 0 ? (
+                  <View style={styles.pendingBox}>
+                    <Text style={styles.pendingText}>
+                      {item.pending_quantity} of {item.original_quantity} held at Swachham
+                      {item.delivery_quantity > 0
+                        ? ` · ${item.delivery_quantity} out for delivery`
+                        : ''}
+                      {item.pending_reason ? ` · ${item.pending_reason}` : ''}
+                    </Text>
+                    <TouchableOpacity
+                      style={[
+                        styles.markReadyButton,
+                        itemBusyId === item.id && styles.buttonDisabled,
+                      ]}
+                      onPress={() => setItemReady(item)}
+                      disabled={itemBusyId !== null}
+                      accessibilityRole="button"
+                      accessibilityLabel={`Mark ${item.item_name} completed`}
+                    >
+                      {itemBusyId === item.id ? (
+                        <ActivityIndicator size="small" color={COLORS.Surface} />
+                      ) : (
+                        <>
+                          <Ionicons
+                            name="checkmark-circle-outline"
+                            size={16}
+                            color={COLORS.Surface}
+                          />
+                          <Text style={styles.markReadyText}>MARK COMPLETED</Text>
+                        </>
+                      )}
+                    </TouchableOpacity>
+                  </View>
+                ) : null}
+
+                {/* The adjustment, spelled out. Only on a line that has one, so
+                    an unadjusted line reads exactly as it always did. */}
+                {isAdjusted ? (
+                  <View style={styles.adjustBox}>
+                    <Text style={styles.adjustText}>
+                      Ordered {item.original_quantity} · Defective{' '}
+                      <Text style={styles.adjustDefect}>{item.defective_quantity}</Text> ·
+                      Final <Text style={styles.adjustFinal}>{item.quantity}</Text>
+                    </Text>
+
+                  </View>
+                ) : null}
+
+                <TouchableOpacity
+                  style={styles.markDefectiveButton}
+                  onPress={() => setDefectiveFor(item)}
+                  accessibilityRole="button"
+                  accessibilityLabel={`Mark defective pieces for ${item.item_name}`}
+                >
+                  <Ionicons name="alert-circle-outline" size={16} color={COLORS.Error} />
+                  <Text style={styles.markDefectiveText}>
+                    {isAdjusted ? 'EDIT DEFECTIVE' : 'MARK DEFECTIVE'}
+                  </Text>
+                </TouchableOpacity>
               </View>
-              <View style={styles.itemRight}>
-                <Text style={styles.itemQty}>× {item.quantity}</Text>
-                <Text style={styles.itemWeight}>{formatWeightKg(item.total_weight_kg)}</Text>
-              </View>
-            </View>
-          ))}
+            );
+          })}
 
           <View style={styles.totalRow}>
             <Text style={styles.totalLabel}>Total Weight</Text>
             <Text style={styles.totalValue}>{formatWeightKg(order.total_weight_kg)}</Text>
           </View>
+          {/* NO ORDER TOTAL. The Sorter is never sent one — see the note at
+              the top of MarkDefectiveModal. Pieces and weight are the shop
+              floor's units. */}
+          {order.has_pending_items ? (
+            <View style={styles.totalRow}>
+              <Text style={styles.totalLabel}>Pieces</Text>
+              <Text style={styles.totalValue}>
+                {order.delivery_quantity} out for delivery · {order.pending_quantity} pending
+              </Text>
+            </View>
+          ) : null}
         </View>
+
+        {/* ---- DEFECTIVE ADJUSTMENT: history, money position, notify ---- */}
+        {order.has_adjustment ? (
+          <View style={styles.card}>
+            <Text style={styles.cardTitle}>Defective adjustment</Text>
+
+            {order.adjustments.map((adjustment) => (
+              <View key={adjustment.id} style={styles.adjustRow}>
+                <Text style={styles.adjustRowTitle}>{adjustment.item_name}</Text>
+                <Text style={styles.itemMeta}>
+                  {adjustment.original_quantity} ordered · {adjustment.defective_quantity}{' '}
+                  defective · {adjustment.final_quantity} final
+                </Text>
+                {adjustment.previous_defective_quantity > 0 &&
+                adjustment.previous_defective_quantity !== adjustment.defective_quantity ? (
+                  <Text style={styles.itemMeta}>
+                    Corrected from {adjustment.previous_defective_quantity}
+                  </Text>
+                ) : null}
+                {adjustment.reason ? (
+                  <Text style={styles.itemMeta}>Reason: {adjustment.reason}</Text>
+                ) : null}
+                <Text style={styles.adjustMetaFaint}>
+                  {adjustment.adjusted_by_name || 'Sorter'} ·{' '}
+                  {formatDateTime(adjustment.adjusted_at).date}{' '}
+                  {formatDateTime(adjustment.adjusted_at).time}
+                </Text>
+              </View>
+            ))}
+
+            {order.adjustment_notifications.length > 0 ? (
+              <Text style={styles.adjustMetaFaint}>
+                Last notification:{' '}
+                {order.adjustment_notifications[0].status === 'SENT'
+                  ? `sent to ${order.adjustment_notifications[0].sent_to || 'the customer'}`
+                  : order.adjustment_notifications[0].error || 'not sent'}
+              </Text>
+            ) : null}
+
+            <TouchableOpacity
+              style={[styles.defectButton, sendingAdjustmentWhatsApp && styles.buttonDisabled]}
+              onPress={sendAdjustmentWhatsApp}
+              disabled={sendingAdjustmentWhatsApp}
+              accessibilityRole="button"
+              accessibilityLabel="Send the adjustment to the customer on WhatsApp"
+            >
+              {sendingAdjustmentWhatsApp ? (
+                <ActivityIndicator size="small" color={COLORS.Surface} />
+              ) : (
+                <>
+                  <Ionicons name="logo-whatsapp" size={18} color={COLORS.Surface} />
+                  <Text style={styles.defectButtonText}>SEND WHATSAPP</Text>
+                </>
+              )}
+            </TouchableOpacity>
+          </View>
+        ) : null}
 
         {/* Garment verification. The counts come from the server, and the
             forward action stays locked until it reports a match — the server
@@ -498,14 +857,37 @@ export default function SorterOrderDetailsScreen({ navigation, route }: any) {
           </View>
         )}
       </ScrollView>
+
+      {/* The form is a controlled sheet over this screen rather than a route,
+          so the order stays on screen behind it and no navigation state is
+          involved in what is a single field and a save. */}
+      <MarkDefectiveModal
+        visible={defectiveFor !== null}
+        item={defectiveFor}
+        orderNumber={order.order_number}
+        saving={savingAdjustment}
+        onCancel={() => setDefectiveFor(null)}
+        onSave={saveAdjustment}
+      />
+
+      {/* Which items are pending, asked only after the Sorter says some are. */}
+      <PendingItemsModal
+        visible={pendingPrompt}
+        items={order.items}
+        orderNumber={order.order_number}
+        saving={isUpdating}
+        onCancel={() => setPendingPrompt(false)}
+        onSave={finishWithPending}
+      />
     </SafeAreaView>
   );
 }
 
 /**
  * Adapts the Sorter payload to the shape the shared PDF template reads, so the
- * document the Sorter opens is the same one the Business app produces. Amounts
- * are zero here — the template then omits its pricing columns entirely.
+ * document the Sorter opens is the same one the Business app produces. Neither
+ * shape carries amounts: a business order's price is an internal figure used
+ * to raise the invoice, and no operational document prints it.
  */
 function toPdfShape(order: SorterOrderDetail): BusinessOrderDetail {
   return {
@@ -516,20 +898,21 @@ function toPdfShape(order: SorterOrderDetail): BusinessOrderDetail {
     service_type: null,
     service_name: null,
     status: order.status,
-    total: 0,
     item_count: order.item_count,
     total_quantity: order.total_quantity,
     total_weight_kg: order.total_weight_kg,
     created_at: order.created_at,
     business_name: order.customer_name,
     contact_person_name: null,
-    business_mobile: order.customer_contact,
+    // The PDF states the number the order was PLACED on, not the number the
+    // shop floor calls -- so it is placed_by_mobile, and never the account's.
+    placed_by_mobile: order.placed_by_mobile,
+    // Drives whether the document splits Qty into Ordered / Defective / Final.
+    has_adjustment: order.has_adjustment,
+    // Drives the Status column, so a pending item is never printed as ready.
+    has_pending_items: order.has_pending_items,
     business_email: null,
     business_address: null,
-    subtotal: 0,
-    delivery_charge: 0,
-    tax: 0,
-    coupon_discount: 0,
     items: order.items.map((item) => ({
       id: item.id,
       service_id: null,
@@ -539,11 +922,15 @@ function toPdfShape(order: SorterOrderDetail): BusinessOrderDetail {
       category_name: item.category_name,
       image_url: null,
       quantity: item.quantity,
+      original_quantity: item.original_quantity,
+      defective_quantity: item.defective_quantity,
+      item_status: item.item_status,
+      pending_quantity: item.pending_quantity,
+      delivery_quantity: item.delivery_quantity,
+      pending_reason: item.pending_reason,
       unit: item.unit,
       weight_kg: item.weight_kg,
       total_weight_kg: item.total_weight_kg,
-      unit_price: 0,
-      total_price: 0,
     })),
   };
 }
@@ -737,6 +1124,140 @@ const styles = StyleSheet.create({
     letterSpacing: 0.5,
   },
   // ---- Defective piece ----
+  /* ---- Pending items / partial completion ---- */
+  itemStatusPill: {
+    marginTop: 4,
+    paddingHorizontal: SPACING.xs,
+    paddingVertical: 2,
+    borderRadius: BORDER_RADIUS.sm,
+    backgroundColor: COLORS.Background,
+  },
+  itemStatusPending: { backgroundColor: '#FFF4E5' },
+  itemStatusReady: { backgroundColor: '#E6F4EC' },
+  itemStatusText: {
+    fontFamily: TYPOGRAPHY.fontFamily,
+    fontSize: 10,
+    fontWeight: '700',
+    letterSpacing: 0.4,
+    color: COLORS.TextSecondary,
+  },
+  itemStatusTextPending: { color: '#8A5200' },
+  itemStatusTextReady: { color: '#1B4332' },
+  pendingBox: {
+    backgroundColor: '#FFF9F0',
+    borderRadius: BORDER_RADIUS.sm,
+    padding: SPACING.sm,
+    marginTop: SPACING.xs,
+    gap: SPACING.xs,
+  },
+  pendingText: {
+    fontFamily: TYPOGRAPHY.fontFamily,
+    fontSize: TYPOGRAPHY.sizes.xs,
+    color: '#8A5200',
+    lineHeight: 18,
+  },
+  markReadyButton: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: SPACING.xs,
+    backgroundColor: COLORS.Success,
+    borderRadius: BORDER_RADIUS.sm,
+    paddingVertical: SPACING.xs,
+  },
+  markReadyText: {
+    fontFamily: TYPOGRAPHY.fontFamily,
+    fontSize: TYPOGRAPHY.sizes.xs,
+    fontWeight: '700',
+    letterSpacing: 0.5,
+    color: COLORS.Surface,
+  },
+
+  /* ---- Defective piece adjustment ---- */
+  itemBlock: { borderBottomWidth: 1, borderBottomColor: COLORS.Border, paddingBottom: SPACING.sm },
+  itemAmount: {
+    fontFamily: TYPOGRAPHY.fontFamily,
+    fontSize: TYPOGRAPHY.sizes.sm,
+    fontWeight: '700',
+    color: COLORS.TextPrimary,
+    marginTop: 2,
+  },
+  adjustBox: {
+    backgroundColor: '#FDF2F2',
+    borderRadius: BORDER_RADIUS.sm,
+    paddingVertical: SPACING.xs,
+    paddingHorizontal: SPACING.sm,
+    marginTop: SPACING.xs,
+  },
+  adjustText: {
+    fontFamily: TYPOGRAPHY.fontFamily,
+    fontSize: TYPOGRAPHY.sizes.xs,
+    color: COLORS.TextSecondary,
+  },
+  adjustDefect: { color: COLORS.Error, fontWeight: '700' },
+  adjustFinal: { color: COLORS.TextPrimary, fontWeight: '700' },
+  adjustAmount: {
+    fontFamily: TYPOGRAPHY.fontFamily,
+    fontSize: TYPOGRAPHY.sizes.xs,
+    fontWeight: '700',
+    color: COLORS.TextPrimary,
+    marginTop: 2,
+  },
+  markDefectiveButton: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: SPACING.xs,
+    borderWidth: 1,
+    borderColor: COLORS.Error,
+    borderRadius: BORDER_RADIUS.sm,
+    paddingVertical: SPACING.xs,
+    marginTop: SPACING.sm,
+  },
+  markDefectiveText: {
+    fontFamily: TYPOGRAPHY.fontFamily,
+    fontSize: TYPOGRAPHY.sizes.xs,
+    fontWeight: '700',
+    letterSpacing: 0.5,
+    color: COLORS.Error,
+  },
+  adjustRow: {
+    borderBottomWidth: 1,
+    borderBottomColor: COLORS.Border,
+    paddingVertical: SPACING.sm,
+  },
+  adjustRowTitle: {
+    fontFamily: TYPOGRAPHY.fontFamily,
+    fontSize: TYPOGRAPHY.sizes.sm,
+    fontWeight: '700',
+    color: COLORS.TextPrimary,
+  },
+  adjustMetaFaint: {
+    fontFamily: TYPOGRAPHY.fontFamily,
+    fontSize: TYPOGRAPHY.sizes.xs,
+    color: COLORS.TextSecondary,
+    marginTop: SPACING.xs,
+  },
+  totalStruck: {
+    fontFamily: TYPOGRAPHY.fontFamily,
+    fontSize: TYPOGRAPHY.sizes.sm,
+    color: COLORS.TextSecondary,
+    textDecorationLine: 'line-through',
+  },
+  paymentNote: {
+    backgroundColor: COLORS.Background,
+    borderRadius: BORDER_RADIUS.sm,
+    padding: SPACING.sm,
+    marginTop: SPACING.sm,
+  },
+  paymentNoteWarn: { backgroundColor: '#FFF7E6' },
+  paymentNoteText: {
+    fontFamily: TYPOGRAPHY.fontFamily,
+    fontSize: TYPOGRAPHY.sizes.xs,
+    color: COLORS.TextPrimary,
+    lineHeight: 18,
+  },
+
   defectItem: {
     borderTopWidth: 1,
     borderTopColor: COLORS.Border,

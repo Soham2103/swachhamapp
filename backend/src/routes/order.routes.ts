@@ -11,7 +11,10 @@ router.use(authenticate);
 router.post('/', requireServiceArea, async (req: Request, res: Response, next: NextFunction) => {
   try {
     const authReq = req as AuthenticatedRequest;
-    const order = await createOrder(authReq.user!.id, req.body);
+    // The number is taken from the SESSION -- whatever the body says about
+    // `placed_by_mobile` is ignored, so an order cannot be stamped with a
+    // number the caller did not prove by OTP.
+    const order = await createOrder(authReq.user!.id, req.body, authReq.user!.mobile);
     sendSuccess(res, order, 'Order created successfully', 201);
   } catch (error) {
     next(error);

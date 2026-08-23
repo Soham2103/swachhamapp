@@ -201,7 +201,7 @@ export async function businessLogin(email: string, password: string): Promise<Au
   logger.debug(`[AuthService] Business login attempt for: ${email}`);
   const userResult = await query<UserProfile & { password_hash: string; business_id: string }>(
     `SELECT bu.id, bu.name, bu.email, bu.password_hash, bu.is_active, bu.created_at, bu.updated_at,
-            COALESCE(bu.mobile_number, b.mobile_number) AS mobile,
+            bu.mobile_number AS mobile,
             b.status as business_status
      FROM business_users bu
      JOIN businesses b ON bu.business_id = b.id
@@ -554,7 +554,7 @@ export async function getMe(userId: string, role?: string): Promise<UserProfile>
   const businessLookup = () =>
     query<UserProfile>(
       `SELECT bu.id, bu.name, bu.email,
-              COALESCE(bu.mobile_number, b.mobile_number, '') AS mobile,
+              COALESCE(bu.mobile_number, '') AS mobile,
               'BUSINESS' as role, bu.is_active, bu.created_at, bu.updated_at
        FROM business_users bu
        JOIN businesses b ON b.id = bu.business_id
@@ -739,33 +739,53 @@ export async function businessRegister(data: {
 
   const passwordHash = await bcrypt.hash(data.password, SALT_ROUNDS);
 
-  // Insert business
+  // Insert business. Only the ESTABLISHMENT'S OWN fields: every contact
+  // column moved to `business_users` in migration 031, so a business row no
+  // longer has anywhere to put a person.
   const businessInsert = await query(
     `INSERT INTO businesses (
-      name, business_type, other_type_specify, address, gst_number, pan_number, website,
-      contact_person_name, designation, mobile_number, whatsapp_number,
-      alternate_contact_person, alternate_mobile_no, status
+      name, business_type, registration_type, other_type_specify, address,
+      gst_number, pan_number, website, status
      -- Signups now wait for a super admin decision instead of going
      -- live on submit; the approval queue is what makes them ACTIVE.
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING')`,
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'PENDING')`,
     [
-      data.establishmentName, data.customerType, data.otherTypeSpecify || null, data.establishmentAddress,
-      data.gstNumber || null, data.panNumber || null, data.website || null,
-      data.contactPersonName, data.designation || null, data.mobileNumber,
-      data.whatsappNumber || null, data.alternateContactPerson || null, data.alternateMobileNo || null
+      data.establishmentName, data.customerType,
+      // A self-registration that supplied a GSTIN is a B2B one; without one
+      // it is B2C. The same rule the Manager's form applies, not a second.
+      data.gstNumber ? 'B2B' : 'B2C',
+      data.otherTypeSpecify || null, data.establishmentAddress,
+      data.gstNumber || null, data.panNumber || null, data.website || null
     ]
   );
 
   const businessId = businessInsert.insertId;
 
-  // Insert business user. The registration mobile number is stored on the
-  // account row too, so the authenticated Business record carries it and the
-  // number never has to be asked for again.
+  // The contact person IS the account: one PRIMARY row carrying the name,
+  // designation, both numbers, the email that is the username, and the hash.
   const userInsert = await query(
-    `INSERT INTO business_users (business_id, name, email, mobile_number, password_hash, is_active)
-     VALUES (?, ?, ?, ?, ?, true)`,
-    [businessId, data.contactPersonName, data.emailId.toLowerCase(), data.mobileNumber, passwordHash]
+    `INSERT INTO business_users
+       (business_id, contact_type, name, designation, email, mobile_number,
+        whatsapp_number, password_hash, is_active, login_enabled)
+     VALUES (?, 'PRIMARY', ?, ?, ?, ?, ?, ?, true, true)`,
+    [
+      businessId, data.contactPersonName, data.designation || null,
+      data.emailId.toLowerCase(), data.mobileNumber, data.whatsappNumber || null,
+      passwordHash,
+    ]
   );
+
+  // The alternative contact, when one was given, as a row of its own -- so
+  // that number identifies this business at sign-in like any other contact's.
+  if (data.alternateMobileNo) {
+    await query(
+      `INSERT INTO business_users
+         (business_id, contact_type, name, designation, email, mobile_number,
+          whatsapp_number, password_hash, is_active, login_enabled)
+       VALUES (?, 'ALTERNATIVE', ?, NULL, NULL, ?, NULL, NULL, true, true)`,
+      [businessId, data.alternateContactPerson || 'Alternative contact', data.alternateMobileNo]
+    );
+  }
 
   const userId = userInsert.insertId;
 

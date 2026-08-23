@@ -2,10 +2,31 @@ import { query } from '../config/database';
 import { AppError } from '../utils/appError';
 import { getCompleteness, Completeness } from './businessCompleteness';
 
+/**
+ * A business's own profile.
+ *
+ * WHERE EACH FIELD NOW LIVES. Migration 031 split what used to be one wide
+ * `businesses` row in two:
+ *
+ *   businesses      the establishment — name, type, B2B/B2C, GSTIN, PAN,
+ *                   addresses, city/state/pincode, status
+ *   business_users  the people — the head (PRIMARY, which is also the login
+ *                   account) and the alternative contacts
+ *
+ * The RESPONSE SHAPE IS UNCHANGED, deliberately: `contact_person_name`,
+ * `mobile_number`, `email_id`, `alternate_contact_person` and
+ * `alternate_mobile_no` are all still returned under those names, they are
+ * simply read from the contact rows now. The app's existing profile screen
+ * needs no change to keep working.
+ */
+
 export interface BusinessProfile {
   business_id: string;
   business_name: string;
+  /** The establishment CATEGORY (hotel, restaurant…), from businesses.business_type. */
   customer_type: string | null;
+  /** B2B or B2C — the registration type. */
+  registration_type: string;
   other_type_specify: string | null;
   establishment_address: string | null;
   gst_number: string | null;
@@ -52,6 +73,20 @@ async function getOwnedBusinessId(businessUserId: string): Promise<string> {
   return row.business_id;
 }
 
+/**
+ * The first alternative contact, as the two flat fields the profile has
+ * always reported. A business may hold up to three; this pair is the
+ * self-service view of the first, and the Super Admin screens show the
+ * whole list.
+ */
+const ALTERNATE_COLUMNS = `
+  (SELECT a.name FROM business_users a
+    WHERE a.business_id = b.id AND a.contact_type = 'ALTERNATIVE'
+    ORDER BY a.id LIMIT 1) AS alternate_contact_person,
+  (SELECT a.mobile_number FROM business_users a
+    WHERE a.business_id = b.id AND a.contact_type = 'ALTERNATIVE'
+    ORDER BY a.id LIMIT 1) AS alternate_mobile_no`;
+
 async function getProfile(businessUserId: string): Promise<BusinessProfile> {
   const businessId = await getOwnedBusinessId(businessUserId);
 
@@ -59,14 +94,15 @@ async function getProfile(businessUserId: string): Promise<BusinessProfile> {
     `SELECT b.id AS business_id,
             b.name AS business_name,
             b.business_type AS customer_type,
+            b.registration_type,
             b.other_type_specify,
             COALESCE(b.establishment_address, b.address) AS establishment_address,
             b.gst_number, b.pan_number, b.website,
-            b.contact_person_name, b.designation,
-            COALESCE(bu.mobile_number, b.mobile_number) AS mobile_number,
-            b.whatsapp_number,
-            COALESCE(b.email_id, bu.email) AS email_id,
-            b.alternate_contact_person, b.alternate_mobile_no,
+            bu.name AS contact_person_name, bu.designation,
+            bu.mobile_number,
+            bu.whatsapp_number,
+            COALESCE(bu.email, b.email) AS email_id,
+            ${ALTERNATE_COLUMNS},
             b.status,
             bu.name AS account_name,
             bu.email AS account_email,
@@ -111,6 +147,23 @@ function optionalText(value: unknown): string | null {
 }
 
 /**
+ * What one profile submission changes, split by the table it changes.
+ *
+ * `businessFields` go to `businesses`, `contactFields` to the business's
+ * PRIMARY `business_users` row, and `alternate` replaces the first
+ * alternative contact. Splitting it here rather than at each call site is
+ * what keeps the self-service update and the Super Admin's update applying
+ * the same rules to the same columns.
+ */
+export interface ProfileUpdatePlan {
+  fields: string[];
+  values: unknown[];
+  contactFields: string[];
+  contactValues: unknown[];
+  alternate?: { name: string | null; mobile: string | null };
+}
+
+/**
  * Turns a profile input into SQL assignments, with every field's
  * validation in one place.
  *
@@ -122,9 +175,11 @@ function optionalText(value: unknown): string | null {
 export function buildBusinessProfileUpdate(
   input: UpdateBusinessProfileInput & { establishmentName?: string },
   options: { allowNameChange?: boolean } = {}
-): { fields: string[]; values: unknown[] } {
+): ProfileUpdatePlan {
   const fields: string[] = [];
   const values: unknown[] = [];
+  const contactFields: string[] = [];
+  const contactValues: unknown[] = [];
 
   if (input.customerType !== undefined) {
     const value = String(input.customerType).trim().toUpperCase();
@@ -176,18 +231,20 @@ export function buildBusinessProfileUpdate(
     values.push(value);
   }
 
+  /* ---- The contact person: `business_users`, not `businesses` ---- */
+
   if (input.contactPersonName !== undefined) {
     const value = String(input.contactPersonName).trim();
     if (value.length < 2 || value.length > 255) {
       throw new AppError('Contact person name must be between 2 and 255 characters', 400);
     }
-    fields.push('contact_person_name = ?');
-    values.push(value);
+    contactFields.push('name = ?');
+    contactValues.push(value);
   }
 
   if (input.designation !== undefined) {
-    fields.push('designation = ?');
-    values.push(optionalText(input.designation));
+    contactFields.push('designation = ?');
+    contactValues.push(optionalText(input.designation));
   }
 
   if (input.mobileNumber !== undefined) {
@@ -195,8 +252,8 @@ export function buildBusinessProfileUpdate(
     if (!MOBILE_RE.test(value)) {
       throw new AppError('Invalid mobile number', 400);
     }
-    fields.push('mobile_number = ?');
-    values.push(value);
+    contactFields.push('mobile_number = ?');
+    contactValues.push(value);
   }
 
   if (input.whatsappNumber !== undefined) {
@@ -204,8 +261,8 @@ export function buildBusinessProfileUpdate(
     if (value && !MOBILE_RE.test(value)) {
       throw new AppError('Invalid WhatsApp number', 400);
     }
-    fields.push('whatsapp_number = ?');
-    values.push(value);
+    contactFields.push('whatsapp_number = ?');
+    contactValues.push(value);
   }
 
   if (input.emailId !== undefined) {
@@ -213,24 +270,20 @@ export function buildBusinessProfileUpdate(
     if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value)) {
       throw new AppError('Invalid email address', 400);
     }
-    fields.push('email_id = ?');
-    values.push(value);
+    contactFields.push('email = ?');
+    contactValues.push(value);
   }
 
-  if (input.alternateContactPerson !== undefined) {
-    fields.push('alternate_contact_person = ?');
-    values.push(optionalText(input.alternateContactPerson));
-  }
+  /* ---- The first alternative contact ---- */
 
-  if (input.alternateMobileNo !== undefined) {
-    const value = optionalText(input.alternateMobileNo);
-    if (value && !MOBILE_RE.test(value)) {
+  let alternate: ProfileUpdatePlan['alternate'];
+  if (input.alternateContactPerson !== undefined || input.alternateMobileNo !== undefined) {
+    const mobile = optionalText(input.alternateMobileNo);
+    if (mobile && !MOBILE_RE.test(mobile)) {
       throw new AppError('Invalid alternate mobile number', 400);
     }
-    fields.push('alternate_mobile_no = ?');
-    values.push(value);
+    alternate = { name: optionalText(input.alternateContactPerson), mobile };
   }
-
 
   // Only the super admin path may correct the establishment name; on the
   // self-service path the name is the profile's identity and is fixed.
@@ -243,7 +296,76 @@ export function buildBusinessProfileUpdate(
     values.push(value, value);
   }
 
-  return { fields, values };
+  return { fields, values, contactFields, contactValues, alternate };
+}
+
+/**
+ * Applies the contact half of a profile update.
+ *
+ * `contactRowId` is the row to write the head onto — the authenticated
+ * account on the self-service path, the business's PRIMARY row on the Super
+ * Admin path. The alternative is written as a real contact row, so the same
+ * number that appears here is the one the sign-in lookup will find.
+ */
+export async function applyContactUpdate(
+  businessId: string,
+  contactRowId: string | null,
+  plan: ProfileUpdatePlan
+): Promise<void> {
+  if (plan.contactFields.length > 0 && contactRowId) {
+    await query(
+      `UPDATE business_users SET ${plan.contactFields.join(', ')}, updated_at = NOW()
+        WHERE id = ?`,
+      [...plan.contactValues, contactRowId]
+    );
+  }
+
+  if (!plan.alternate) return;
+
+  const existing = await query<{ id: string }>(
+    `SELECT id FROM business_users
+      WHERE business_id = ? AND contact_type = 'ALTERNATIVE'
+      ORDER BY id LIMIT 1`,
+    [businessId]
+  );
+
+  // A blank number clears the contact rather than leaving a nameless row
+  // behind; a row that carries credentials is never removed this way.
+  if (!plan.alternate.mobile) {
+    if (existing.rows[0]) {
+      await query(`DELETE FROM business_users WHERE id = ? AND password_hash IS NULL`, [
+        existing.rows[0].id,
+      ]);
+    }
+    return;
+  }
+
+  const clash = await query<{ id: string }>(
+    `SELECT id FROM business_users WHERE mobile_number = ? AND business_id <> ?`,
+    [plan.alternate.mobile, businessId]
+  );
+  if (clash.rows[0]) {
+    throw new AppError(
+      'That alternate mobile number is already registered against another business.',
+      409
+    );
+  }
+
+  const name = plan.alternate.name || 'Alternative contact';
+  if (existing.rows[0]) {
+    await query(
+      `UPDATE business_users SET name = ?, mobile_number = ?, updated_at = NOW() WHERE id = ?`,
+      [name, plan.alternate.mobile, existing.rows[0].id]
+    );
+    return;
+  }
+  await query(
+    `INSERT INTO business_users
+       (business_id, contact_type, name, designation, email, mobile_number,
+        whatsapp_number, password_hash, is_active, login_enabled)
+     VALUES (?, 'ALTERNATIVE', ?, NULL, NULL, ?, NULL, NULL, TRUE, TRUE)`,
+    [businessId, name, plan.alternate.mobile]
+  );
 }
 
 /**
@@ -256,25 +378,18 @@ async function updateProfile(
 ): Promise<BusinessProfile> {
   const businessId = await getOwnedBusinessId(businessUserId);
 
-  const { fields, values } = buildBusinessProfileUpdate(input);
+  const plan = buildBusinessProfileUpdate(input);
 
-  if (fields.length === 0) {
-    return getProfile(businessUserId);
-  }
-
-  fields.push('updated_at = NOW()');
-  values.push(businessId);
-
-  await query(`UPDATE businesses SET ${fields.join(', ')} WHERE id = ?`, values);
-
-  // Keep the account row's mobile number in step with the profile, since the
-  // authenticated record is what the Order Summary and PDF read.
-  if (input.mobileNumber !== undefined) {
-    await query(`UPDATE business_users SET mobile_number = ?, updated_at = NOW() WHERE id = ?`, [
-      String(input.mobileNumber).trim(),
-      businessUserId,
+  if (plan.fields.length > 0) {
+    await query(`UPDATE businesses SET ${plan.fields.join(', ')}, updated_at = NOW() WHERE id = ?`, [
+      ...plan.values,
+      businessId,
     ]);
   }
+
+  // The contact person is the signed-in account's own row, which is also
+  // what the Order Summary and the PDF read.
+  await applyContactUpdate(businessId, businessUserId, plan);
 
   return getProfile(businessUserId);
 }

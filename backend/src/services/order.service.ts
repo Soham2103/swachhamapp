@@ -3,6 +3,8 @@ import { logger } from '../utils/logger';
 import { validateCoupon } from './cart.service';
 import socketService from './socket.service';
 import { createNotification } from './notification.service';
+import { requireCustomerPrices } from './priceList.service';
+import { normaliseMobileOrNull } from './businessContact.service';
 
 const DELIVERY_CHARGE = 40;
 const FREE_DELIVERY_THRESHOLD = 399;
@@ -46,7 +48,22 @@ export interface OrderRow {
  */
 async function createOrder(
   userId: string,
-  input: CreateOrderInput
+  input: CreateOrderInput,
+  /**
+   * The mobile number this session was PROVEN on, from the token.
+   *
+   * A customer signs in by OTP and nothing else, so this is the number they
+   * verified to get here. It is stamped on the order so the order's documents
+   * can state the number the order was actually placed from, rather than
+   * whatever the profile happens to say today.
+   *
+   * It comes from the SESSION, never from the request body: a caller cannot
+   * put someone else's number on their order by sending one.
+   *
+   * Optional -- a session minted before the token carried this has none, and
+   * the order keeps NULL rather than being stamped with a guess.
+   */
+  placedByMobile?: string
 ): Promise<OrderRow> {
   const connection = await getClient();
   try {
@@ -60,9 +77,14 @@ async function createOrder(
     const cart = cartRows[0];
     if (!cart) throw new Error('Cart not found');
 
-    // 2) Get cart items
+    // 2) Get cart items.
+    //
+    // No price is selected here. `price_at_add` on the cart line and
+    // anything the client sent are both ignored: the amount billed is
+    // resolved from the price list below, so a tampered request cannot
+    // change what the order costs.
     const [cartItems]: any = await connection.execute(
-      `SELECT ci.service_id, s.name AS service_name, s.unit, ci.quantity, s.base_price AS price
+      `SELECT ci.service_id, s.name AS service_name, s.unit, ci.quantity
        FROM cart_items ci
        JOIN services s ON s.id = ci.service_id
        WHERE ci.cart_id = ?`,
@@ -70,7 +92,16 @@ async function createOrder(
     );
     if (cartItems.length === 0) throw new Error('Cart is empty');
 
-    // 3) Calculate pricing
+    // 3) Prices, from the GLOBAL customer price list. Every customer
+    //    pays the same figure for the same item; nothing here is
+    //    per-customer, and business_price_list is never consulted.
+    const customerPrices = await requireCustomerPrices(
+      cartItems.map((item: any) => String(item.service_id))
+    );
+    for (const item of cartItems) {
+      item.price = customerPrices.get(String(item.service_id))!;
+    }
+
     const subtotal = cartItems.reduce(
       (sum: number, item: any) => sum + Number(item.price) * Number(item.quantity),
       0
@@ -95,14 +126,17 @@ async function createOrder(
     // 5) INSERT order, then stamp its number from the generated id.
     const [orderInsert]: any = await connection.execute(
       `INSERT INTO orders (
-         user_id, address_id, order_number, status, subtotal,
+         user_id, address_id, placed_by_mobile, order_number, status, subtotal,
          delivery_charge, coupon_discount, coupon_id, total,
          payment_method, payment_status, special_notes
        )
-       VALUES (?, ?, '', 'ORDER_PLACED', ?, ?, ?, ?, ?, ?, 'PENDING', ?)`,
+       VALUES (?, ?, ?, '', 'ORDER_PLACED', ?, ?, ?, ?, ?, ?, 'PENDING', ?)`,
+      // `placed_by_mobile` is written ONCE, here, and never updated: changing
+      // the profile number later must not rewrite what an order already says.
       [
         userId,
         input.address_id,
+        normaliseMobileOrNull(placedByMobile),
         subtotal,
         delivery_charge,
         discountAmount,
@@ -130,13 +164,17 @@ async function createOrder(
     // 6) INSERT order_items
     for (const item of cartItems) {
       await connection.execute(
-        `INSERT INTO order_items (order_id, service_id, service_name, unit, quantity, unit_price, total_price)
-         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+        // `original_quantity` equals `quantity` at placement — nothing has been
+        // found defective yet. Written explicitly so the pieces the order was
+        // placed for are on the row from the start.
+        `INSERT INTO order_items (order_id, service_id, service_name, unit, quantity, original_quantity, defective_quantity, unit_price, total_price)
+         VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?)`,
         [
           orderId,
           item.service_id,
           item.service_name,
           item.unit,
+          item.quantity,
           item.quantity,
           item.price,
           Number(item.price) * Number(item.quantity),

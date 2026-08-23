@@ -15,7 +15,30 @@ export interface SignInResult {
   role?: string;
   name?: string | null;
   preAuthToken?: string;
+  /**
+   * Present when the verified number turned out to belong to a business --
+   * as its primary contact or as one of its alternative contacts. The SERVER
+   * decides this from the contact rows; nothing is asked of the user.
+   *
+   * `login_email` is the email to sign in WITH, never a password.
+   */
+  business?: { id: string; name: string; login_email: string };
+  contact?: { name: string; designation: string | null; is_primary: boolean };
   message?: string;
+}
+
+/**
+ * What a verified business contact number resolves to.
+ *
+ * NO CREDENTIAL IS IN HERE. `login_email` is the email to sign in WITH -- the
+ * primary contact's, which is printed on that business's own paperwork -- and
+ * `preAuthToken` only unlocks a password attempt against this one business.
+ * Neither is a session, and neither can open an authenticated route.
+ */
+export interface BusinessSignInTarget {
+  business: { id: string; name: string; login_email: string };
+  contact: { name: string; designation: string | null; is_primary: boolean };
+  preAuthToken: string;
 }
 import { ApiResponse, User, LoginPayload, RegisterPayload, BusinessRegisterPayload } from '../types';
 import { API_ENDPOINTS } from '../constants/api';
@@ -281,6 +304,50 @@ export const authApi = {
         otp: otp.replace(/[^0-9]/g, ''),
         deviceId: await getDeviceId(),
       }
+    );
+    return response.data;
+  },
+
+  /* ---- Business sign-in ----
+   *
+   * For any of a business's registered contacts: the primary one, and the
+   * alternative contacts who have no account and no password of their own.
+   *
+   * Step 1 sends an OTP, but ONLY to a number registered against a business --
+   * an unrecognised number comes back as an error rather than quietly becoming
+   * a customer, which is the difference from the unified sign-in above.
+   *
+   * Step 2 verifies it and identifies the business. Step 3 is `signinPassword`
+   * below -- the SAME call every other role uses, with the business's own
+   * email and password. There is no separate business password endpoint.
+   */
+  businessSendOtp: async (mobile: string): Promise<ApiResponse<{ business_name: string }>> => {
+    const response = await apiClient.post<ApiResponse<{ business_name: string }>>(
+      '/api/auth/business/send-otp',
+      { mobile: normalizeMobile(mobile), deviceId: await getDeviceId() }
+    );
+    return response.data;
+  },
+
+  businessVerifyOtp: async (
+    mobile: string,
+    otp: string
+  ): Promise<ApiResponse<BusinessSignInTarget>> => {
+    const response = await apiClient.post<ApiResponse<BusinessSignInTarget>>(
+      '/api/auth/business/verify-otp',
+      {
+        mobile: normalizeMobile(mobile),
+        otp: otp.replace(/[^0-9]/g, ''),
+        deviceId: await getDeviceId(),
+      }
+    );
+    return response.data;
+  },
+
+  businessResendOtp: async (mobile: string): Promise<ApiResponse<{ business_name: string }>> => {
+    const response = await apiClient.post<ApiResponse<{ business_name: string }>>(
+      '/api/auth/business/resend-otp',
+      { mobile: normalizeMobile(mobile), deviceId: await getDeviceId() }
     );
     return response.data;
   },

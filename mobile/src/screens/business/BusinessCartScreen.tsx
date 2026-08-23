@@ -255,7 +255,17 @@ export default function BusinessCartScreen({ navigation }: any) {
 
   return (
     <SafeAreaView style={styles.container} edges={['top']}>
-      <BusinessHeader title="My Cart" />
+      {/* Back is always offered. The Cart is a tab root, so there is usually
+          nothing on its own stack to pop — in that case it returns to Select
+          Items, which is where the user came from. Navigating away never
+          touches the cart: it lives on the server and in the store, so every
+          item and quantity is still there on return. */}
+      <BusinessHeader
+        title="My Cart"
+        onBack={() =>
+          navigation.canGoBack() ? navigation.goBack() : navigation.navigate('BusinessHome')
+        }
+      />
 
       {initialLoad ? (
         <View style={styles.centered}>
