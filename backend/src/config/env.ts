@@ -91,6 +91,18 @@ interface AppConfig {
   WHATSAPP_DEFAULT_COUNTRY_CODE: string;
   /** Fallback for the Sorter copy when the sorter account has no mobile. */
   WHATSAPP_SORTER_NUMBER: string;
+
+  // --- The processing facility ---
+  //
+  // Where finished laundry is collected from for delivery. A DELIVERY job is
+  // matched to the rider nearest HERE, not nearest the customer: the rider
+  // has to load before they can deliver, so the facility is the first stop
+  // and the only one that says anything about who is well placed to take it.
+  FACILITY_NAME: string;
+  FACILITY_ADDRESS: string;
+  FACILITY_LATITUDE: number;
+  FACILITY_LONGITUDE: number;
+  FACILITY_CONTACT: string;
 }
 
 function requireEnv(key: string): string {
@@ -211,6 +223,18 @@ const config: AppConfig = {
   WHATSAPP_DEFAULT_COUNTRY_CODE: optionalEnv('WHATSAPP_DEFAULT_COUNTRY_CODE', '91'),
   // Optional: used only when the reporting sorter has no number on file.
   WHATSAPP_SORTER_NUMBER: optionalEnv('WHATSAPP_SORTER_NUMBER', ''),
+
+  // The Swachham processing facility in Dapoli. Defaults are the real
+  // coordinates, so a deployment that configures nothing still dispatches
+  // deliveries correctly rather than silently matching on the wrong point.
+  FACILITY_NAME: optionalEnv('FACILITY_NAME', 'Swachham Facility'),
+  FACILITY_ADDRESS: optionalEnv(
+    'FACILITY_ADDRESS',
+    'Nityanandnilayam, Dapoli Dabhol Road, Jalgaon, Dapoli 415712'
+  ),
+  FACILITY_LATITUDE: Number(optionalEnv('FACILITY_LATITUDE', '17.724111270855886')),
+  FACILITY_LONGITUDE: Number(optionalEnv('FACILITY_LONGITUDE', '73.19959128432343')),
+  FACILITY_CONTACT: optionalEnv('FACILITY_CONTACT', optionalEnv('COMPANY_PHONE', '9684029990')),
 };
 
 export { config };

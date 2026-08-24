@@ -27,6 +27,7 @@ import superAdminRoutes from './routes/superAdmin.routes';
 import managerRoutes from './routes/manager.routes';
 import { UPLOAD_ROOT, UPLOAD_URL_PREFIX } from './utils/fileStorage';
 import adminRoutes from './routes/admin.routes';
+import riderRoutes from './routes/rider.routes';
 
 const app = express();
 const server = http.createServer(app);
@@ -88,6 +89,7 @@ app.use('/api/chat', chatRoutes);
 app.use('/api/super-admin', superAdminRoutes);
 app.use('/api/manager', managerRoutes);
 app.use('/api/admin', adminRoutes);
+app.use('/api/rider', riderRoutes);
 
 // Error Handling Middleware
 app.use(errorHandler);

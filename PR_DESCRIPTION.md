@@ -1,88 +1,59 @@
 ## What
 
-Adds a Super Admin portal — two-step sign-in, an approval queue for businesses and riders, and a B2B/B2C sales dashboard — replaces the per-role login screens with one sign-in for everyone, lets a business hold several mobile numbers under a limit the super admin sets, and ports the customer catalogue off Postgres so `/api/services` stops throwing.
+Adds the rider module — the pickup and delivery leg of an order — where a job created by the Sorter's acceptance is offered to the nearest riders at once, the first to accept takes it, and it is closed with a handover code the customer reads out; plus Google Maps turn-by-turn routing, a "hold" answer for a rider who is not free yet, and fixes for five bugs found on the way.
 
 ## Why
 
-**Nobody could administer anything.** `users` holds `CUSTOMER` and `ADMIN` rows in the same table, but `/auth/customer/login` filters `role = 'CUSTOMER'` in SQL and `/auth/business/login` reads the separate `business_users` table. An `ADMIN` row could authenticate through no route at all, so every `/api/admin/*` endpoint was unreachable by anyone.
+**The schema had space for riders and nothing behind it.** `pickups` and `deliveries` have carried an `assigned_to` column since the first schema and nothing ever set it. The orders enum has carried `PICKUP_ASSIGNED`, `PICKED_UP`, `DELIVERY_ASSIGNED` and `OUT_FOR_DELIVERY` with nothing to move an order through them. The `RIDER` role has existed since migration 020, and rider accounts could be created through the Manager and Super Admin request flows — but a rider who signed in landed on a **blank navigator**, because no stack was ever mounted for the role.
 
-**Sign-in had grown a screen per role.** Customer, business, sorter and super admin each had their own entry point, and the app had to know which kind of user it was dealing with before it could ask anything. The server already knows; the client should not have to guess.
+**Assigning pickups was a manual, human job.** There was no way to tell which rider was near an order, no way to offer work without phoning someone, and no record of who was asked or who answered.
 
-**A business could order without the details needed to invoice it.** Onboarding is done by a super admin on the client's behalf, and fields get missed while that happens. Nothing checked.
-
-**A business is reached on more than one number,** but a number lived in two columns that could disagree — one business already held `7030492233` on its business row and `9175584227` on its account.
-
-**`/api/services` threw on every call.** Unported Postgres: `$1` placeholders, `ILIKE`, a `categories` table that does not exist (it is `service_categories`), and columns this schema never had. Confirmed against the live database: `ER_NO_SUCH_TABLE` and `ER_BAD_FIELD_ERROR`.
+**Order placement returned 500 on orders that had saved.** `createOrder` calls `createNotification` *after* its transaction commits, and every statement in `notification.service.ts` was written for PostgreSQL — `$1` placeholders and `RETURNING *` — against a MySQL pool that understands neither. The order was written, the notification threw, and the customer saw a failure. `production.service` had the same problem on every status change.
 
 ## Changes
 
-**Unified sign-in** (`unifiedAuth.service.ts`, `SignInPasswordScreen`)
-- One entry point: mobile → OTP → the server decides. Customers are signed in and land on Home; staff and business accounts go on to a password step; an unrecognised number becomes a `CUSTOMER` and is signed straight in.
-- Resolution searches **both id-spaces** — businesses live in `business_users`, not `users`, so a lookup reading only `users` would have been blind to every business account.
-- Ambiguity resolves **downwards**: a number matching several accounts gets the customer account if there is one, and is otherwise refused. Four numbers already match more than one account; picking a winner would let a shared or recycled number hand somebody a staff session.
-- The password step is bound to the OTP step by a 15-minute pre-auth token signed with a **separate derived secret** — sharing `JWT_SECRET` would let a half-finished login pass `authenticate` as a full session. It also checks the username resolves to the *same* account the OTP was proven against.
-- The separate "Staff login" and "Super Admin login" entries are gone.
+**Dispatch** (`dispatch.service.ts`, new)
+- An order being placed sends nearby riders an **advisory only** — no job exists yet and none can be accepted, because the order has not been confirmed by anyone.
+- The **Sorter's acceptance** is what creates a real pickup job and offers it. `out_for_delivery` does the same for the return leg — deliberately not `ready`, which only means the laundry is finished and an order can sit finished on a shelf.
+- Offers fan out to the 5 nearest online riders rather than assigning to the single closest: the closest rider may be looking at their handlebars, and an order that waits for one person to notice is an order that waits.
+- **First accept wins, atomically** — a single conditional `UPDATE ... WHERE status = 'OFFERED' AND rider_id IS NULL` inside a locked transaction. Checking then writing would let two riders both pass the check. Losers get a 409 and their card clears.
+- Candidate riders are found with a bounding-box prefilter so MySQL uses the location index instead of computing a distance for every rider on the books.
+- **A delivery is matched on the FACILITY, not the customer.** The rider must load before they can deliver, so the facility is their first stop; matching on the customer would offer the job to whoever lives near a door they cannot usefully visit yet. Jobs therefore carry an origin as well as a destination.
+- Radius, offer TTL and the stale-fix window are configurable (`RIDER_OFFER_RADIUS_M`, `RIDER_OFFER_TTL_SECONDS`, `RIDER_STALE_FIX_MINUTES`); the facility is `FACILITY_LATITUDE`/`FACILITY_LONGITUDE`.
 
-**Super admin portal** (`superAdmin.service.ts`, `superAdmin.routes.ts`, 7 screens)
-- Dashboard: revenue headline, B2B/B2C trend chart, approval queues, create actions.
-- Approvals for businesses and riders, with an audit trail (`reviewed_at`, `reviewed_by`, note) rather than a status that silently flipped.
-- Direct onboarding of businesses and riders.
-- Sales APIs derive the B2B/B2C split from which owner column an order carries, not a flag that could drift. Both channels are always returned and every period is zero-filled, so a chart never meets a missing series.
+**The rider's side** (`rider.service.ts`, `rider.routes.ts`, both new)
+- Duty switch, position pings, the job pipeline, and the rider's own day. 15 endpoints, `RIDER`-gated once at router level like the Sorter module; every route derives the rider from the token and never from the body, so there is nowhere to name another rider's job.
+- Going online **requires a position**: a rider online with no coordinates is invisible to dispatch and would sit waiting for offers that can never arrive.
+- **A pickup does not end at the doorstep.** `ASSIGNED → EN_ROUTE → ARRIVED → COLLECTED → COMPLETED`, where `COLLECTED` means the bags are on the vehicle and `COMPLETED` means they reached the facility. Closing the job at the handover made the rider's load invisible the instant they acquired it.
+- **Handover codes.** A job only completes when the customer or establishment reads out a 4-digit code. A rider cannot mark work done on their own say-so, which is what makes the record worth something in a dispute.
+- **Hold** — a third answer to an offer, beside accept and decline. A rider who is not free yet reserves the job rather than giving it up; it is not offered to anyone else, and is reclaimed automatically after 45 minutes so an order cannot be parked indefinitely.
+- **No prices anywhere.** Same rule the Sorter module states, enforced by never selecting the columns rather than by hiding UI.
 
-**Charts** (`chartTheme.ts`, `RevenueLineChart`)
-- Colour was computed, not chosen. The brand green **failed** validation — chroma 0.078 is under the floor, so it reads grey in a chart, and green-vs-amber is a classic protan confusion at deltaE 7.0. The shipped pair (`#0891B2` / `#EA580C`) passes every check with CVD deltaE 19.8 protan against a floor of 8.
-- One y-axis, never two. Both series are rupees; a second scale would let the shapes be compared when the magnitudes cannot be.
-- Both channels are drawn even though B2C is currently flat at zero — dropping an empty series would imply it does not exist.
+**Rider app** (`mobile/src/screens/rider/`, `riderApi.ts`, `riderStore.ts`, all new)
+- Dashboard: duty switch, live offer cards with countdowns, jobs in hand, held jobs, and the day's counts.
+- Job screen: one next action at a time, directions, call, the piece list, and the handover field.
+- **Google Maps turn-by-turn** (`utils/navigation.ts`), launched from the job screen, from the job list, and automatically when a rider taps "I'm on my way". A delivery routes to the facility until the rider has loaded, then to the customer.
+- The app **polls** while on duty rather than listening: the backend emits every rider event over Socket.IO, but `socket.io-client` is not a dependency of this project and adding one is a bundling decision that belongs to whoever owns the dependency list. `startWatch` is the single place that changes when a socket client is added.
+- `RiderStack` mounted in `AppNavigator`, and `userTypeFor` in `authStore` taught about `'rider'` — it fell through to `'customer'`, which left `userType` and `user.role` disagreeing.
 
-**Mandatory establishment details** (`businessCompleteness.ts`)
-- Six fields required before a business may order: establishment name, address, GST, contact person, mobile, email. One list, read by the ordering gate, the business's own profile and the super admin screen, so "complete" cannot mean different things in different places.
-- `createOrder` refuses an incomplete business with 403 **and names the missing fields**.
-- Super admin can read and fill any business's details, validated by the *same code* the self-service update runs.
+**Bugs fixed**
+- `notification.service.ts` rewritten for MySQL. Notification failures now log and swallow rather than misreporting a committed order as a 500.
+- `socket.service.ts` `join-order` had the same Postgres-placeholder bug, so **no client ever joined an order room**. It was also too narrow: business orders hang off `business_user_id`, so an establishment could never watch its own order, and the assigned rider was refused too.
+- **Offers never expired.** `offered_at` came from MySQL's `NOW()` but `expires_at` was a JS `Date`, which mysql2 serialises in the *Node process's* timezone — a 90-second offer was stored 5.5 hours out (19890s, measured). All expiry arithmetic now happens on the database clock, and the app is sent a duration rather than a timestamp.
+- **Every accept was rejected as expired.** The pool runs `bigNumberStrings: true`, so `(expires_at < NOW())` returns the string `'0'` — which is truthy in JavaScript. Now compared as a number.
+- **Jobs whose offers all lapsed were stranded.** Nothing re-offered them: they sat at `OFFERED` with no live offer, invisible to every rider, and only the decline path triggered a re-dispatch. Added `redispatchStaleJobs`, bounded by the existing 3-attempt ceiling.
 
-**Many mobile numbers per business** (`business_mobiles`, `BusinessMobilesSection`)
-- Any listed number can sign in to the business, so the list is an authentication surface, not contact details — which is why adds are capped and the last number cannot be removed.
-- `businesses.max_mobiles` is the per-business allowance, set by the super admin. The backfill seeds it from what each business already holds, so nothing starts over its own limit.
-- Adding a number used elsewhere succeeds **and warns**, naming where it is already used and that it can no longer sign in.
+**Business pickup points** (`businessProfile.service.ts`)
+- `businesses.latitude`/`longitude` were only writable through a legacy admin route the Super Admin onboarding flow does not use, so **every business onboarded through the live flow had NULL coordinates** and could never have a rider matched to it. Coordinates are now part of the shared profile-update builder, validated, both-or-neither.
 
-**Customer catalogue** (`service.service.ts`, `service.routes.ts`)
-- Rewritten against the real schema. Scope defaults to `CUSTOMER` so a customer endpoint never serves the hotel list; `?scope=BUSINESS` still reaches it.
-- Unpriced is no longer reported as free: every `base_price` is `0`, so `NULLIF` returns null and the client can say "price on request".
-- `/services/categories` and `/services/popular` are registered at last — both have been in the README all along and neither was ever routed. They are declared **before** `/:id`, or Express matches them as an id.
-- `getServiceById` throws 404 instead of returning null with a 200.
+**Migrations** — `036` (rider tables), `037` (collected/held states), `038` (drops the weight-capacity fields added in 037, after the requirement was clarified: a rider decides what they can carry, the server does not), `039` (job origin). `037`→`038` is kept as real history rather than squashed, because `036` has already been applied and editing it would not reach an existing database.
 
-**Two unrelated fixes found while testing**
-- `DATABASE_SSL` was parsed as `optionalEnv(...) === 'true'`, so any unrecognised value silently became `false`. A `.env` carrying `DATABASE_SSL=REQUIRED` disabled TLS and the pool connected to the managed MySQL instance **in plaintext**. `booleanEnv()` now throws on an unrecognised value rather than defaulting to the insecure one. Verified: `Ssl_cipher` empty before, `TLS_AES_256_GCM_SHA384` after.
-- `start-lan.js` wrote `REACT_NATIVE_PACKAGER_HOSTNAME` into `mobile/.env`, which Expo SDK 54+ refuses to load — `npm start` failed every time. The value is already passed to the dev-server child process, so the write was redundant.
+**Tests** — three smoke suites, **50 checks**, run against the real database and restoring everything they touch: `smoke_rider_dispatch` (26), `smoke_rider_hold` (16), `smoke_rider_delivery` (8). The delivery suite's decisive assertion is that the same order's pickup and delivery go to **different** riders — if the origin were ignored, every other check could still pass.
 
-**Migrations** — `019` SUPER_ADMIN role · `020` RIDER role, PENDING business status, rider approval columns · `021` MANAGER role · `022` `business_mobiles` + `max_mobiles`. All additive, all idempotent, all gated on `information_schema`.
+**Also** — Expo aligned to `54.0.37` / `expo-file-system@19.0.24`; a `__DEV__`-only service-area bypass in `locationGateStore` for testing outside Ratnagiri; helper scripts under `backend/scripts/` for driving the flow by hand.
 
-## Behaviour changes reviewers should know
+## Notes for the reviewer
 
-- **Business self-registration is closed.** `POST /auth/business/register` returns 403 with an explanation; the handler that created accounts is deleted, not merely unrouted. `BusinessRegisterScreen` is now a dead end and needs removing.
-- **GST is mandatory for everyone.** Three existing businesses (Test Hotel QA, Hotel ABC, Hos) have none and **cannot place orders** until a super admin fills it in.
-- **New business signups land in `PENDING`** and wait for approval. Businesses that already existed stay `ACTIVE` — they predate approval being a concept.
-- **A `BUSINESS` token is no longer sufficient to transact.** Registration still returns a session so the app can show a waiting state, so the real gate is a status check in front of the business ordering routes.
-- **`HomeScreen.tsx` has zero net change.** The catalogue was wired into it and then reverted at the author's request. `ServiceCategoryScreen` and its route remain but are unreachable; they are the only consumer of the fixed catalogue endpoints and are kept as groundwork.
-
-## Testing
-
-Verified against the live database and a real device, not only at unit level:
-
-| Area | Result |
-|---|---|
-| Unified sign-in, all 5 paths | new number, customer, super admin, business, ambiguous — each correct |
-| Two-step bypass attempts | no token rejected; forged token rejected; pre-auth used as Bearer → **401** |
-| Role isolation on `/api/super-admin/*` | `CUSTOMER` 403, plain `ADMIN` 403, no token 401 |
-| Super admin on device | sign-in → dashboard → charts → approvals → establishment details, every request 200 |
-| Completeness gate | blocked with the field named, then unblocked once GST was filled |
-| Mobile allowance | add over cap refused; raise limit; add succeeds; duplicate warns; lower-below-held refused |
-| Sign-in via a newly added business number | resolved to `PASSWORD_REQUIRED` / "Comffort Inn" |
-| Catalogue endpoints | 102 items over 34 pages, 20 categories, search, 404 on unknown id |
-| Migrations | applied; row counts intact before and after each |
-| Typecheck | `tsc --noEmit` clean, backend and mobile |
-| Bundles | Android and iOS both build, 0 errors |
-
-## Notes
-
-- `.claude/skills/pr-description/SKILL.md` is in the range but is the repo owner's own commit (`774b504`), not part of this work.
-- This is large and splits cleanly along four seams if you would rather review it in pieces: unified auth, super admin portal, business mobiles, and the catalogue/config fixes.
+- `unifiedAuth.service.ts` shows as modified with a **zero-line diff** — line endings only.
+- Riders still sign in through the existing staff flow (mobile → OTP → username + password); nothing about authentication changed.
+- The rider app has no notifications screen yet, so `RIDER_JOB_OFFER` rows are written and pushed but not browsable in-app.

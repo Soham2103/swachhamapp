@@ -60,6 +60,30 @@ const INITIAL = {
   isChecking: false,
 };
 
+/**
+ * Testing bypass for the service-area gate.
+ *
+ * Set EXPO_PUBLIC_DISABLE_LOCATION_GATE=true in mobile/.env to enter the app
+ * from outside Ratnagiri, with no GPS fix and no district check. It exists so
+ * the sign-in flow can be tested away from the service area.
+ *
+ * Deliberately ANDed with __DEV__. Expo inlines EXPO_PUBLIC_* variables into
+ * the bundle at BUILD time, so a stray value in a build environment would
+ * otherwise ship a release with no service-area gate at all - the one thing
+ * this must never do. In a production build it is false whatever the .env says.
+ */
+const BYPASS_LOCATION_GATE =
+  __DEV__ && process.env.EXPO_PUBLIC_DISABLE_LOCATION_GATE === 'true';
+
+if (BYPASS_LOCATION_GATE) {
+  // Loud on purpose: an app that lets anyone in from anywhere should say so
+  // every time it starts, so this is never mistaken for normal behaviour.
+  console.warn(
+    '[LocationGate] BYPASSED - service-area check disabled for testing ' +
+      '(EXPO_PUBLIC_DISABLE_LOCATION_GATE=true). Never ship a build with this set.'
+  );
+}
+
 /** A fix this old is not worth reusing for a district decision. */
 const MAX_FIX_AGE_MS = 60_000;
 /** Give up rather than leaving the user staring at a spinner. */
@@ -74,6 +98,19 @@ export const useLocationGateStore = create<LocationGateState>((set, get) => ({
   isVerified: () => get().status === 'verified',
 
   verify: async (options = {}) => {
+    // Checked before everything else - before the cached verdict, the
+    // in-flight guard and `force` - so Retry cannot reach a real check
+    // while the bypass is on.
+    if (BYPASS_LOCATION_GATE) {
+      const bypassed: LocationGateResult = {
+        status: 'verified',
+        message: 'Location check bypassed for testing',
+        district: 'Bypassed (dev)',
+      };
+      set({ ...bypassed, isChecking: false });
+      return bypassed;
+    }
+
     const settle = (next: LocationGateResult) => {
       set({ ...next, isChecking: false });
       return next;

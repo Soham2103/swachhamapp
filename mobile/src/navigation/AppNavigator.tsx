@@ -155,6 +155,21 @@ import SorterDefectCaptureScreen
   from '../screens/sorter/SorterDefectCaptureScreen';
 
 
+// =========================================================
+// RIDER MODULE
+//
+// Staff-facing, gated on the RIDER role. Riders sign in
+// through the same unified OTP + password flow as the other
+// staff roles, so there is no separate login screen here.
+// =========================================================
+
+import RiderDashboardScreen
+  from '../screens/rider/RiderDashboardScreen';
+
+import RiderJobDetailsScreen
+  from '../screens/rider/RiderJobDetailsScreen';
+
+
 // The one bottom bar for both tab sets: Customer and Business.
 import LiquidGlassTabBar from '../components/LiquidGlassTabBar';
 
@@ -537,6 +552,26 @@ function SuperAdminStack() {
 }
 
 
+/**
+ * The Rider section.
+ *
+ * One stack, no tabs. A rider works a single queue on a phone that is
+ * usually in a mount on a handlebar, and a bottom bar would only take room
+ * from the one card that matters.
+ */
+function RiderStack() {
+  return (
+    <Stack.Navigator
+      initialRouteName="RiderDashboard"
+      screenOptions={{ headerShown: false }}
+    >
+      <Stack.Screen name="RiderDashboard" component={RiderDashboardScreen} />
+      <Stack.Screen name="RiderJobDetails" component={RiderJobDetailsScreen} />
+    </Stack.Navigator>
+  );
+}
+
+
 function SorterStack() {
   return (
     <Stack.Navigator
@@ -845,6 +880,24 @@ export default function AppNavigator() {
             component={
               SorterStack
             }
+          />
+
+        )}
+
+
+        {/* =================================================
+            RIDER APPLICATION
+
+            Same unified sign-in as the other staff roles;
+            the role decides the stack, so a rider cannot
+            navigate into the Sorter or Manager one.
+        ================================================= */}
+
+        {isAuthenticated && role === 'rider' && (
+
+          <Stack.Screen
+            name="Rider"
+            component={RiderStack}
           />
 
         )}

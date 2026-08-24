@@ -3,6 +3,7 @@ import { logger } from '../utils/logger';
 import { validateCoupon } from './cart.service';
 import socketService from './socket.service';
 import { createNotification } from './notification.service';
+import { notifyNearbyRidersOfNewOrder } from './dispatch.service';
 import { requireCustomerPrices } from './priceList.service';
 import { normaliseMobileOrNull } from './businessContact.service';
 
@@ -252,6 +253,21 @@ async function createOrder(
       orderNumber: order.order_number,
       status: 'ORDER_PLACED',
     });
+
+    /*
+     * RIDERS NEARBY GET A HEADS-UP — nothing more.
+     *
+     * No job exists yet and none can be accepted: the order has not been
+     * confirmed by a Sorter, and dispatching work that might still be
+     * rejected would send riders to doors for orders that never happen.
+     * This is the advisory only; the real offer follows the Sorter's
+     * acceptance.
+     *
+     * Deliberately not awaited into the caller's failure path — the
+     * transaction is already committed, so a dispatch problem must never
+     * turn a placed order into a 500. It logs and swallows internally.
+     */
+    void notifyNearbyRidersOfNewOrder(order.id);
 
     logger.info(`[OrderService] Order created: ${order.order_number} for user ${userId}`);
     return order;

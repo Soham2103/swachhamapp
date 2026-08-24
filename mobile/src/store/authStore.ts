@@ -8,7 +8,7 @@ import { User, LoginPayload, RegisterPayload, BusinessRegisterPayload } from '..
 
 interface AuthState {
   user: User | null;
-  userType: 'customer' | 'business' | 'sorter' | 'super_admin' | 'manager' | null;
+  userType: 'customer' | 'business' | 'sorter' | 'super_admin' | 'manager' | 'rider' | null;
   token: string | null;
   isAuthenticated: boolean;
   isLoading: boolean;
@@ -61,14 +61,16 @@ interface AuthState {
   clearStoredSession: () => Promise<void>;
   logout: () => Promise<void>;
   updateUser: (user: Partial<User>) => void;
-  setUserType: (type: 'customer' | 'business' | 'sorter' | 'super_admin' | 'manager' | null) => void;
+  setUserType: (type: 'customer' | 'business' | 'sorter' | 'super_admin' | 'manager' | 'rider' | null) => void;
 }
 
 const TOKEN_KEY = 'swachham_access_token';
 const USER_KEY = 'swachham_user';
 
 /** Maps the role on the account to the stack the app should show. */
-function userTypeFor(role?: string | null): 'customer' | 'business' | 'sorter' | 'super_admin' | 'manager' {
+function userTypeFor(
+  role?: string | null
+): 'customer' | 'business' | 'sorter' | 'super_admin' | 'manager' | 'rider' {
   const value = String(role || '').toLowerCase();
   if (value === 'business') return 'business';
   if (value === 'sorter') return 'sorter';
@@ -76,6 +78,14 @@ function userTypeFor(role?: string | null): 'customer' | 'business' | 'sorter' |
   // MANAGER signs in through the same password flow as the other staff
   // roles; without this it would fall through to the customer app.
   if (value === 'manager') return 'manager';
+  /*
+   * RIDER arrives by the OTP-only path, which the app labels
+   * CUSTOMER_SESSION. Without this line a rider's userType would read
+   * 'customer'. AppNavigator happens to prefer `user.role` and would still
+   * route correctly, but leaving the two disagreeing is the sort of thing
+   * that bites whoever next reads userType and believes it.
+   */
+  if (value === 'rider') return 'rider';
   return 'customer';
 }
 

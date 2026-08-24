@@ -138,6 +138,20 @@ export interface UpdateBusinessProfileInput {
   emailId?: string;
   alternateContactPerson?: string | null;
   alternateMobileNo?: string | null;
+  /**
+   * The establishment's PICKUP POINT.
+   *
+   * `businesses` has carried these columns since the first schema and nothing
+   * has ever written them through this path — only a legacy admin route did,
+   * which the Super Admin onboarding flow does not use. The result was that
+   * every business onboarded through the live flow had NULL coordinates.
+   *
+   * That is not cosmetic: rider dispatch matches a job to the riders nearest
+   * the pickup point, so a business with no coordinates can never have a
+   * rider offered to it at all. Both are set together or neither is.
+   */
+  latitude?: number | null;
+  longitude?: number | null;
 }
 
 function optionalText(value: unknown): string | null {
@@ -229,6 +243,47 @@ export function buildBusinessProfileUpdate(
     }
     fields.push('website = ?');
     values.push(value);
+  }
+
+  /*
+   * THE PICKUP POINT — both coordinates or neither.
+   *
+   * A half-set pair is worse than none: dispatch reads latitude AND longitude,
+   * so a row carrying one of them is a row that looks located and is not.
+   * Clearing the point is still allowed by passing null for both.
+   */
+  if (input.latitude !== undefined || input.longitude !== undefined) {
+    const lat = input.latitude;
+    const lng = input.longitude;
+
+    const clearing =
+      (lat === null || lat === undefined) && (lng === null || lng === undefined);
+
+    if (clearing) {
+      fields.push('latitude = ?', 'longitude = ?');
+      values.push(null, null);
+    } else {
+      const latNum = Number(lat);
+      const lngNum = Number(lng);
+
+      if (!Number.isFinite(latNum) || !Number.isFinite(lngNum)) {
+        throw new AppError('Latitude and longitude must both be numbers', 400);
+      }
+      if (latNum < -90 || latNum > 90) {
+        throw new AppError('Latitude must be between -90 and 90', 400);
+      }
+      if (lngNum < -180 || lngNum > 180) {
+        throw new AppError('Longitude must be between -180 and 180', 400);
+      }
+      // 0,0 is in the Atlantic and is what a broken client sends -- the same
+      // check the service-area validator makes.
+      if (latNum === 0 && lngNum === 0) {
+        throw new AppError('0,0 is not a valid pickup location', 400);
+      }
+
+      fields.push('latitude = ?', 'longitude = ?');
+      values.push(latNum, lngNum);
+    }
   }
 
   /* ---- The contact person: `business_users`, not `businesses` ---- */

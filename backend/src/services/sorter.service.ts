@@ -3,6 +3,7 @@ import { config } from '../config/env';
 import { AppError } from '../utils/appError';
 import { logger } from '../utils/logger';
 import { listDefectsForOrder, DefectRecord } from './defect.service';
+import { createJobForOrder, dispatchJob } from './dispatch.service';
 import {
   listAdjustmentsForOrder,
   listNotificationsForOrder,
@@ -880,6 +881,51 @@ async function updateStatus(
         `by user ${sorterUserId}` +
         (heldPieces > 0 ? ` (${goingPieces} piece(s) out, ${heldPieces} held)` : '')
     );
+
+    /*
+     * THE SORTER'S ACCEPTANCE IS WHAT DISPATCHES A RIDER.
+     *
+     * This is the point the business asked for: an order that has been
+     * confirmed by a human is real work, so a pickup job is created and
+     * offered to the riders nearest the customer or establishment. Before
+     * this moment riders have only had an advisory, which they cannot act on.
+     *
+     * `ready` does the same for the return leg, so a finished order is
+     * collected for delivery without anyone chasing it.
+     *
+     * Run AFTER commit and deliberately not awaited into this function's
+     * failure path. The Sorter's transition is already durable; a dispatch
+     * that fails must leave the order accepted and be retried, never undo
+     * the acceptance or report it as failed.
+     */
+    /*
+     * WHICH SORTER STEP DISPATCHES WHAT.
+     *
+     *   accepted          -> PICKUP. The order is confirmed, so collecting
+     *                        it from the customer is now real work.
+     *
+     *   out_for_delivery  -> DELIVERY. NOT `ready`: ready means the laundry
+     *                        is finished, which is a shop-floor fact, and an
+     *                        order can sit finished on a shelf for a while.
+     *                        Dispatching then would send a rider to the
+     *                        facility for goods nobody had decided to send
+     *                        out. `out_for_delivery` is the decision to send
+     *                        it, and that is the moment a rider is wanted.
+     */
+    if (target === 'accepted' || target === 'out_for_delivery') {
+      const jobType = target === 'accepted' ? 'PICKUP' : 'DELIVERY';
+      void (async () => {
+        try {
+          const job = await createJobForOrder(String(order.id), jobType);
+          if (job) await dispatchJob(job.id);
+        } catch (dispatchError) {
+          logger.error(
+            `[SorterService] ${jobType} dispatch failed for order ${order.order_number}: ` +
+              `${dispatchError instanceof Error ? dispatchError.message : String(dispatchError)}`
+          );
+        }
+      })();
+    }
 
     return {
       id: String(order.id),
