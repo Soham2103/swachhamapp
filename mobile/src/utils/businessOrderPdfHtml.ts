@@ -389,18 +389,22 @@ export function buildBusinessOrderPdfBody(
     <div class="cell"><span class="k">Order Type:</span> <span class="v">${escapeHtml(ORDER_LABEL[data.order_type || ''] || '-')}</span></div>
     <div class="cell"><span class="k">Items:</span> <span class="v">${escapeHtml(data.item_count)} (Qty ${escapeHtml(data.total_quantity)})</span></div>
 
-    <!-- WHO PLACED THIS ORDER, and on which number.
+    <!-- WHO PLACED THIS ORDER.
+         ONE CELL, not two. The number IS the identification: a separate
+         "Mobile Number" heading repeated the same fact under a second label,
+         so the number now stands as the value of "Placed By" and the second
+         heading is gone.
          placed_by_mobile is orders.placed_by_mobile and nothing else: the
          number that passed OTP for the session this order was placed in. For
          a business reached on several numbers that is whichever contact
          actually placed it, so an order placed on an alternative contact's
          number prints the alternative contact's number and never the
          primary's.
-         "N/A", not a substituted number, when the order carries none -- those
+         EMPTY, not a substituted number, when the order carries none -- those
          are orders from before the field existed, and no number is known to
-         be the right one for them. -->
-    <div class="cell"><span class="k">Placed By:</span> <span class="v">${escapeHtml(data.contact_person_name || '-')}</span></div>
-    <div class="cell"><span class="k">Mobile Number:</span> <span class="v">${escapeHtml(data.placed_by_mobile || 'N/A')}</span></div>
+         be the right one for them. Nothing is printed in their place: a
+         stand-in here would read as an attribution. -->
+    <div class="cell"><span class="k">Placed By:</span> <span class="v">${escapeHtml(data.placed_by_mobile || '')}</span></div>
   </div>
 
 ${summary}

@@ -5,6 +5,8 @@ import {
   updateStatus,
   setItemPendingQuantity,
   getConfirmationPdf,
+  savePendingItemCounts,
+  PendingItemInput,
 } from '../services/sorter.service';
 import {
   generateGarmentsForOrder,
@@ -202,6 +204,48 @@ router.patch(
             `${result.item.ordered_quantity} held pending`
           : `${result.item.item_name} is ready — all ${result.item.ordered_quantity} piece(s)`
       );
+    } catch (error) {
+      next(error);
+    }
+  }
+);
+
+/**
+ * PATCH /api/sorter/orders/:id/items/:itemId/cloth-counts
+ *   { white?: number | null, color?: number | null, socked?: number | null }
+ *
+ * The cloth counts for ONE LINE of an order, written to `pending_item`. Each
+ * line is counted on its own, so this is addressed by item and not by order.
+ *
+ * Only the fields PRESENT in the body are written, so saving one box leaves
+ * the others as they were. Sending a field as null clears that count back to
+ * "not counted", which is a different thing from 0.
+ *
+ * SORTER ONLY, by construction — `authorize('SORTER')` runs at the top of this
+ * router, so any other token is refused with 403 before this handler runs.
+ *
+ * NOTHING FINANCIAL MOVES, and no status changes. Counting a line is a note
+ * taken during sorting, not a step in the workflow.
+ */
+router.patch(
+  '/orders/:id/items/:itemId/cloth-counts',
+  async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      /*
+       * Only keys the client actually sent are forwarded. Building the input
+       * this way is what keeps "left out" (don't touch) apart from "sent as
+       * null" (clear it) — spreading the body would lose that distinction.
+       */
+      const body = (req.body ?? {}) as Record<string, unknown>;
+      const input: PendingItemInput = {};
+      if ('white' in body) input.white = body.white as number | null;
+      if ('color' in body) input.color = body.color as number | null;
+      if ('socked' in body) input.socked = body.socked as number | null;
+      if ('whiteSocked' in body) input.whiteSocked = body.whiteSocked as number | null;
+      if ('colorSocked' in body) input.colorSocked = body.colorSocked as number | null;
+
+      const saved = await savePendingItemCounts(req.params.id, req.params.itemId, input);
+      sendSuccess(res, saved, `${saved.item_name}: cloth counts saved`);
     } catch (error) {
       next(error);
     }

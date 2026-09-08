@@ -238,9 +238,66 @@ export interface AdjustmentNotification {
  * Where the money stands after an adjustment. Computed by the server and
  * never written: an adjustment does not touch a payment record.
  */
+/**
+ * ONE LINE'S CLOTH COUNTS, as the `pending_item` table holds them.
+ *
+ * PER ITEM: each line of an order is counted on its own, so a line that has
+ * not been counted yet has no record here at all.
+ *
+ * The order number, establishment name and item name are stored on the row and
+ * come back from it — they are what those names were when the count was taken.
+ *
+ * NULL on a count is "not counted", which is not the same fact as 0, "counted,
+ * and there were none". A box shows NULL as empty for that reason.
+ */
+export interface PendingItemRecord {
+  id: string;
+  order_id: string;
+  order_item_id: string;
+  order_number: string;
+  business_name: string;
+  item_name: string;
+  white_cloth_count: number | null;
+  color_cloth_count: number | null;
+  /**
+   * What was recorded under the older single "Socked Cloths" box.
+   *
+   * KEPT and no longer written by the screen: `white_socked` and
+   * `color_socked` replaced it. Rows that carry a value still carry it.
+   */
+  socked_cloth_count: number | null;
+  /** Socked cloth, counted as its own pair. NULL is "not counted". */
+  white_socked: number | null;
+  color_socked: number | null;
+  created_at: string;
+  updated_at: string;
+}
+
+/**
+ * What may be sent for one line.
+ *
+ * Every field optional on purpose: OMITTING one leaves that count alone, while
+ * sending it as null clears it. The screen sends all three together, but the
+ * endpoint does not require that.
+ */
+export interface PendingItemPayload {
+  white?: number | null;
+  color?: number | null;
+  socked?: number | null;
+  whiteSocked?: number | null;
+  colorSocked?: number | null;
+}
+
 export interface SorterOrderDetail extends SorterOrderSummary {
   items: SorterOrderItem[];
   confirmation_pdf_url: string | null;
+  /**
+   * The cloth counts saved against each line of this order.
+   *
+   * At most one entry per line, keyed back to it by `order_item_id`; lines
+   * that have not been counted are simply absent.
+   */
+  pending_items: PendingItemRecord[];
   /** Newest first. */
   defects: DefectRecord[];
   /** Newest first. */
@@ -620,6 +677,27 @@ export const sorterApi = {
    * Nothing financial moves: holding pieces back or releasing them does not
    * touch price, billed quantity, invoice or payment.
    */
+  /**
+   * Records the cloth counts for ONE LINE of an order.
+   *
+   * Only the fields PASSED are written; the ones left out keep whatever the
+   * line already holds. Passing null clears a count back to "not counted".
+   *
+   * The response is the row as saved, including any count this call did not
+   * touch.
+   */
+  savePendingItemCounts: async (
+    orderId: string,
+    orderItemId: string,
+    counts: PendingItemPayload
+  ): Promise<ApiResponse<PendingItemRecord>> => {
+    const response = await apiClient.patch<ApiResponse<PendingItemRecord>>(
+      `/api/sorter/orders/${orderId}/items/${orderItemId}/cloth-counts`,
+      counts
+    );
+    return response.data;
+  },
+
   setItemPendingQuantity: async (
     orderId: string,
     orderItemId: string,

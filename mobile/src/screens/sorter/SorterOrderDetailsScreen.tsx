@@ -5,6 +5,7 @@ import {
   StyleSheet,
   ScrollView,
   TouchableOpacity,
+  TextInput,
   ActivityIndicator,
   Alert,
   Linking,
@@ -22,6 +23,7 @@ import sorterApi, {
   ScanStatus,
   ScanStageName,
   DefectRecord,
+  PendingItemRecord,
   defectCopies,
   defectFullyDelivered,
 } from '../../services/sorterApi';
@@ -37,6 +39,7 @@ import {
   LAUNDRY_LABEL,
   ORDER_LABEL,
 } from '../../utils/businessOrderPdf';
+import { generateSockedDetailsPdf } from '../../utils/sockedDetailsPdf';
 import { STAGE_META } from './SorterDashboardScreen';
 
 /**
@@ -71,6 +74,162 @@ const NEXT_ACTION: Record<
  * The action the screen offers is derived from the current status, and the
  * server re-validates the transition, so the UI can never talk it into a skip.
  */
+/**
+ * THE ORDER-LEVEL CLOTH COUNTS.
+ *
+ * Counted off the pile ONCE for the whole order, which is why they sit above
+ * the Items card rather than inside it: the pile is the order, and the lines
+ * it breaks down into are not what gets counted here.
+ */
+/**
+ * The Cloth Count card's boxes.
+ *
+ * These two, and only these two, are what the line's quantity is checked
+ * against. Socked cloth is counted separately below and takes no part in it.
+ */
+const CLOTH_COUNT_FIELDS = [
+  { key: 'white', label: 'White Cloths' },
+  { key: 'color', label: 'Color Cloths' },
+] as const;
+
+/**
+ * The Socked Cloth card's boxes.
+ *
+ * A SEPARATE COUNT, stored in its own two columns and deliberately outside the
+ * quantity check: socked cloth is counted alongside the pile, not out of it.
+ */
+const SOCKED_FIELDS = [
+  { key: 'whiteSocked', label: 'White Socked' },
+  { key: 'colorSocked', label: 'Color Socked' },
+] as const;
+
+type ClothCountKey =
+  | (typeof CLOTH_COUNT_FIELDS)[number]['key']
+  | (typeof SOCKED_FIELDS)[number]['key'];
+
+/** What a line's boxes hold before anything has been counted or loaded. */
+const EMPTY_CLOTH_COUNTS: Record<ClothCountKey, string> = {
+  white: '',
+  color: '',
+  whiteSocked: '',
+  colorSocked: '',
+};
+
+/** Every line's boxes, keyed by order item id. */
+type ClothCountsByItem = Record<string, Record<ClothCountKey, string>>;
+
+/**
+ * A saved record as its line's boxes show it.
+ *
+ * NULL BECOMES AN EMPTY BOX, never "0". The line has no count recorded, and
+ * printing a zero would state one that was never taken.
+ *
+ * `socked_cloth_count` is not read here: the older single Socked Cloths box is
+ * gone from the screen, and the two socked columns are what these boxes show.
+ */
+function boxesOf(record: PendingItemRecord | undefined): Record<ClothCountKey, string> {
+  if (!record) return EMPTY_CLOTH_COUNTS;
+  const show = (value: number | null) => (value === null ? '' : String(value));
+  return {
+    white: show(record.white_cloth_count),
+    color: show(record.color_cloth_count),
+    whiteSocked: show(record.white_socked),
+    colorSocked: show(record.color_socked),
+  };
+}
+
+/**
+ * Every line's boxes, from what the order came back carrying.
+ *
+ * Driven by the ORDER'S items and not by the saved records, so a line that has
+ * never been counted still gets its own empty set of boxes.
+ */
+function boxesForOrder(order: SorterOrderDetail): ClothCountsByItem {
+  // Defended rather than assumed: a backend that has not been restarted onto
+  // this version sends no pending_items at all, and a screen that threw on
+  // that would fail to load the order instead of simply showing empty boxes.
+  const saved = new Map(
+    (order.pending_items ?? []).map((record) => [record.order_item_id, record])
+  );
+  const next: ClothCountsByItem = {};
+  for (const item of order.items) next[item.id] = boxesOf(saved.get(item.id));
+  return next;
+}
+
+/**
+ * A box's contents as the endpoint wants them.
+ *
+ * An emptied box is null — "not counted" — and not 0, so clearing a count and
+ * counting none stay the two different facts they are.
+ */
+function clothCountPayload(raw: string): number | null {
+  return raw.trim() === '' ? null : Number(raw);
+}
+
+/**
+ * One box as a number for the purpose of the total.
+ *
+ * AN EMPTY BOX IS 0 HERE, and only here. What is SAVED still distinguishes an
+ * empty box from a typed zero -- empty is "not counted" -- but a line cannot
+ * be part-counted for the purpose of checking it against the quantity, so an
+ * empty box weighs nothing in the sum.
+ */
+function clothCountValue(raw: string): number {
+  return raw.trim() === '' ? 0 : Number(raw);
+}
+
+/**
+ * The line total, worked out the way the count is taken.
+ *
+ *   (White Cloth - White Socked) + (Color Cloth - Color Socked)
+ *     + White Socked + Color Socked
+ *
+ * SOCKED CLOTH COMES OUT OF THE CLOTH COUNTED FOR ITS COLOUR and is then put
+ * back as its own figure, so the pile is neither double counted nor lost.
+ *
+ * Written out in full rather than reduced. The two socked terms cancel, so
+ * this always equals White Cloth + Color Cloth -- but the form above is the
+ * rule as the shop floor states it, and a reader checking the code against
+ * the rule should not have to re-derive it. What the socked boxes actually
+ * constrain is enforced by clothCountsWithinSocked below.
+ */
+function clothCountTotalOf(boxes: Record<ClothCountKey, string> = EMPTY_CLOTH_COUNTS) {
+  const white = clothCountValue(boxes.white);
+  const color = clothCountValue(boxes.color);
+  const whiteSocked = clothCountValue(boxes.whiteSocked);
+  const colorSocked = clothCountValue(boxes.colorSocked);
+  const remainingWhite = white - whiteSocked;
+  const remainingColor = color - colorSocked;
+  return remainingWhite + remainingColor + whiteSocked + colorSocked;
+}
+
+/**
+ * Neither remainder may go negative.
+ *
+ * Socked cloth is taken OUT OF the cloth counted for that colour, so it can
+ * never exceed it. A line claiming more socked than cloth has been miscounted,
+ * and the total alone would not catch it: the socked terms cancel, so 40/10
+ * with 99 white socked still sums to 50.
+ */
+function clothCountsWithinSocked(boxes: Record<ClothCountKey, string> = EMPTY_CLOTH_COUNTS) {
+  return (
+    clothCountValue(boxes.whiteSocked) <= clothCountValue(boxes.white) &&
+    clothCountValue(boxes.colorSocked) <= clothCountValue(boxes.color)
+  );
+}
+
+function sameBoxes(
+  a: Record<ClothCountKey, string> = EMPTY_CLOTH_COUNTS,
+  b: Record<ClothCountKey, string> = EMPTY_CLOTH_COUNTS
+) {
+  return (
+    a.white === b.white &&
+    a.color === b.color &&
+    a.whiteSocked === b.whiteSocked &&
+    a.colorSocked === b.colorSocked
+  );
+}
+
 export default function SorterOrderDetailsScreen({ navigation, route }: any) {
   const { orderId } = route.params || {};
   const [order, setOrder] = useState<SorterOrderDetail | null>(null);
@@ -100,6 +259,55 @@ export default function SorterOrderDetailsScreen({ navigation, route }: any) {
   const [itemBusyId, setItemBusyId] = useState<string | null>(null);
   /** Open while the Sorter answers the pending-items question. */
   const [pendingPrompt, setPendingPrompt] = useState(false);
+  /** True while the Socked Details document is being produced. */
+  const [isBuildingSockedPdf, setIsBuildingSockedPdf] = useState(false);
+  /**
+   * The three counts, held against the order being viewed.
+   *
+   * KEYED TO THE ORDER, and cleared whenever a different one is opened, so a
+   * number typed against one order can never be read as another's. The screen
+   * already mounts per order; the reset is what makes that a guarantee rather
+   * than a consequence of how navigation happens to work today.
+   *
+   * Held for as long as the screen is open and sent nowhere: the order has no
+   * field for these and no endpoint accepts them, so storing them would be a
+   * change to the workflow rather than an addition to the page.
+   */
+  /** What is typed in each line's boxes, keyed by order item id. */
+  const [clothCounts, setClothCounts] = useState<ClothCountsByItem>({});
+  /**
+   * What each line's boxes held when last read from or written to the server.
+   *
+   * Kept beside what is typed so the two can be compared per line: that is
+   * what makes one line's Save light up without lighting up every other, and
+   * what tells a reload whether it may refresh a line's boxes.
+   */
+  const [savedClothCounts, setSavedClothCounts] = useState<ClothCountsByItem>({});
+  /** The line whose counts are being written, so only its own button spins. */
+  const [clothCountBusyId, setClothCountBusyId] = useState<string | null>(null);
+  /**
+   * Read by `load`, which must not depend on either piece of state.
+   *
+   * The screen reloads on every focus and after every action, and a reload
+   * that overwrote half-typed counts would lose a number somebody had just
+   * read off a pile. So a reload refreshes only the lines that are untouched,
+   * and unsaved typing survives it.
+   */
+  const clothCountsRef = useRef<ClothCountsByItem>({});
+  const savedClothCountsRef = useRef<ClothCountsByItem>({});
+  useEffect(() => {
+    clothCountsRef.current = clothCounts;
+  }, [clothCounts]);
+  useEffect(() => {
+    savedClothCountsRef.current = savedClothCounts;
+  }, [savedClothCounts]);
+  useEffect(() => {
+    setClothCounts({});
+    setSavedClothCounts({});
+    clothCountsRef.current = {};
+    savedClothCountsRef.current = {};
+  }, [orderId]);
+
   /** Synchronous lock: two taps in one frame cannot both fire a transition. */
   const busyRef = useRef(false);
 
@@ -325,6 +533,22 @@ export default function SorterOrderDetailsScreen({ navigation, route }: any) {
         sorterApi.getScanStatus(String(orderId)),
       ]);
       setOrder(detail.data);
+      /*
+       * The saved counts, line by line, and the boxes with them — except on a
+       * line whose boxes differ from what was last saved, which is somebody
+       * mid-count and is left exactly as they typed it.
+       */
+      const stored = boxesForOrder(detail.data);
+      setSavedClothCounts(stored);
+      setClothCounts((current) => {
+        const next: ClothCountsByItem = {};
+        for (const [itemId, boxes] of Object.entries(stored)) {
+          const typed = current[itemId];
+          const wasSaved = savedClothCountsRef.current[itemId];
+          next[itemId] = typed && !sameBoxes(typed, wasSaved) ? typed : boxes;
+        }
+        return next;
+      });
       setScan(scanStatus.data);
     } catch (err: any) {
       setError(extractErrorMessage(err, 'Failed to load order'));
@@ -390,6 +614,100 @@ export default function SorterOrderDetailsScreen({ navigation, route }: any) {
       setError('Unable to open the confirmation PDF. Please try again.');
     } finally {
       setIsBuildingPdf(false);
+    }
+  };
+
+  /**
+   * Writes ONE LINE'S cloth counts to `pending_item`.
+   *
+   * All three of that line's boxes go together because the line saves as one,
+   * and the server's reply — not what was typed — is what its boxes are then
+   * set from, so the screen shows what the row actually holds.
+   *
+   * No status moves and nothing is re-derived: this records a count taken
+   * during sorting and is not a step in the workflow.
+   */
+  const saveClothCounts = async (item: SorterOrderItem) => {
+    if (clothCountBusyId) return;
+    const boxes = clothCounts[item.id] || EMPTY_CLOTH_COUNTS;
+    setClothCountBusyId(item.id);
+    setError('');
+    try {
+      const response = await sorterApi.savePendingItemCounts(String(orderId), item.id, {
+        white: clothCountPayload(boxes.white),
+        color: clothCountPayload(boxes.color),
+        // Its own two columns, written on the same row as the cloth counts:
+        // one line has one record, and this is more of what is known about it.
+        // `socked` is not sent — the older single box no longer exists, and
+        // omitting it leaves whatever that column already holds untouched.
+        whiteSocked: clothCountPayload(boxes.whiteSocked),
+        colorSocked: clothCountPayload(boxes.colorSocked),
+      });
+      const shown = boxesOf(response.data);
+      setClothCounts((current) => ({ ...current, [item.id]: shown }));
+      setSavedClothCounts((current) => ({ ...current, [item.id]: shown }));
+      /*
+       * The order's own copy of the records is kept in step, so the Socked
+       * Details document can be produced straight after a save without
+       * waiting for the next reload.
+       */
+      setOrder((current) =>
+        current
+          ? {
+              ...current,
+              pending_items: [
+                ...(current.pending_items ?? []).filter((r) => r.order_item_id !== item.id),
+                response.data,
+              ],
+            }
+          : current
+      );
+    } catch (err: any) {
+      setError(extractErrorMessage(err, `Failed to save the cloth counts for ${item.item_name}`));
+    } finally {
+      setClothCountBusyId(null);
+    }
+  };
+
+  /**
+   * THE SOCKED DETAILS DOCUMENT.
+   *
+   * Built from what is SAVED in `pending_item` and carried on the order — not
+   * from what happens to be typed in the boxes — so the document reports
+   * counts that were actually recorded. A line with nothing saved still gets a
+   * row, marked as not counted, rather than being dropped.
+   *
+   * Entirely separate from the confirmation PDF: its own template, its own
+   * generator and its own file name.
+   */
+  const handleSockedDetailsPdf = async () => {
+    if (isBuildingSockedPdf || !order) return;
+    try {
+      setIsBuildingSockedPdf(true);
+      setError('');
+
+      const saved = new Map((order.pending_items ?? []).map((r) => [r.order_item_id, r]));
+      const { uri, fileName } = await generateSockedDetailsPdf({
+        order_number: order.order_number,
+        business_name: order.customer_name,
+        rows: order.items.map((item) => ({
+          item_name: item.item_name,
+          socked_quantity: saved.get(item.id)?.socked_cloth_count ?? null,
+        })),
+      });
+
+      const outcome = await openPdfInDeviceViewer(uri, fileName);
+      if (outcome === 'unavailable') {
+        Alert.alert(
+          'No PDF viewer',
+          `This device has no app that can open a PDF. The file is saved as ${fileName}.`
+        );
+      }
+    } catch (err: any) {
+      if (__DEV__) console.error('[Sorter] socked details PDF failed', err);
+      setError('Unable to open the socked details PDF. Please try again.');
+    } finally {
+      setIsBuildingSockedPdf(false);
     }
   };
 
@@ -576,6 +894,28 @@ export default function SorterOrderDetailsScreen({ navigation, route }: any) {
           <Text style={styles.cardTitle}>Items ({order.item_count})</Text>
           {order.items.map((item) => {
             const isAdjusted = item.defective_quantity > 0;
+            /*
+             * THE THREE COUNTS MUST ACCOUNT FOR THE WHOLE LINE.
+             *
+             * Save is offered only when White + Color + Socked comes to
+             * exactly this item's quantity. Short means pieces are still
+             * unaccounted for; over means more were counted than the line
+             * holds. Neither is a count worth recording, so neither can be
+             * saved.
+             *
+             * PER LINE. Each item is checked against its own quantity, so one
+             * line balancing says nothing about any other.
+             */
+            const clothCountTotal = clothCountTotalOf(clothCounts[item.id]);
+            const clothCountBalances =
+              clothCountTotal === item.quantity &&
+              clothCountsWithinSocked(clothCounts[item.id]);
+            const canSaveClothCounts =
+              clothCountBalances &&
+              // Unchanged since the last save means there is nothing to save,
+              // which is the existing rule and still applies.
+              !sameBoxes(clothCounts[item.id], savedClothCounts[item.id]) &&
+              clothCountBusyId === null;
             return (
               <View key={item.id} style={styles.itemBlock}>
                 <View style={styles.itemRow}>
@@ -615,6 +955,73 @@ export default function SorterOrderDetailsScreen({ navigation, route }: any) {
                       </Text>
                     </View>
                   </View>
+                </View>
+
+                {/* THE COUNTS FOR THIS LINE. One card per item: each line is
+                    counted on its own and saved on its own. */}
+                <View style={styles.clothCountBlock}>
+                  <Text style={styles.clothCountTitle}>Cloth Count</Text>
+                  {CLOTH_COUNT_FIELDS.map((field) => (
+                    <View key={field.key} style={styles.clothCountRow}>
+                      <Text style={styles.clothCountLabel}>{field.label}</Text>
+                      <TextInput
+                        style={styles.clothCountInput}
+                        value={(clothCounts[item.id] || EMPTY_CLOTH_COUNTS)[field.key]}
+                        onChangeText={(next) =>
+                          setClothCounts((current) => ({
+                            ...current,
+                            [item.id]: {
+                              ...(current[item.id] || EMPTY_CLOTH_COUNTS),
+                              // Digits only: the box is a piece count, so
+                              // anything that is not one is dropped as it is
+                              // typed rather than left to be read as a
+                              // quantity later.
+                              [field.key]: next.replace(/[^0-9]/g, ''),
+                            },
+                          }))
+                        }
+                        keyboardType="number-pad"
+                        placeholder="0"
+                        placeholderTextColor={COLORS.TextSecondary}
+                        selectTextOnFocus
+                        maxLength={4}
+                        editable={clothCountBusyId !== item.id}
+                        accessibilityLabel={`${field.label} count for ${item.item_name} on order ${order.order_number}`}
+                      />
+                    </View>
+                  ))}
+                </View>
+
+                {/* SOCKED CLOTH FOR THIS LINE. Counted separately from the
+                    pile, and saved on the same row by the button below. */}
+                <View style={styles.clothCountBlock}>
+                  <Text style={styles.clothCountTitle}>Socked Cloth</Text>
+                  {SOCKED_FIELDS.map((field) => (
+                    <View key={field.key} style={styles.clothCountRow}>
+                      <Text style={styles.clothCountLabel}>{field.label}</Text>
+                      <TextInput
+                        style={styles.clothCountInput}
+                        value={(clothCounts[item.id] || EMPTY_CLOTH_COUNTS)[field.key]}
+                        onChangeText={(next) =>
+                          setClothCounts((current) => ({
+                            ...current,
+                            [item.id]: {
+                              ...(current[item.id] || EMPTY_CLOTH_COUNTS),
+                              // Digits only, as in the card above.
+                              [field.key]: next.replace(/[^0-9]/g, ''),
+                            },
+                          }))
+                        }
+                        keyboardType="number-pad"
+                        placeholder="0"
+                        placeholderTextColor={COLORS.TextSecondary}
+                        selectTextOnFocus
+                        maxLength={4}
+                        editable={clothCountBusyId !== item.id}
+                        accessibilityLabel={`${field.label} count for ${item.item_name} on order ${order.order_number}`}
+                      />
+                    </View>
+                  ))}
                 </View>
 
                 {/* Held pieces, and the one action that releases them. */}
@@ -665,6 +1072,25 @@ export default function SorterOrderDetailsScreen({ navigation, route }: any) {
 
                   </View>
                 ) : null}
+
+                {/* Nothing typed since this line was last saved means
+                    nothing to save for it. */}
+                <TouchableOpacity
+                  style={[
+                    styles.clothCountSave,
+                    !canSaveClothCounts && styles.buttonDisabled,
+                  ]}
+                  onPress={() => saveClothCounts(item)}
+                  disabled={!canSaveClothCounts}
+                  accessibilityRole="button"
+                  accessibilityLabel={`Save cloth counts for ${item.item_name}`}
+                >
+                  {clothCountBusyId === item.id ? (
+                    <ActivityIndicator size="small" color={COLORS.Surface} />
+                  ) : (
+                    <Text style={styles.clothCountSaveText}>SAVE COUNTS</Text>
+                  )}
+                </TouchableOpacity>
 
                 {defectsLocked ? (
                   /* Accepted: the action is gone, the figure stays. */
@@ -933,6 +1359,22 @@ export default function SorterOrderDetailsScreen({ navigation, route }: any) {
         </View>
 
         <TouchableOpacity
+          style={[styles.secondaryButton, isBuildingSockedPdf && styles.buttonDisabled]}
+          onPress={handleSockedDetailsPdf}
+          disabled={isBuildingSockedPdf}
+          activeOpacity={0.85}
+        >
+          {isBuildingSockedPdf ? (
+            <ActivityIndicator size="small" color={COLORS.Primary} />
+          ) : (
+            <>
+              <Ionicons name="document-text-outline" size={20} color={COLORS.Primary} />
+              <Text style={styles.secondaryButtonText}>SOCKED DETAILS PDF</Text>
+            </>
+          )}
+        </TouchableOpacity>
+
+        <TouchableOpacity
           style={[styles.secondaryButton, isBuildingPdf && styles.buttonDisabled]}
           onPress={handleViewPdf}
           disabled={isBuildingPdf}
@@ -1022,6 +1464,9 @@ function toPdfShape(order: SorterOrderDetail): BusinessOrderDetail {
     total_weight_kg: order.total_weight_kg,
     created_at: order.created_at,
     business_name: order.customer_name,
+    // Nothing to carry: the Sorter payload has no contact person, and the
+    // document's "Placed By" now reads placed_by_mobile directly rather than
+    // this field.
     contact_person_name: null,
     // The PDF states the number the order was PLACED on, not the number the
     // shop floor calls -- so it is placed_by_mobile, and never the account's.
@@ -1150,6 +1595,62 @@ const styles = StyleSheet.create({
     fontSize: TYPOGRAPHY.sizes.sm,
     fontWeight: '600',
     color: COLORS.TextPrimary,
+  },
+
+  clothCountBlock: {
+    marginTop: SPACING.sm,
+    paddingTop: SPACING.sm,
+    borderTopWidth: 1,
+    borderTopColor: COLORS.Border,
+  },
+  clothCountTitle: {
+    fontFamily: TYPOGRAPHY.fontFamily,
+    fontSize: TYPOGRAPHY.sizes.sm,
+    fontWeight: '700',
+    color: COLORS.TextPrimary,
+    marginBottom: 2,
+  },
+  clothCountSave: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    height: 40,
+    marginTop: SPACING.sm,
+    borderRadius: BORDER_RADIUS.md,
+    backgroundColor: COLORS.Primary,
+  },
+  clothCountSaveText: {
+    fontFamily: TYPOGRAPHY.fontFamily,
+    fontSize: TYPOGRAPHY.sizes.sm,
+    fontWeight: '800',
+    color: COLORS.Surface,
+    letterSpacing: 0.5,
+  },
+  clothCountRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    gap: SPACING.md,
+    paddingVertical: 5,
+  },
+  clothCountLabel: {
+    fontFamily: TYPOGRAPHY.fontFamily,
+    fontSize: TYPOGRAPHY.sizes.sm,
+    color: COLORS.TextSecondary,
+  },
+  clothCountInput: {
+    minWidth: 76,
+    textAlign: 'right',
+    borderWidth: 1,
+    borderColor: COLORS.Border,
+    borderRadius: BORDER_RADIUS.sm,
+    paddingVertical: SPACING.xs,
+    paddingHorizontal: SPACING.sm,
+    fontFamily: TYPOGRAPHY.fontFamily,
+    fontSize: TYPOGRAPHY.sizes.base,
+    fontWeight: '700',
+    color: COLORS.TextPrimary,
+    backgroundColor: COLORS.Surface,
   },
 
   itemRow: {

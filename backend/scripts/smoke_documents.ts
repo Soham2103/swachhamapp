@@ -188,17 +188,16 @@ async function main() {
   check('no Business Name field remains', !html.includes('Business Name:'));
   check('no Address field remains', !html.includes('Address:'));
 
-  // -- the order placer's mobile, now in the trailing Order Information --
+  // -- the order placer's mobile, now the value of "Placed By" --
   const orderInfo = html.slice(orderInfoAt);
-  check('the Order Information section shows a Mobile Number',
-    orderInfo.includes('Mobile Number:'));
-  check('it is the mobile of whoever PLACED the order',
-    orderInfo.includes(ORDER.business_mobile), ORDER.business_mobile);
-  check('it names who placed it', orderInfo.includes('Placed By:') &&
-    orderInfo.includes(ORDER.contact_person_name));
+  check('the separate Mobile Number heading is gone',
+    !html.includes('Mobile Number:'));
+  check('Placed By carries the mobile of whoever PLACED the order',
+    orderInfo.includes('Placed By:') && orderInfo.includes(ORDER.business_mobile),
+    ORDER.business_mobile);
   check('the mobile appears exactly once',
-    (html.match(/Mobile Number:/g) || []).length === 1,
-    `${(html.match(/Mobile Number:/g) || []).length} occurrence(s)`);
+    (html.match(new RegExp(ORDER.business_mobile, 'g')) || []).length === 1,
+    `${(html.match(new RegExp(ORDER.business_mobile, 'g')) || []).length} occurrence(s)`);
 
   // -- nothing else was lost --
   for (const kept of ['Order Number:', 'Order Date:', 'Order Time:', 'Order Status:',

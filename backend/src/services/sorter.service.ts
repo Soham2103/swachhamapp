@@ -314,6 +314,14 @@ export interface SorterOrderDetail extends SorterOrderSummary {
     total_weight_kg: number;
   }>;
   confirmation_pdf_url: string | null;
+  /**
+   * The cloth counts taken against each line of this order.
+   *
+   * PER ITEM: every line is counted on its own, so there is at most one row
+   * here per line and lines that have not been counted yet have none at all.
+   * Keyed back to the line by `order_item_id`.
+   */
+  pending_items: PendingItemRecord[];
   defects: DefectRecord[];
   /**
    * The defective-piece adjustments recorded against this order, newest
@@ -572,10 +580,11 @@ async function getOrderById(orderId: string): Promise<SorterOrderDetail> {
     };
   });
 
-  const [defects, adjustments, adjustmentNotifications] = await Promise.all([
+  const [defects, adjustments, adjustmentNotifications, pendingItems] = await Promise.all([
     listDefectsForOrder(orderId),
     listAdjustmentsForOrder(orderId),
     listNotificationsForOrder(orderId),
+    listPendingItemsForOrder(orderId),
   ]);
 
   return {
@@ -592,6 +601,7 @@ async function getOrderById(orderId: string): Promise<SorterOrderDetail> {
     ),
     items,
     confirmation_pdf_url: row.confirmation_pdf_url || null,
+    pending_items: pendingItems,
     defects,
     // Stripped of every financial field before it leaves. See the note above
     // SorterAdjustmentRecord.
@@ -1223,5 +1233,245 @@ async function getConfirmationPdf(
   return { url: order.confirmation_pdf_url, order };
 }
 
+/**
+ * ONE LINE'S CLOTH COUNTS, as `pending_item` holds them.
+ *
+ * `order_number`, `business_name` and `item_name` are stored on the row and
+ * read back from it rather than re-joined: they are what those names were when
+ * the count was taken. See the migration.
+ */
+export interface PendingItemRecord {
+  id: string;
+  order_id: string;
+  order_item_id: string;
+  order_number: string;
+  business_name: string;
+  item_name: string;
+  white_cloth_count: number | null;
+  color_cloth_count: number | null;
+  /**
+   * What was recorded under the older single "Socked Cloths" box.
+   *
+   * KEPT, and no longer written by the Sorter screen: `white_socked` and
+   * `color_socked` replaced it. Rows that carry a value still carry it, and
+   * anything reading it goes on reading it.
+   */
+  socked_cloth_count: number | null;
+  /** Socked cloth, counted as its own pair. NULL is "not counted". */
+  white_socked: number | null;
+  color_socked: number | null;
+  created_at: Date;
+  updated_at: Date;
+}
+
+/**
+ * What a client may send for one line. Every field optional: a field left out
+ * is not touched, and a field sent as null clears that count back to "not
+ * counted". Those are deliberately different requests.
+ */
+export interface PendingItemInput {
+  white?: number | null;
+  color?: number | null;
+  socked?: number | null;
+  whiteSocked?: number | null;
+  colorSocked?: number | null;
+}
+
+/** The largest count a column and a box both accept. */
+const MAX_CLOTH_COUNT = 9999;
+
+/** A database value to the API shape: a number, or null for "not counted". */
+function toClothCount(value: unknown): number | null {
+  if (value === null || value === undefined) return null;
+  const n = Number(value);
+  return Number.isFinite(n) ? n : null;
+}
+
+/**
+ * One count, from a client, validated.
+ *
+ * REJECTS rather than rounds or clamps: a count is a number somebody read off
+ * a pile, so quietly turning 12.5 into 12, or 100000 into 9999, would record a
+ * figure nobody counted.
+ */
+function parseClothCount(value: unknown, label: string): number | null {
+  if (value === null) return null;
+  const n = typeof value === 'string' ? Number(value.trim()) : Number(value);
+  if (!Number.isInteger(n) || n < 0 || n > MAX_CLOTH_COUNT) {
+    throw new AppError(
+      `${label} must be a whole number between 0 and ${MAX_CLOTH_COUNT}.`,
+      400
+    );
+  }
+  return n;
+}
+
+function toPendingItem(row: any): PendingItemRecord {
+  return {
+    id: String(row.id),
+    order_id: String(row.order_id),
+    order_item_id: String(row.order_item_id),
+    order_number: row.order_number,
+    business_name: row.business_name,
+    item_name: row.item_name,
+    // NULL is preserved and never coerced to 0: an uncounted line must not
+    // come back claiming a count of nothing.
+    white_cloth_count: toClothCount(row.white_cloth_count),
+    color_cloth_count: toClothCount(row.color_cloth_count),
+    socked_cloth_count: toClothCount(row.socked_cloth_count),
+    white_socked: toClothCount(row.white_socked),
+    color_socked: toClothCount(row.color_socked),
+    created_at: row.created_at,
+    updated_at: row.updated_at,
+  };
+}
+
+/** Every counted line of one order, oldest row first. */
+async function listPendingItemsForOrder(orderId: string): Promise<PendingItemRecord[]> {
+  const result = await query<any>(
+    `SELECT id, order_id, order_item_id, order_number, business_name, item_name,
+            white_cloth_count, color_cloth_count, socked_cloth_count,
+            white_socked, color_socked,
+            created_at, updated_at
+       FROM pending_item
+      WHERE order_id = ?
+      ORDER BY id ASC`,
+    [orderId]
+  );
+  return result.rows.map(toPendingItem);
+}
+
+/**
+ * Records the cloth counts for ONE LINE of an order.
+ *
+ * WRITES IN PLACE. A line is counted once and re-counted in place, so a second
+ * save corrects the first rather than adding a row — the unique key on
+ * `order_item_id` is what makes that a guarantee rather than a convention.
+ *
+ * The order number, the establishment name and the item name are read from the
+ * order INSIDE the transaction and written onto the row, so the row records
+ * what those names were when the count was taken.
+ *
+ * WHILE THE ORDER IS STILL ON THE SORTER'S BOARD, and not after: the statuses
+ * allowed are exactly the ones the Sorter queue covers, so this can never
+ * refuse something reachable from the screen and never accepts a count against
+ * an order that has left the floor.
+ *
+ * NOTHING ELSE MOVES. No status is re-derived and no quantity, price, invoice
+ * or payment is touched: counting a line is not a step in the workflow.
+ */
+async function savePendingItemCounts(
+  orderId: string,
+  orderItemId: string,
+  input: PendingItemInput
+): Promise<PendingItemRecord> {
+  const fields: Array<[string, number | null]> = [];
+  if ('white' in input) {
+    fields.push(['white_cloth_count', parseClothCount(input.white, 'White Cloths')]);
+  }
+  if ('color' in input) {
+    fields.push(['color_cloth_count', parseClothCount(input.color, 'Color Cloths')]);
+  }
+  if ('socked' in input) {
+    fields.push(['socked_cloth_count', parseClothCount(input.socked, 'Socked Cloths')]);
+  }
+  if ('whiteSocked' in input) {
+    fields.push(['white_socked', parseClothCount(input.whiteSocked, 'White Socked')]);
+  }
+  if ('colorSocked' in input) {
+    fields.push(['color_socked', parseClothCount(input.colorSocked, 'Color Socked')]);
+  }
+  if (fields.length === 0) {
+    throw new AppError('No cloth counts were supplied.', 400);
+  }
+
+  const connection = await getClient();
+  try {
+    await connection.beginTransaction();
+
+    // Order first, then the line: the same lock order as every other write in
+    // this service, so two Sorters on one order queue rather than deadlock.
+    // The establishment name is resolved exactly as ORDER_SELECT resolves it,
+    // so a document never disagrees with the queue about what a business is
+    // called.
+    const [orderRows]: any = await connection.execute(
+      `SELECT o.id, o.order_number, o.status,
+              COALESCE(NULLIF(TRIM(b.establishment_name), ''), b.name, u.name, 'Customer')
+                AS business_name
+         FROM orders o
+         LEFT JOIN business_users bu ON bu.id = o.business_user_id
+         LEFT JOIN businesses b ON b.id = bu.business_id
+         LEFT JOIN users u ON u.id = o.user_id
+        WHERE o.id = ? FOR UPDATE`,
+      [orderId]
+    );
+    const order = orderRows[0];
+    if (!order) throw new AppError('Order not found', 404);
+
+    if (!QUEUE_STATUSES.includes(String(order.status) as any)) {
+      throw new AppError(
+        `This order is ${String(order.status).replace(/_/g, ' ')} and is no longer ` +
+          'on the Sorter workflow, so its cloth counts can no longer be changed.',
+        409
+      );
+    }
+
+    const [itemRows]: any = await connection.execute(
+      `SELECT id, service_name FROM order_items WHERE id = ? AND order_id = ? FOR UPDATE`,
+      [orderItemId, orderId]
+    );
+    const item = itemRows[0];
+    if (!item) throw new AppError('That item is not part of this order.', 404);
+
+    /*
+     * INSERT, or correct the row that is already there.
+     *
+     * Column names come from the three literals above and never from the
+     * request, so the interpolation below cannot carry anything a client sent.
+     * Every value stays parameterised.
+     *
+     * The three names are refreshed on an update as well as an insert: if an
+     * establishment is renamed between two counts, the row says what it was
+     * called at the latest count rather than keeping a name nobody uses.
+     */
+    const insertColumns = ['order_id', 'order_item_id', 'order_number', 'business_name', 'item_name',
+                           ...fields.map(([c]) => c)];
+    const insertValues = [orderId, orderItemId, order.order_number, order.business_name,
+                          item.service_name, ...fields.map(([, v]) => v)];
+    const updates = ['order_number = VALUES(order_number)',
+                     'business_name = VALUES(business_name)',
+                     'item_name = VALUES(item_name)',
+                     ...fields.map(([c]) => `${c} = VALUES(${c})`)];
+
+    await connection.execute(
+      `INSERT INTO pending_item (${insertColumns.join(', ')})
+            VALUES (${insertColumns.map(() => '?').join(', ')})
+       ON DUPLICATE KEY UPDATE ${updates.join(', ')}`,
+      insertValues
+    );
+
+    const [saved]: any = await connection.execute(
+      `SELECT id, order_id, order_item_id, order_number, business_name, item_name,
+              white_cloth_count, color_cloth_count, socked_cloth_count,
+              white_socked, color_socked,
+              created_at, updated_at
+         FROM pending_item WHERE order_item_id = ?`,
+      [orderItemId]
+    );
+
+    await connection.commit();
+
+    // Read back rather than echoed, so what the client renders next is what
+    // the row holds — including the counts this request left alone.
+    return toPendingItem(saved[0]);
+  } catch (error) {
+    await connection.rollback();
+    throw error;
+  } finally {
+    connection.release();
+  }
+}
+
 export { listOrders, getOrderById, updateStatus, setItemPendingQuantity,
-         getConfirmationPdf, deriveOrderStatus, ALLOWED_TRANSITIONS };
+         getConfirmationPdf, savePendingItemCounts, listPendingItemsForOrder,
+         deriveOrderStatus, ALLOWED_TRANSITIONS };
