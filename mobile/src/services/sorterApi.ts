@@ -172,6 +172,16 @@ export interface SorterOrderItem {
   /** Pieces found damaged. 0 until an adjustment is recorded. */
   defective_quantity: number;
   /**
+   * How that figure divides between white and colour cloth.
+   *
+   * NULL means no split was recorded — a line adjusted before the two boxes
+   * existed. Not the same as zero: the pieces are defective either way, they
+   * were simply never attributed to a colour. The two sum to
+   * `defective_quantity` whenever present.
+   */
+  white_defective_quantity: number | null;
+  color_defective_quantity: number | null;
+  /**
    * Where this line stands on its own, derived from the quantities below.
    *
    * Holding pieces back is NOT the same as finding them defective — pieces
@@ -636,11 +646,31 @@ export const sorterApi = {
     orderId: string,
     orderItemId: string,
     defectiveQuantity: number,
-    reason?: string
+    reason?: string,
+    /**
+     * The white/colour split.
+     *
+     * When given, these two ARE the defective quantity — the server takes the
+     * total from their sum and checks each against its own cloth count, so a
+     * line with 10 colour pieces cannot have 20 colour defective.
+     *
+     * Optional so the single-figure call still works unchanged; omitting it
+     * leaves the split unrecorded rather than guessing one.
+     */
+    split?: { white: number; color: number }
   ): Promise<ApiResponse<AdjustmentResult>> => {
     const response = await apiClient.patch<ApiResponse<AdjustmentResult>>(
       `/api/sorter/orders/${orderId}/items/${orderItemId}/defective`,
-      { defectiveQuantity, reason: reason || undefined }
+      {
+        defectiveQuantity,
+        reason: reason || undefined,
+        ...(split
+          ? {
+              whiteDefectiveQuantity: split.white,
+              colorDefectiveQuantity: split.color,
+            }
+          : {}),
+      }
     );
     return response.data;
   },

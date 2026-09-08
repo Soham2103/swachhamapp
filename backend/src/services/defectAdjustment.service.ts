@@ -180,6 +180,37 @@ const money = (value: unknown) => Math.round(Number(value || 0) * 100) / 100;
  * rather than silently truncated to 2, which would bill a figure nobody
  * asked for.
  */
+/**
+ * One half of the white/colour split.
+ *
+ * Its own parser rather than a reuse of the one below, because the message
+ * has to name WHICH box was wrong — "the defective quantity cannot be
+ * negative" in front of two boxes tells the Sorter nothing about which one to
+ * fix. The rules themselves are the same: a whole number, not negative.
+ *
+ * The upper bounds are NOT checked here. How many white pieces there are to
+ * be defective depends on the line's counts, which this function has not
+ * read; that check belongs where those counts are known and is done there.
+ */
+function parseDefectiveHalf(value: unknown, label: string): number {
+  if (value === null || value === undefined || value === '') return 0;
+
+  const n = Number(value);
+  if (!Number.isFinite(n)) {
+    throw new AppError(`The ${label} defective quantity must be a number.`, 400);
+  }
+  if (!Number.isInteger(n)) {
+    throw new AppError(
+      `The ${label} defective quantity must be a whole number of pieces.`,
+      400
+    );
+  }
+  if (n < 0) {
+    throw new AppError(`The ${label} defective quantity cannot be negative.`, 400);
+  }
+  return n;
+}
+
 function parseDefectiveQuantity(value: unknown, originalQuantity: number): number {
   if (value === null || value === undefined || value === '') {
     throw new AppError('A defective quantity is required.', 400);
@@ -406,6 +437,20 @@ export async function adjustDefectiveQuantity(params: {
   orderId: string;
   orderItemId: string;
   defectiveQuantity: unknown;
+  /**
+   * The white/colour split, when the Sorter recorded one.
+   *
+   * OPTIONAL AND ADDITIVE. When both are absent the function behaves exactly
+   * as it did before the split existed: `defectiveQuantity` is the figure,
+   * and the two split columns stay NULL — "no split recorded", which is the
+   * truth about every row written before this.
+   *
+   * When either is present the two BECOME the figure: the total is their sum
+   * and `defectiveQuantity` is ignored, so the screen cannot send a total
+   * that disagrees with its own boxes.
+   */
+  whiteDefectiveQuantity?: unknown;
+  colorDefectiveQuantity?: unknown;
   reason?: string | null;
   sorterUserId: string;
 }): Promise<AdjustResult> {
@@ -475,7 +520,83 @@ export async function adjustDefectiveQuantity(params: {
      */
     const originalQuantity = Number(item.original_quantity ?? item.quantity);
     const previousDefective = Number(item.defective_quantity || 0);
-    const defectiveQuantity = parseDefectiveQuantity(params.defectiveQuantity, originalQuantity);
+
+    /*
+     * THE WHITE / COLOUR SPLIT.
+     *
+     * Present only when the screen sent it. When it is, the two boxes ARE the
+     * defective quantity and the total is their sum — see the params note.
+     */
+    const hasSplit =
+      params.whiteDefectiveQuantity !== undefined ||
+      params.colorDefectiveQuantity !== undefined;
+
+    let whiteDefective: number | null = null;
+    let colorDefective: number | null = null;
+    let defectiveQuantity: number;
+
+    if (hasSplit) {
+      whiteDefective = parseDefectiveHalf(params.whiteDefectiveQuantity, 'white');
+      colorDefective = parseDefectiveHalf(params.colorDefectiveQuantity, 'colour');
+
+      /*
+       * EACH HALF IS CHECKED AGAINST ITS OWN COUNT, not just the two against
+       * the line total. A line of 40 white and 10 colour cannot have 20
+       * colour pieces defective, and a check on the sum alone would let that
+       * through — it would then subtract 20 from a colour count of 10 and
+       * leave the effective count negative.
+       *
+       * The counts come from `pending_item`, which exists only once the line
+       * has been counted. A line that has NOT been counted is checked on the
+       * total alone: there is no white or colour figure to be too large for,
+       * and refusing the defect because nobody has counted yet would block
+       * the shop floor from recording damage it can plainly see.
+       */
+      const [countRows]: any = await connection.execute(
+        `SELECT white_cloth_count, color_cloth_count
+           FROM pending_item WHERE order_item_id = ?`,
+        [item.id]
+      );
+      const counts = countRows[0];
+
+      if (counts) {
+        const whiteAvailable = counts.white_cloth_count === null
+          ? null
+          : Number(counts.white_cloth_count);
+        const colorAvailable = counts.color_cloth_count === null
+          ? null
+          : Number(counts.color_cloth_count);
+
+        if (whiteAvailable !== null && whiteDefective > whiteAvailable) {
+          throw new AppError(
+            `Only ${whiteAvailable} white piece(s) were counted on this item, so ` +
+              `${whiteDefective} cannot be defective.`,
+            400
+          );
+        }
+        if (colorAvailable !== null && colorDefective > colorAvailable) {
+          throw new AppError(
+            `Only ${colorAvailable} colour piece(s) were counted on this item, so ` +
+              `${colorDefective} cannot be defective.`,
+            400
+          );
+        }
+      }
+
+      defectiveQuantity = whiteDefective + colorDefective;
+
+      // The same ceiling the single-figure path enforces. Checked on the sum
+      // because that is what comes off the billable quantity.
+      if (defectiveQuantity > originalQuantity) {
+        throw new AppError(
+          `The defective quantity cannot be more than the ${originalQuantity} piece(s) ordered.`,
+          400
+        );
+      }
+    } else {
+      defectiveQuantity = parseDefectiveQuantity(params.defectiveQuantity, originalQuantity);
+    }
+
     const finalQuantity = originalQuantity - defectiveQuantity;
 
     // Belt and braces: the arithmetic above cannot produce this, and if it
@@ -508,12 +629,23 @@ export async function adjustDefectiveQuantity(params: {
     const lineWeight =
       perPieceWeight === null ? null : Math.round(perPieceWeight * finalQuantity * 1000) / 1000;
 
+    /*
+     * `defective_quantity` STAYS THE TOTAL. Every consumer — pricing, the
+     * reports, the adjustment history — reads it and is correct without
+     * knowing a split exists. The two split columns are written beside it,
+     * and stay NULL on the path that did not send one.
+     */
     await connection.execute(
       `UPDATE order_items
           SET original_quantity = ?, defective_quantity = ?, quantity = ?,
-              total_price = ?, total_weight_kg = ?
+              total_price = ?, total_weight_kg = ?,
+              white_defective_quantity = ?, color_defective_quantity = ?
         WHERE id = ?`,
-      [originalQuantity, defectiveQuantity, finalQuantity, adjustedAmount, lineWeight, item.id]
+      [
+        originalQuantity, defectiveQuantity, finalQuantity, adjustedAmount, lineWeight,
+        whiteDefective, colorDefective,
+        item.id,
+      ]
     );
 
     // The audit row: one per adjustment EVENT. A correction adds a row, it

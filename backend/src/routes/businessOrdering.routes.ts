@@ -34,6 +34,13 @@ import {
   QUICK_ORDER_MULTIPLIER,
 } from '../services/businessOrder.service';
 import { getProfile, updateProfile, getOwnedBusinessId } from '../services/businessProfile.service';
+import {
+  listPendingTicketsForBusiness,
+  acceptTicketAsBusiness,
+  listMessagesForBusiness,
+  businessInboxCounts,
+  markBusinessMessagesRead,
+} from '../services/riderDoorAcceptance.service';
 import { sendSuccess } from '../utils/response';
 import { query } from '../config/database';
 import { AppError } from '../utils/appError';
@@ -478,6 +485,78 @@ router.post('/orders', async (req: Request, res: Response, next: NextFunction) =
         (driverCode ? ` (db: ${driverCode})` : '')
     );
     next(error);
+  }
+});
+
+// ======================================================
+// DOOR TICKETS AND MESSAGES FROM RIDERS
+// ======================================================
+//
+// The hotel's side of the rider's "Without Counting & Checked" acceptance: a
+// ticket it must accept, and the messages its riders have left it.
+//
+// The hotel is `req.user.id` — the `business_users` row from the token, the
+// same id every other route in this file uses. It is never read from the body
+// or a path parameter, so one hotel cannot answer another's ticket.
+
+/** Tickets waiting on this hotel. */
+router.get('/door-tickets', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const authReq = req as AuthenticatedRequest;
+    const tickets = await listPendingTicketsForBusiness(String(authReq.user!.id));
+    return sendSuccess(res, tickets, 'Pending door tickets');
+  } catch (error) {
+    return next(error);
+  }
+});
+
+/**
+ * The hotel's "Accepted".
+ *
+ * This is what releases the waiting rider and sends the mismatch notice.
+ */
+router.post('/door-tickets/:ticketId/accept', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const authReq = req as AuthenticatedRequest;
+    const result = await acceptTicketAsBusiness(
+      String(req.params.ticketId),
+      String(authReq.user!.id)
+    );
+    return sendSuccess(res, result, 'Ticket accepted');
+  } catch (error) {
+    return next(error);
+  }
+});
+
+/** Messages riders have left this hotel. */
+router.get('/messages', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const authReq = req as AuthenticatedRequest;
+    const messages = await listMessagesForBusiness(String(authReq.user!.id));
+    return sendSuccess(res, messages, 'Messages');
+  } catch (error) {
+    return next(error);
+  }
+});
+
+/** Unread and pending counts, for the badge. */
+router.get('/inbox-counts', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const authReq = req as AuthenticatedRequest;
+    const counts = await businessInboxCounts(String(authReq.user!.id));
+    return sendSuccess(res, counts, 'Inbox counts');
+  } catch (error) {
+    return next(error);
+  }
+});
+
+router.post('/messages/read', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const authReq = req as AuthenticatedRequest;
+    const result = await markBusinessMessagesRead(String(authReq.user!.id));
+    return sendSuccess(res, result, 'Messages marked read');
+  } catch (error) {
+    return next(error);
   }
 });
 

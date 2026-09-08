@@ -181,6 +181,54 @@ export function formatDayMonthIST(dateKey: string): string {
   return `${day} ${MONTH_SHORT[month - 1]}`;
 }
 
+/**
+ * "16:00:00" or "16:00" -> "4:00 PM".
+ *
+ * Written out for the same reason the dates above are: `toLocaleTimeString`
+ * formats in the device's locale, and a collection time shown to an Indian
+ * operator must read the same on every phone. Returns '' for anything that is
+ * not a time, so a caller can test the result rather than the input.
+ */
+export function formatClockIST(time: string | null | undefined): string {
+  if (!time) return '';
+  const [rawHour, rawMinute] = String(time).split(':');
+  const hour24 = Number(rawHour);
+  const minute = Number(rawMinute);
+  if (!Number.isFinite(hour24) || !Number.isFinite(minute)) return '';
+
+  const suffix = hour24 >= 12 ? 'PM' : 'AM';
+  const hour12 = hour24 % 12 === 0 ? 12 : hour24 % 12;
+  return `${hour12}:${pad(minute)} ${suffix}`;
+}
+
+/**
+ * THE ONE PLACE AN ASSIGNED PICKUP IS TURNED INTO WORDS.
+ *
+ * The customer's tracker, the business's order screens and the Manager's own
+ * queue all call this, so one collection cannot be worded three ways — and a
+ * screen cannot accidentally show a date with no time, or a time with no
+ * date, because both halves are required for a result at all.
+ *
+ * Returns null when the Manager has not assigned one. That is the signal to
+ * show NOTHING: an order with no collection arranged yet must not display a
+ * heading with an empty value under it, and orders placed before this feature
+ * existed have no assignment and never will.
+ */
+export function formatAssignedPickup(
+  dateKey: string | null | undefined,
+  time: string | null | undefined
+): { date: string; time: string } | null {
+  if (!dateKey || !time) return null;
+
+  const day = formatLongDateIST(String(dateKey).slice(0, 10));
+  const clock = formatClockIST(time);
+  // A malformed stored value reads as "no pickup" rather than as a broken
+  // one: showing "NaN:NaN PM" beside a real date would be worse than silence.
+  if (!day || !clock || day.includes('undefined')) return null;
+
+  return { date: day, time: clock };
+}
+
 /** "Today" / "Tomorrow" / "Mon", relative to the current Indian day. */
 export function relativeDayCaption(dateKey: string): string {
   const today = todayIST();

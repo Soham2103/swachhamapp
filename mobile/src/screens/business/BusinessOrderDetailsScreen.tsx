@@ -16,6 +16,7 @@ import * as Sharing from 'expo-sharing';
 import * as FileSystem from 'expo-file-system/legacy';
 import { COLORS, SPACING, TYPOGRAPHY, BORDER_RADIUS, SHADOWS } from '../../constants/theme';
 import BusinessHeader from '../../components/business/BusinessHeader';
+import PickupScheduleCard from '../../components/PickupScheduleCard';
 import businessOrderApi, { BusinessOrderDetail } from '../../services/businessOrderApi';
 import { extractErrorMessage } from '../../services/api';
 import {
@@ -236,6 +237,26 @@ export default function BusinessOrderDetailsScreen({ navigation, route }: any) {
             below it, found when it is wanted rather than scrolled past every
             time. */}
         <Text style={styles.brand}>SWACHHAM</Text>
+
+        {/*
+          THE COLLECTION A MANAGER ASSIGNED.
+
+          Above the items because "when is it being picked up" is the one
+          thing on this screen that is time-critical to a business.
+
+          THE SAME COMPONENT AND THE SAME TWO FIELDS the customer's tracking
+          screen renders — `orders.assigned_pickup_date` and
+          `assigned_pickup_time`, read straight from the order — which is what
+          makes the two sides agree by construction rather than by care.
+
+          It renders nothing at all until a Manager has assigned one, so an
+          order still awaiting approval, and every order placed before this
+          existed, shows no empty heading here.
+        */}
+        <PickupScheduleCard
+          date={order.assigned_pickup_date}
+          time={order.assigned_pickup_time}
+        />
 
         <View style={styles.card}>
           <Text style={styles.cardTitle}>Items ({order.item_count})</Text>

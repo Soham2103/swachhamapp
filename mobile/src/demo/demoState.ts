@@ -98,6 +98,21 @@ export interface DemoOrder {
   created_at: string;
   pickup: DemoOrderLeg;
   delivery: DemoOrderLeg | null;
+  /**
+   * THE COLLECTION "ASSIGNED" WHEN THE ORDER LEAVES PENDING_APPROVAL.
+   *
+   * The demo has no Manager — advancing the status by hand is what stands in
+   * for one — so the assignment is made at that same moment, from the order's
+   * OWN booked pickup. Nothing is invented and no date is written into the
+   * code: it is the day and the slot start this order actually carries.
+   *
+   * Both null until then, and both null on orders created before this
+   * existed, which is exactly what the real API returns for an order no
+   * Manager has scheduled. The screens therefore behave identically in demo
+   * mode and against the live backend.
+   */
+  assigned_pickup_date?: string | null;
+  assigned_pickup_time?: string | null;
   items: DemoOrderItem[];
   /**
    * The order's STATUS HISTORY.

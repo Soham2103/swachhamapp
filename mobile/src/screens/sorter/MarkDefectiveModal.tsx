@@ -36,6 +36,14 @@ import { SorterOrderItem } from '../../services/sorterApi';
  * glance. The server recomputes it too and its answer is what gets stored.
  */
 
+/**
+ * How a defective quantity divides between the two piles.
+ *
+ * Always both numbers, never null: the form always knows which colour it
+ * counted, and an empty box means none of that colour rather than unknown.
+ */
+export type DefectiveSplit = { white: number; color: number };
+
 export default function MarkDefectiveModal({
   visible,
   item,
@@ -44,6 +52,8 @@ export default function MarkDefectiveModal({
   onCancel,
   onSave,
   onReportPiece,
+  availableWhite,
+  availableColour,
 }: {
   visible: boolean;
   /** Null while closing, so the modal can animate out without flashing empty. */
@@ -51,7 +61,7 @@ export default function MarkDefectiveModal({
   orderNumber: string;
   saving: boolean;
   onCancel: () => void;
-  onSave: (defectiveQuantity: number, reason: string) => void;
+  onSave: (defectiveQuantity: number, reason: string, split: DefectiveSplit) => void;
   /**
    * REPORT THE PIECE ITSELF — the photo, and the WhatsApp notification that
    * carries it. Reached from HERE rather than from a button of its own, so
@@ -59,52 +69,129 @@ export default function MarkDefectiveModal({
    * line, the same count, the same reason. The parent saves the adjustment
    * first and then opens the camera.
    */
-  onReportPiece: (defectiveQuantity: number, reason: string) => void;
+  onReportPiece: (defectiveQuantity: number, reason: string, split: DefectiveSplit) => void;
+  /**
+   * The cloth counted on this line, so each box can be checked against its
+   * OWN pile rather than against the line total.
+   *
+   * NULL means that colour has not been counted, and then there is no ceiling
+   * to enforce: refusing damage the Sorter can plainly see, because nobody
+   * has counted yet, would stop the shop floor recording it at all. The
+   * server applies the same rule.
+   *
+   * These arrive already NET of any defect currently recorded, so re-opening
+   * the form on an adjusted line must add that figure back before checking —
+   * see `availableFor` below.
+   */
+  availableWhite: number | null;
+  availableColour: number | null;
 }) {
-  // Seeded from what the line already carries, so opening the form on an
-  // adjusted line offers the CURRENT figure to correct rather than a blank
-  // box that reads as "none recorded".
-  const [text, setText] = useState('');
+  /*
+   * TWO BOXES, ONE PER COLOUR.
+   *
+   * Seeded from what the line already carries so re-opening the form offers
+   * the CURRENT figures to correct rather than blanks that read as "none
+   * recorded". A line adjusted before the split existed has NULL for both, so
+   * its whole defective quantity is seeded into WHITE — the pieces are real
+   * and must not be silently dropped to zero, and white is the side that does
+   * not change what colour cloth is left.
+   */
+  const [whiteText, setWhiteText] = useState('');
+  const [colourText, setColourText] = useState('');
   const [reason, setReason] = useState('');
   const [touched, setTouched] = useState(false);
 
   const ordered = item ? item.original_quantity : 0;
 
   // Re-seed whenever a different line is opened.
-  const seedKey = item ? `${item.id}:${item.defective_quantity}` : '';
+  const seedKey = item
+    ? `${item.id}:${item.defective_quantity}:${item.white_defective_quantity}:${item.color_defective_quantity}`
+    : '';
   const [lastSeed, setLastSeed] = useState('');
   if (visible && seedKey && seedKey !== lastSeed) {
     setLastSeed(seedKey);
-    setText(String(item!.defective_quantity || 0));
+    const white = item!.white_defective_quantity;
+    const colour = item!.color_defective_quantity;
+    const hasSplit = white !== null || colour !== null;
+    setWhiteText(String(hasSplit ? white || 0 : item!.defective_quantity || 0));
+    setColourText(String(hasSplit ? colour || 0 : 0));
     setReason('');
     setTouched(false);
   }
 
-  /**
-   * The same rules the server enforces, so the Sorter is told at the keyboard
-   * rather than by a failed request. The server checks them again regardless
-   * — this is a convenience, never the guard.
+  /*
+   * The ceiling for each box is the count AS COUNTED.
+   *
+   * `availableWhite` / `availableColour` are the original figures — the
+   * server stores and returns the count off the pile, with the defective
+   * pieces subtracted only where they are displayed. So they are the ceiling
+   * directly: a line counted at 20 white can have at most 20 white defective,
+   * whatever is already recorded against it.
+   *
+   * That also makes a correction work without arithmetic here. An earlier
+   * version received these already net of the recorded defect and had to add
+   * it back before comparing, which was one more place for the two figures to
+   * drift apart.
    */
-  const validation = useMemo(() => {
-    const raw = text.trim();
-    if (raw === '') return { error: 'Enter how many pieces are defective.', value: null };
-    if (!/^\d+$/.test(raw)) {
+  const whiteCeiling = availableWhite;
+  const colourCeiling = availableColour;
+
+  /**
+   * One box's own rules. The server enforces all of these again — this is a
+   * convenience so the Sorter is told at the keyboard, never the guard.
+   */
+  const checkBox = (raw: string, label: string, ceiling: number | null) => {
+    const trimmed = raw.trim();
+    // An empty box is none of that colour, not an error: a line can be all
+    // white, and forcing a "0" into the colour box to say so is friction.
+    if (trimmed === '') return { error: null as string | null, value: 0 };
+    if (!/^\d+$/.test(trimmed)) {
       // Rejected rather than rounded: a garment is a physical object, and
       // silently turning 2.5 into 2 would bill a figure nobody asked for.
-      return { error: 'Whole pieces only — no decimals or negative numbers.', value: null };
+      // The pattern also rejects a leading "-", so negatives cannot be typed.
+      return { error: `${label}: whole pieces only — no decimals or negatives.`, value: null };
     }
-    const value = Number(raw);
-    if (value > ordered) {
-      return { error: `Cannot be more than the ${ordered} piece(s) ordered.`, value: null };
+    const value = Number(trimmed);
+    if (ceiling !== null && value > ceiling) {
+      return {
+        error: `${label}: only ${ceiling} piece(s) counted, so ${value} cannot be defective.`,
+        value: null,
+      };
     }
     return { error: null as string | null, value };
-  }, [text, ordered]);
+  };
 
-  const defective = validation.value ?? 0;
+  const validation = useMemo(() => {
+    const white = checkBox(whiteText, 'White', whiteCeiling);
+    if (white.error) return { error: white.error, white: null, colour: null, total: null };
+
+    const colour = checkBox(colourText, 'Colour', colourCeiling);
+    if (colour.error) return { error: colour.error, white: null, colour: null, total: null };
+
+    const total = (white.value || 0) + (colour.value || 0);
+    if (total > ordered) {
+      return {
+        error: `Cannot be more than the ${ordered} piece(s) ordered.`,
+        white: null,
+        colour: null,
+        total: null,
+      };
+    }
+
+    return { error: null as string | null, white: white.value, colour: colour.value, total };
+  }, [whiteText, colourText, whiteCeiling, colourCeiling, ordered]);
+
+  const defective = validation.total ?? 0;
   const finalQuantity = Math.max(0, ordered - defective);
 
   const showError = touched && validation.error;
   const canSave = !saving && validation.error === null;
+
+  /** What the two boxes come to, for the parent. */
+  const split: DefectiveSplit = {
+    white: validation.white ?? 0,
+    color: validation.colour ?? 0,
+  };
 
   return (
     <Modal
@@ -133,21 +220,55 @@ export default function MarkDefectiveModal({
               <Text style={styles.readOnlyText}>{ordered}</Text>
             </View>
 
+            {/*
+              * DEFECTIVE QUANTITY, SPLIT BY COLOUR.
+              *
+              * Two boxes because the defect has to come off the right pile:
+              * white damage reduces the white count and colour damage the
+              * colour count. Each box shows the pieces it may not exceed, so
+              * the limit is visible before it is hit rather than after.
+              */}
             <Text style={styles.label}>DEFECTIVE QUANTITY</Text>
+
+            <Text style={styles.splitLabel}>
+              White{whiteCeiling !== null ? ` (of ${whiteCeiling} counted)` : ''}
+            </Text>
             <TextInput
               style={[styles.input, showError ? styles.inputError : null]}
-              value={text}
+              value={whiteText}
               onChangeText={(next) => {
                 setTouched(true);
-                setText(next);
+                // Digits only, dropped as typed: a minus sign or a decimal
+                // point never reaches the value, so a negative cannot be
+                // entered at all.
+                setWhiteText(next.replace(/[^0-9]/g, ''));
               }}
               onBlur={() => setTouched(true)}
               keyboardType="number-pad"
               placeholder="0"
               placeholderTextColor={COLORS.TextSecondary}
               editable={!saving}
-              accessibilityLabel="Defective quantity"
+              accessibilityLabel="White defective quantity"
             />
+
+            <Text style={styles.splitLabel}>
+              Colour{colourCeiling !== null ? ` (of ${colourCeiling} counted)` : ''}
+            </Text>
+            <TextInput
+              style={[styles.input, showError ? styles.inputError : null]}
+              value={colourText}
+              onChangeText={(next) => {
+                setTouched(true);
+                setColourText(next.replace(/[^0-9]/g, ''));
+              }}
+              onBlur={() => setTouched(true)}
+              keyboardType="number-pad"
+              placeholder="0"
+              placeholderTextColor={COLORS.TextSecondary}
+              editable={!saving}
+              accessibilityLabel="Colour defective quantity"
+            />
+
             {showError ? <Text style={styles.error}>{validation.error}</Text> : null}
 
             <Text style={styles.label}>REASON (OPTIONAL)</Text>
@@ -182,8 +303,8 @@ export default function MarkDefectiveModal({
                 style={[styles.button, styles.save, !canSave && styles.buttonDisabled]}
                 onPress={() => {
                   setTouched(true);
-                  if (validation.value === null) return;
-                  onSave(validation.value, reason.trim());
+                  if (validation.total === null) return;
+                  onSave(validation.total, reason.trim(), split);
                 }}
                 disabled={!canSave}
                 accessibilityRole="button"
@@ -203,8 +324,8 @@ export default function MarkDefectiveModal({
               style={[styles.reportButton, !canSave && styles.buttonDisabled]}
               onPress={() => {
                 setTouched(true);
-                if (validation.value === null) return;
-                onReportPiece(validation.value, reason.trim());
+                if (validation.total === null) return;
+                onReportPiece(validation.total, reason.trim(), split);
               }}
               disabled={!canSave}
               accessibilityRole="button"
@@ -270,6 +391,19 @@ const styles = StyleSheet.create({
     letterSpacing: 0.6,
     color: COLORS.TextSecondary,
     marginTop: SPACING.md,
+    marginBottom: SPACING.xs,
+  },
+  /**
+   * The per-colour caption above each box. Lighter than `label`, and with a
+   * smaller top margin, so the two boxes read as one DEFECTIVE QUANTITY
+   * section rather than as two unrelated fields.
+   */
+  splitLabel: {
+    fontFamily: TYPOGRAPHY.fontFamily,
+    fontSize: 12,
+    fontWeight: '600',
+    color: COLORS.TextPrimary,
+    marginTop: SPACING.sm,
     marginBottom: SPACING.xs,
   },
   itemName: {

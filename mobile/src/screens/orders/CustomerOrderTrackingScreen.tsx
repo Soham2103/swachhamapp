@@ -8,6 +8,7 @@ import { useFocusEffect } from '@react-navigation/native';
 import { Ionicons } from '@expo/vector-icons';
 import { COLORS, SPACING, TYPOGRAPHY, BORDER_RADIUS } from '../../constants/theme';
 import { customerOrderApi } from '../../services/customerCartApi';
+import PickupScheduleCard from '../../components/PickupScheduleCard';
 import {
   CUSTOMER_STAGES, customerStatusLabel, customerStageIndex, isCancelledStatus,
 } from '../../constants/orderStatus';
@@ -191,6 +192,35 @@ export default function CustomerOrderTrackingScreen({ route, navigation }: any) 
               <Text style={styles.meta}>Placed {when(tracking.created_at)}</Text>
             )}
           </View>
+
+          {/*
+            THE COLLECTION, ONCE A MANAGER HAS ARRANGED ONE.
+
+            Directly under the status because it is the one thing a customer
+            opens this screen to find out: when someone is coming.
+
+            IT APPEARS BY ITSELF. Nothing is entered here and nothing is
+            polled for it — the two fields come back with the tracking read
+            that already runs on every focus, so accepting an order, or
+            moving its pickup afterwards, shows up the next time this screen
+            is looked at.
+
+            NOTHING IS RENDERED UNTIL THERE IS SOMETHING TO RENDER. The card
+            returns null unless both halves are set, so an order still
+            waiting on a Manager shows no heading and no empty row — and
+            neither does an order placed before pickups were assigned at all.
+
+            A CANCELLED ORDER IS NOT COLLECTED, so the card is suppressed for
+            one even if a pickup had been assigned before it was cancelled:
+            the line above already says nothing will be collected, and a
+            collection time under it would contradict that outright.
+          */}
+          {!cancelled && (
+            <PickupScheduleCard
+              date={tracking?.assigned_pickup_date}
+              time={tracking?.assigned_pickup_time}
+            />
+          )}
 
           {/*
             THE LADDER, LIT FROM THE CURRENT STATUS.

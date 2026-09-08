@@ -1,6 +1,6 @@
 import { Asset } from 'expo-asset';
-import * as Print from 'expo-print';
 import * as FileSystem from 'expo-file-system/legacy';
+import { printPdfAs } from './pdfFile';
 import { BusinessOrderDetail } from '../services/businessOrderApi';
 import {
   buildBusinessOrderPdfHtml, buildCombinedOrderPdfHtml, buildPdfFileName,
@@ -41,13 +41,11 @@ export async function generateOrderPdf(
   order: BusinessOrderDetail
 ): Promise<{ uri: string; fileName: string }> {
   const logo = await getLogoDataUri();
-  const { uri } = await Print.printToFileAsync({
-    html: buildBusinessOrderPdfHtml(order, logo),
-  });
 
   // Named for the business first, then the order. See buildPdfFileName.
   const fileName = buildPdfFileName(order.order_number, order.business_name);
-  return renameIntoCache(uri, fileName);
+
+  return printPdfAs(buildBusinessOrderPdfHtml(order, logo), fileName);
 }
 
 /**
@@ -66,42 +64,20 @@ export async function generateCombinedOrderPdf(
   fileName: string
 ): Promise<{ uri: string; fileName: string }> {
   const logo = await getLogoDataUri();
-  const { uri } = await Print.printToFileAsync({
-    html: buildCombinedOrderPdfHtml(orders, logo),
-  });
-  return renameIntoCache(uri, fileName);
+  return printPdfAs(buildCombinedOrderPdfHtml(orders, logo), fileName);
 }
 
-/**
- * Moves a freshly printed PDF to `fileName` in the cache.
+/*
+ * `renameIntoCache` used to live here and is gone.
  *
- * The URI is percent-encoded because an order number contains `#`, which
- * would otherwise be read as a URI fragment. Shared by both generators so
- * Share and Download hand over the same file under the same name whichever
- * document was built.
+ * It moved the printed file into the cache, and on Expo Go it could never
+ * succeed: the printer writes outside the sandbox expo-file-system grants
+ * permissions for, so both the move and the copy were refused before they
+ * reached the disk, and every document fell through to the warning. It is
+ * replaced by `printPdfAs` in `utils/pdfFile`, which is shared with the batch
+ * and socked documents so the three cannot drift apart again. The full
+ * explanation is in that file's header.
  */
-async function renameIntoCache(
-  uri: string,
-  fileName: string
-): Promise<{ uri: string; fileName: string }> {
-  const targetUri = `${FileSystem.cacheDirectory}${encodeURIComponent(fileName)}`;
-  try {
-    await FileSystem.deleteAsync(targetUri, { idempotent: true });
-    await FileSystem.moveAsync({ from: uri, to: targetUri });
-    return { uri: targetUri, fileName };
-  } catch {
-    try {
-      await FileSystem.copyAsync({ from: uri, to: targetUri });
-      return { uri: targetUri, fileName };
-    } catch {
-      // Both renames failed. The generated file is still a valid PDF, so the
-      // action continues rather than failing outright — only the file name
-      // falls back to the one expo-print chose.
-      if (__DEV__) console.warn('[OrderPdf] could not rename to', fileName);
-      return { uri, fileName };
-    }
-  }
-}
 
 /**
  * The logo, resolved ONCE per app session.
@@ -147,15 +123,36 @@ export async function getLogoDataUri(): Promise<string | null> {
      * silently logo-less PDF. Anything that is not already a local file is
      * fetched into the cache first and read from there.
      */
+    const cached = `${FileSystem.cacheDirectory}swachham-logo-pdf.png`;
+
     let fileUri = uri;
     if (!fileUri.startsWith('file://')) {
-      const cached = `${FileSystem.cacheDirectory}swachham-logo-pdf.png`;
       const info = await FileSystem.getInfoAsync(cached);
       if (!info.exists) await FileSystem.downloadAsync(uri, cached);
       fileUri = cached;
     }
 
-    const base64 = await FileSystem.readAsStringAsync(fileUri, { encoding: 'base64' });
+    let base64: string;
+    try {
+      base64 = await FileSystem.readAsStringAsync(fileUri, { encoding: 'base64' });
+    } catch {
+      /*
+       * A `file://` asset is not necessarily a file we are ALLOWED to read.
+       *
+       * On Expo Go the asset can resolve into Expo Go's own storage, outside
+       * the sandbox expo-file-system grants this experience — the same
+       * refusal that broke the PDF caching (see `utils/pdfFile`). It surfaces
+       * differently here: the read throws, the catch below returns null, and
+       * every document silently renders without its logo.
+       *
+       * Copying it into our own cache first turns the read into an ordinary
+       * in-sandbox one. `downloadAsync` handles a file:// source as well as
+       * an http one, so this covers both.
+       */
+      await FileSystem.downloadAsync(uri, cached);
+      base64 = await FileSystem.readAsStringAsync(cached, { encoding: 'base64' });
+    }
+
     logoDataUri = `data:image/png;base64,${base64}`;
     return logoDataUri;
   } catch {

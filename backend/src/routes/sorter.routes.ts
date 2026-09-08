@@ -563,6 +563,11 @@ router.patch(
         orderId: req.params.id,
         orderItemId: req.params.itemId,
         defectiveQuantity: req.body?.defectiveQuantity,
+        // The white/colour split, forwarded only when the client sent it.
+        // Passing `undefined` through is what keeps the old single-figure
+        // body working unchanged — see the service.
+        whiteDefectiveQuantity: req.body?.whiteDefectiveQuantity,
+        colorDefectiveQuantity: req.body?.colorDefectiveQuantity,
         reason: typeof req.body?.reason === 'string' ? req.body.reason : null,
         sorterUserId: authReq.user!.id,
       });

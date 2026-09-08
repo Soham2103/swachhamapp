@@ -118,8 +118,48 @@ export interface PendingOrderRequest {
   pickup_date: string | null;
   pickup_slot_start: string | null;
   pickup_slot_end: string | null;
+  /**
+   * The collection a Manager has assigned, or null when none has been.
+   *
+   * NOT the same as the three fields above, which are what the customer or
+   * the business asked for when booking — and on a business order a
+   * placeholder the app had to send. These two are the Manager's own
+   * decision, and null is what a screen tests to show nothing at all.
+   */
+  assigned_pickup_date: string | null;
+  assigned_pickup_time: string | null;
   special_notes: string | null;
   created_at: string;
+}
+
+/**
+ * One time a collection may be assigned to.
+ *
+ * The same shape as `BusinessTimeSlot`, deliberately: `TimeSlotRow` renders
+ * either without knowing which it has, so the Manager's picker and the
+ * booking picker cannot drift apart in look or behaviour.
+ */
+export interface ManagerPickupTime {
+  /** "16:00" — sent back as `pickupTime`. */
+  id: string;
+  /** "4:00 PM". */
+  label: string;
+  /** Minutes since midnight, e.g. 4:00 PM -> 960. */
+  start_minutes: number;
+  /**
+   * False when this time cannot be assigned on the date that was asked
+   * about — on today, one that has already gone by in IST. The server
+   * decides it, and refuses the same time at accept.
+   */
+  available: boolean;
+}
+
+/** What the Manager chose, as both endpoints take it. */
+export interface PickupAssignmentInput {
+  /** YYYY-MM-DD. */
+  pickupDate: string;
+  /** The id from `getPickupTimes`, e.g. "16:00". */
+  pickupTime: string;
 }
 
 const managerApi = {
@@ -138,6 +178,19 @@ const managerApi = {
     return res.data.data ?? [];
   },
 
+  /**
+   * Accepted orders whose collection has not happened yet, soonest first.
+   *
+   * Not split by source — this asks "what are we collecting?", which spans
+   * both queues — so each row carries its own `source` for labelling.
+   */
+  getScheduledOrders: async (): Promise<PendingOrderRequest[]> => {
+    const res = await apiClient.get<ApiResponse<PendingOrderRequest[]>>(
+      '/api/manager/order-requests/scheduled'
+    );
+    return res.data.data ?? [];
+  },
+
   /** How many are waiting in each tab, for the badges. */
   getOrderRequestCounts: async (): Promise<{ CUSTOMER: number; BUSINESS: number }> => {
     const res = await apiClient.get<ApiResponse<{ CUSTOMER: number; BUSINESS: number }>>(
@@ -147,13 +200,53 @@ const managerApi = {
   },
 
   /**
-   * Accepts one booking. The server owns the rule: it refuses with 409 if the
-   * order has already moved on, and writes ORDER_PLACED plus the history row
-   * in one transaction. Nothing about the order is decided here.
+   * The times a collection may be assigned to on `date`.
+   *
+   * Fetched rather than held here: the working day is defined once on the
+   * server, and the same list validates what is sent back — so a time the
+   * picker offers is a time the accept endpoint will take.
    */
-  acceptOrderRequest: async (orderId: string): Promise<any> => {
+  getPickupTimes: async (date?: string): Promise<ManagerPickupTime[]> => {
+    const res = await apiClient.get<ApiResponse<ManagerPickupTime[]>>(
+      '/api/manager/order-requests/pickup-times',
+      { params: date ? { date } : {} }
+    );
+    return res.data.data ?? [];
+  },
+
+  /**
+   * Accepts one booking, with the collection the Manager assigned it.
+   *
+   * The server owns every rule: it refuses with 409 if the order has already
+   * moved on, refuses with 400 if the pickup is missing or in the past, and
+   * writes the status, the pickup and the history row in one transaction.
+   * Nothing about the order is decided here.
+   */
+  acceptOrderRequest: async (
+    orderId: string,
+    pickup: PickupAssignmentInput
+  ): Promise<any> => {
     const res = await apiClient.post<ApiResponse<any>>(
-      `/api/manager/order-requests/${orderId}/accept`
+      `/api/manager/order-requests/${orderId}/accept`,
+      pickup
+    );
+    return res.data.data;
+  },
+
+  /**
+   * Moves the collection on an order that is already accepted.
+   *
+   * Only the pickup changes — the order keeps its status and its place in the
+   * flow — and only on the order named. The customer's tracker and the
+   * business's order screen both read the new time from the same columns.
+   */
+  reschedulePickup: async (
+    orderId: string,
+    pickup: PickupAssignmentInput
+  ): Promise<any> => {
+    const res = await apiClient.patch<ApiResponse<any>>(
+      `/api/manager/order-requests/${orderId}/pickup`,
+      pickup
     );
     return res.data.data;
   },

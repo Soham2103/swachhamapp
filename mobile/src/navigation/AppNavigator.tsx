@@ -136,6 +136,9 @@ import BusinessOrderDetailsScreen
 import BusinessOrderTrackingScreen
   from '../screens/business/BusinessOrderTrackingScreen';
 
+import BusinessDoorTicketsScreen
+  from '../screens/business/BusinessDoorTicketsScreen';
+
 
 // =========================================================
 // SORTER MODULE
@@ -569,6 +572,9 @@ function BusinessOrdersStack() {
       <Stack.Screen name="BusinessOrdersScreen" component={BusinessOrdersScreen} />
       <Stack.Screen name="BusinessOrderDetailsScreen" component={BusinessOrderDetailsScreen} />
       <Stack.Screen name="BusinessOrderTrackingScreen" component={BusinessOrderTrackingScreen} />
+      {/* Where a business answers a rider who collected without counting.
+          Reached from the Your Orders header; a rider is blocked until it is. */}
+      <Stack.Screen name="BusinessDoorTicketsScreen" component={BusinessDoorTicketsScreen} />
     </Stack.Navigator>
   );
 }

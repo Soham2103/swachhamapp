@@ -297,6 +297,18 @@ export interface SorterOrderDetail extends SorterOrderSummary {
     /** Pieces this Sorter (or another) found damaged. 0 until adjusted. */
     defective_quantity: number;
     /**
+     * How that figure divides between white and colour cloth.
+     *
+     * NULL means NO SPLIT WAS RECORDED — every line adjusted before migration
+     * 063, and any adjusted through the single-figure path since. It is not
+     * the same as zero, and a reader must not treat it as one: the pieces are
+     * defective either way, they were simply never attributed to a colour.
+     *
+     * The two sum to `defective_quantity` whenever they are present.
+     */
+    white_defective_quantity: number | null;
+    color_defective_quantity: number | null;
+    /**
      * Where this line stands on its own.
      *
      * Derived from the two quantities below, never chosen: READY when nothing
@@ -536,6 +548,11 @@ async function getOrderById(orderId: string): Promise<SorterOrderDetail> {
             oi.quantity,
             COALESCE(oi.original_quantity, oi.quantity) AS original_quantity,
             COALESCE(oi.defective_quantity, 0) AS defective_quantity,
+            -- The white/colour split, NULL-preserving: NULL means no split
+            -- was recorded (every row from before migration 063), which is a
+            -- different fact from a split of zero and zero.
+            oi.white_defective_quantity,
+            oi.color_defective_quantity,
             COALESCE(oi.item_status, 'PROCESSING') AS item_status,
             COALESCE(oi.pending_quantity, 0) AS pending_quantity,
             oi.pending_reason,
@@ -569,6 +586,10 @@ async function getOrderById(orderId: string): Promise<SorterOrderDetail> {
       quantity: Number(item.quantity),
       original_quantity: ordered,
       defective_quantity: Number(item.defective_quantity || 0),
+      white_defective_quantity:
+        item.white_defective_quantity === null ? null : Number(item.white_defective_quantity),
+      color_defective_quantity:
+        item.color_defective_quantity === null ? null : Number(item.color_defective_quantity),
       item_status: String(item.item_status) as ItemStatus,
       pending_quantity: held,
       // Computed, never read from a column: there is one definition of it.
@@ -601,6 +622,23 @@ async function getOrderById(orderId: string): Promise<SorterOrderDetail> {
     ),
     items,
     confirmation_pdf_url: row.confirmation_pdf_url || null,
+    /*
+     * THE CLOTH COUNTS TRAVEL AT EVERY STAGE, ACCEPTED INCLUDED.
+     *
+     * These were briefly withheld after acceptance, on the reading that the
+     * White/Colour and Socked figures were choices that belonged only to the
+     * pre-acceptance decision. That was reversed deliberately: the Cloth
+     * Count card is required to STAY VISIBLE after the order is accepted and
+     * marked ready, showing the counts net of any defective pieces.
+     *
+     * So the figures are always sent. What changes after acceptance is who
+     * may EDIT them, and that is enforced elsewhere and independently —
+     * `savePendingItemCounts` refuses once the order leaves the Sorter
+     * queue, and `adjustDefectiveQuantity` refuses once `accepted_at` is
+     * stamped. Withholding the values here was never what protected them.
+     *
+     * Already net of defects: see `listPendingItemsForOrder`.
+     */
     pending_items: pendingItems,
     defects,
     // Stripped of every financial field before it leaves. See the note above
@@ -1326,7 +1364,36 @@ function toPendingItem(row: any): PendingItemRecord {
   };
 }
 
-/** Every counted line of one order, oldest row first. */
+/**
+ * Every counted line of one order, oldest row first.
+ *
+ * ============================================================
+ * THE COUNTS ARE RETURNED AS COUNTED — THE ORIGINAL FIGURE
+ * ============================================================
+ *
+ * `white_cloth_count` is what the Sorter counted off the pile. The defective
+ * pieces are NOT subtracted here, and the reason is the order the shop floor
+ * actually works in.
+ *
+ * These were briefly returned net of defects. That reads well if the counting
+ * happens first — count 20, mark 3 defective, see 17 — but the Sorter marks
+ * defects first at least as often, and then the sum breaks down: they type 20
+ * meaning "there are 20 white", a net-aware save stores 23 to compensate, and
+ * the box redisplays 20 having apparently ignored the defect entirely.
+ *
+ * So the stored figure and the edited figure are both the ORIGINAL count, in
+ * every order of operations, and the subtraction happens where it can be
+ * SEEN: the screen shows the original in the box and the updated figure
+ * beside it, and the read-only card after acceptance shows the updated one.
+ *
+ * That is also what makes a repeated save safe. The box always holds the
+ * original, so saving it back stores the original again — there is no figure
+ * that shrinks each time it makes the round trip, and a defect corrected from
+ * 3 to 5 recomputes from the count rather than compounding on it.
+ *
+ * The batch weight calculation subtracts the defect itself, in SQL, from this
+ * same stored figure — see BATCHABLE_QUANTITY_SQL in sorterBatch.service.
+ */
 async function listPendingItemsForOrder(orderId: string): Promise<PendingItemRecord[]> {
   const result = await query<any>(
     `SELECT id, order_id, order_item_id, order_number, business_name, item_name,
@@ -1422,6 +1489,15 @@ async function savePendingItemCounts(
     );
     const item = itemRows[0];
     if (!item) throw new AppError('That item is not part of this order.', 404);
+
+    /*
+     * WHAT WAS TYPED IS WHAT IS STORED — the count as counted.
+     *
+     * No adjustment is made for defective pieces here. The screen's boxes
+     * hold the ORIGINAL count and the subtraction is applied where it is
+     * displayed, so a value that makes this round trip comes back unchanged
+     * however many times it is saved. See listPendingItemsForOrder.
+     */
 
     /*
      * INSERT, or correct the row that is already there.

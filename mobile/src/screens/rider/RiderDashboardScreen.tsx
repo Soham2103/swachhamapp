@@ -18,7 +18,7 @@ import { useNavigation, useFocusEffect } from '@react-navigation/native';
 import { COLORS, SPACING, TYPOGRAPHY, BORDER_RADIUS, SHADOWS } from '../../constants/theme';
 import useRiderStore from '../../store/riderStore';
 import { useAuthStore } from '../../store/authStore';
-import { HeldJob, JobOffer, RiderJob } from '../../services/riderApi';
+import { DoorTicket, HeldJob, JobOffer, RiderJob } from '../../services/riderApi';
 import { canRouteTo, openGoogleMapsRoute } from '../../utils/navigation';
 
 /**
@@ -51,6 +51,12 @@ export default function RiderDashboardScreen() {
   const goOnline = useRiderStore((s) => s.goOnline);
   const goOffline = useRiderStore((s) => s.goOffline);
   const acceptOffer = useRiderStore((s) => s.acceptOffer);
+  const acceptOfferWithCounting = useRiderStore((s) => s.acceptOfferWithCounting);
+  const acceptOfferWithoutCounting = useRiderStore((s) => s.acceptOfferWithoutCounting);
+  const awaitingTicket = useRiderStore((s) => s.awaitingTicket);
+  const isSubmittingDoorChoice = useRiderStore((s) => s.isSubmittingDoorChoice);
+  const pollAwaitingTicket = useRiderStore((s) => s.pollAwaitingTicket);
+  const clearAwaitingTicket = useRiderStore((s) => s.clearAwaitingTicket);
   const holdOffer = useRiderStore((s) => s.holdOffer);
   const declineOffer = useRiderStore((s) => s.declineOffer);
   const startHeldJob = useRiderStore((s) => s.startHeldJob);
@@ -96,6 +102,32 @@ export default function RiderDashboardScreen() {
     }
   };
 
+  /**
+   * "With Counting & Checked" — accept and tell the business.
+   *
+   * Same destination as the plain accept: the rider goes straight to the job.
+   * Nothing is waited on, because nothing was left open at the door.
+   */
+  const handleAcceptWithCounting = async (offer: JobOffer) => {
+    const result = await acceptOfferWithCounting(offer.job_id);
+    if (result.ok) {
+      navigation.navigate('RiderJobDetails', { jobId: offer.job_id });
+    } else {
+      Alert.alert('Job unavailable', result.message);
+    }
+  };
+
+  /**
+   * "Without Counting & Checked" — raise a ticket, then hold the rider.
+   *
+   * There is NO navigation here. The rider stays on the dashboard with the
+   * waiting card until the business accepts; that is the gate.
+   */
+  const handleAcceptWithoutCounting = async (offer: JobOffer) => {
+    const result = await acceptOfferWithoutCounting(offer.job_id);
+    if (!result.ok) Alert.alert('Could not raise ticket', result.message);
+  };
+
   const handleHold = async (offer: JobOffer) => {
     const result = await holdOffer(offer.job_id);
     if (!result.ok) Alert.alert('Job unavailable', result.message);
@@ -126,6 +158,45 @@ export default function RiderDashboardScreen() {
       ]
     );
   };
+
+  /*
+   * THE WAIT.
+   *
+   * Polls the ticket every 5 seconds while one is pending. Polling rather
+   * than listening because the app has no socket client — the same reason
+   * the offer watch in `riderStore` polls.
+   *
+   * Keyed on the ticket id and its status so the interval is torn down the
+   * moment the answer arrives, rather than running on against a ticket that
+   * is already accepted.
+   */
+  useEffect(() => {
+    if (!awaitingTicket || awaitingTicket.status !== 'PENDING') return;
+
+    const timer = setInterval(() => {
+      void pollAwaitingTicket();
+    }, 5000);
+
+    return () => clearInterval(timer);
+  }, [awaitingTicket?.ticket_id, awaitingTicket?.status, pollAwaitingTicket]);
+
+  /*
+   * The release. The business has accepted, so the rider is told what was
+   * sent on their behalf and handed into the ordinary job workflow — which is
+   * the same screen the counted path goes to.
+   */
+  useEffect(() => {
+    if (!awaitingTicket || awaitingTicket.status !== 'ACCEPTED') return;
+
+    const jobId = awaitingTicket.job_id;
+    clearAwaitingTicket();
+
+    Alert.alert(
+      'Business accepted',
+      'They have been sent: "Any Mismatch will be communicated. Note Physical verification will be done at Swachham"',
+      [{ text: 'Continue', onPress: () => navigation.navigate('RiderJobDetails', { jobId }) }]
+    );
+  }, [awaitingTicket?.status, awaitingTicket?.job_id, clearAwaitingTicket, navigation]);
 
   const isOnline = Boolean(profile?.is_online);
   const carryingJobs = summary?.carrying_jobs ?? 0;
@@ -239,6 +310,16 @@ export default function RiderDashboardScreen() {
           </>
         ) : null}
 
+        {/*
+          * ---------- WAITING ON A BUSINESS ----------
+          *
+          * Above the offers because it is the only thing on the screen the
+          * rider cannot act on and must not walk away from.
+          */}
+        {awaitingTicket && awaitingTicket.status === 'PENDING' ? (
+          <AwaitingBusinessCard ticket={awaitingTicket} />
+        ) : null}
+
         {/* ---------- OFFERS ---------- */}
         <SectionHeading
           title="Offers"
@@ -257,13 +338,27 @@ export default function RiderDashboardScreen() {
           />
         ) : (
           offers.map((offer) => (
-            <OfferCard
-              key={offer.offer_id}
-              offer={offer}
-              onAccept={() => handleAccept(offer)}
-              onHold={() => handleHold(offer)}
-              onDecline={() => declineOffer(offer.job_id)}
-            />
+            <View key={offer.offer_id}>
+              <OfferCard
+                offer={offer}
+                onAccept={() => handleAccept(offer)}
+                onHold={() => handleHold(offer)}
+                onDecline={() => declineOffer(offer.job_id)}
+              />
+
+              {/*
+                * The door acceptance card, on offers that have a business
+                * behind them. A plain customer pickup has nobody to message
+                * or raise a ticket with, so it keeps the offer card alone.
+                */}
+              {offer.has_business ? (
+                <AcceptCard
+                  disabled={isSubmittingDoorChoice || Boolean(awaitingTicket)}
+                  onWithCounting={() => handleAcceptWithCounting(offer)}
+                  onWithoutCounting={() => handleAcceptWithoutCounting(offer)}
+                />
+              ) : null}
+            </View>
           ))
         )}
 
@@ -310,6 +405,110 @@ export default function RiderDashboardScreen() {
  * fixed number, so a card that was on screen while the phone slept shows the
  * truth when it wakes rather than a number that kept ticking in a dream.
  */
+/**
+ * THE ACCEPT CARD — how the load was taken at the door.
+ *
+ * Two options, chosen then confirmed. The confirm step is deliberate: both
+ * choices accept the job, and one of them additionally tells a business
+ * something on the rider's behalf, so neither should be one mistap away.
+ *
+ * This card sits BESIDE the offer card and does not replace it. The offer
+ * card's own Accept, Hold and Decline are untouched.
+ */
+function AcceptCard({
+  disabled,
+  onWithCounting,
+  onWithoutCounting,
+}: {
+  disabled: boolean;
+  onWithCounting: () => void;
+  onWithoutCounting: () => void;
+}) {
+  const [choice, setChoice] = useState<'WITH' | 'WITHOUT' | null>(null);
+
+  const options: Array<{ key: 'WITH' | 'WITHOUT'; label: string; hint: string }> = [
+    {
+      key: 'WITH',
+      label: 'With Counting & Checked',
+      hint: 'Counted with the business. They are told it was checked at the door.',
+    },
+    {
+      key: 'WITHOUT',
+      label: 'Without Counting & Checked',
+      hint: 'Raises a ticket. You wait here until the business accepts.',
+    },
+  ];
+
+  return (
+    <View style={styles.acceptCard}>
+      <View style={styles.acceptHeader}>
+        <Ionicons name="clipboard-outline" size={16} color={COLORS.Primary} />
+        <Text style={styles.acceptTitle}>Accept</Text>
+      </View>
+
+      {options.map((option) => {
+        const selected = choice === option.key;
+        return (
+          <TouchableOpacity
+            key={option.key}
+            style={[styles.acceptOption, selected && styles.acceptOptionSelected]}
+            onPress={() => setChoice(option.key)}
+            disabled={disabled}
+            activeOpacity={0.85}
+          >
+            <Ionicons
+              name={selected ? 'radio-button-on' : 'radio-button-off'}
+              size={18}
+              color={selected ? COLORS.Primary : COLORS.TextSecondary}
+            />
+            <View style={styles.acceptOptionBody}>
+              <Text style={[styles.acceptOptionLabel, selected && styles.acceptOptionLabelSelected]}>
+                {option.label}
+              </Text>
+              <Text style={styles.acceptOptionHint}>{option.hint}</Text>
+            </View>
+          </TouchableOpacity>
+        );
+      })}
+
+      <TouchableOpacity
+        style={[styles.acceptConfirm, (!choice || disabled) && styles.acceptConfirmDisabled]}
+        onPress={() => (choice === 'WITH' ? onWithCounting() : onWithoutCounting())}
+        disabled={!choice || disabled}
+        activeOpacity={0.85}
+      >
+        <Text style={styles.acceptConfirmText}>
+          {choice === 'WITHOUT' ? 'Raise ticket & accept' : 'Confirm accept'}
+        </Text>
+      </TouchableOpacity>
+    </View>
+  );
+}
+
+/**
+ * The waiting card.
+ *
+ * Says who is being waited on and what happens next, because a rider standing
+ * at a door with the bags needs to know this is progress and not a hang. It
+ * has no dismiss: the wait is the workflow, and the card clears itself when
+ * the business answers.
+ */
+function AwaitingBusinessCard({ ticket }: { ticket: DoorTicket }) {
+  return (
+    <View style={styles.awaitCard}>
+      <View style={styles.awaitTop}>
+        <ActivityIndicator size="small" color={COLORS.Warning} />
+        <Text style={styles.awaitTitle}>Waiting for the business</Text>
+      </View>
+
+      <Text style={styles.awaitBody}>
+        A ticket was raised for order {ticket.order_number || ticket.order_id} because the load was
+        not counted. You can continue once the business accepts it.
+      </Text>
+    </View>
+  );
+}
+
 function OfferCard({
   offer,
   onAccept,
@@ -730,6 +929,97 @@ const styles = StyleSheet.create({
     gap: 4,
   },
   holdText: { color: COLORS.Primary, fontWeight: '700', fontSize: TYPOGRAPHY.sizes.sm },
+  // ---- door acceptance ----
+  //
+  // Pulled up under the offer card it belongs to (the offer card carries a
+  // bottom margin of its own), so the two read as one unit.
+  acceptCard: {
+    backgroundColor: COLORS.Surface,
+    borderRadius: BORDER_RADIUS.lg,
+    borderWidth: 1,
+    borderColor: COLORS.Border,
+    padding: SPACING.md,
+    marginTop: -SPACING.xs,
+    marginBottom: SPACING.md,
+    ...SHADOWS.light,
+  },
+  acceptHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: SPACING.xs,
+    marginBottom: SPACING.sm,
+  },
+  acceptTitle: {
+    fontSize: TYPOGRAPHY.sizes.sm,
+    fontWeight: TYPOGRAPHY.weights.semibold,
+    color: COLORS.TextPrimary,
+    letterSpacing: 0.3,
+  },
+  acceptOption: {
+    flexDirection: 'row',
+    alignItems: 'flex-start',
+    gap: SPACING.sm,
+    borderWidth: 1,
+    borderColor: COLORS.Border,
+    borderRadius: BORDER_RADIUS.md,
+    padding: SPACING.sm,
+    marginBottom: SPACING.sm,
+  },
+  acceptOptionSelected: {
+    borderColor: COLORS.Primary,
+    backgroundColor: COLORS.Background,
+  },
+  acceptOptionBody: { flex: 1 },
+  acceptOptionLabel: {
+    fontSize: TYPOGRAPHY.sizes.sm,
+    fontWeight: TYPOGRAPHY.weights.semibold,
+    color: COLORS.TextPrimary,
+  },
+  acceptOptionLabelSelected: { color: COLORS.PrimaryDark },
+  acceptOptionHint: {
+    fontSize: TYPOGRAPHY.sizes.xs,
+    color: COLORS.TextSecondary,
+    marginTop: 2,
+  },
+  acceptConfirm: {
+    backgroundColor: COLORS.Primary,
+    borderRadius: BORDER_RADIUS.md,
+    paddingVertical: SPACING.sm + 2,
+    alignItems: 'center',
+  },
+  acceptConfirmDisabled: { opacity: 0.45 },
+  acceptConfirmText: {
+    color: COLORS.Surface,
+    fontSize: TYPOGRAPHY.sizes.sm,
+    fontWeight: TYPOGRAPHY.weights.semibold,
+  },
+
+  // ---- waiting on a business ----
+  awaitCard: {
+    backgroundColor: COLORS.Background,
+    borderRadius: BORDER_RADIUS.lg,
+    borderWidth: 1,
+    borderColor: COLORS.Warning,
+    padding: SPACING.md,
+    marginBottom: SPACING.md,
+  },
+  awaitTop: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: SPACING.sm,
+    marginBottom: SPACING.xs,
+  },
+  awaitTitle: {
+    fontSize: TYPOGRAPHY.sizes.base,
+    fontWeight: TYPOGRAPHY.weights.semibold,
+    color: COLORS.TextPrimary,
+  },
+  awaitBody: {
+    fontSize: TYPOGRAPHY.sizes.sm,
+    color: COLORS.TextSecondary,
+    lineHeight: 20,
+  },
+
   offerCard: {
     backgroundColor: COLORS.Surface,
     borderRadius: BORDER_RADIUS.lg,

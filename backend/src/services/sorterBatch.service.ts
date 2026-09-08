@@ -159,6 +159,75 @@ function toMachine(row: any): MachineRecord {
 }
 
 /**
+ * HOW MANY PIECES OF A LINE MAY BE WASHED IN A BATCH.
+ *
+ * ============================================================
+ * THE RULE
+ * ============================================================
+ *
+ * Soaking cloth and colour cloth do not go into a batch, and their weight is
+ * not part of any batch or machine total. What is left is WHITE, NON-SOAKED
+ * cloth, and that is all this expression returns:
+ *
+ *     white_cloth_count - white_socked
+ *
+ * ============================================================
+ * WHY COLOUR IS NOT SUBTRACTED SEPARATELY
+ * ============================================================
+ *
+ * Because it is already gone. The Sorter's four figures are not four piles:
+ * `white_socked` and `color_socked` are counted OUT OF the white and colour
+ * cloth respectively — the counting screen states the rule as
+ *
+ *     (White - White Socked) + (Color - Color Socked) + White Socked + Color Socked
+ *
+ * so White Cloth + Color Cloth is the whole line. Excluding "colour and
+ * soaking" therefore means keeping only the white that was not soaked, and
+ * subtracting `color_cloth_count` or `color_socked` here as well would remove
+ * pieces that this expression never included in the first place.
+ *
+ * ============================================================
+ * AN UNCOUNTED LINE IS UNCHANGED
+ * ============================================================
+ *
+ * NULL means "not counted" — a different fact from 0, and the schema keeps
+ * them apart deliberately. A line the Sorter never counted has nothing known
+ * to be colour or soaking, so it batches on its full ordered quantity exactly
+ * as it did before this rule existed. Only a line that HAS been counted is
+ * reduced.
+ *
+ * LEAST caps the result at the ordered quantity: the counts are taken by hand
+ * and are not enforced against the order, so a miscount cannot conjure pieces
+ * that were never ordered. GREATEST floors it at zero for the same reason in
+ * the other direction.
+ *
+ * Written once and used by BOTH the eligibility read and the batch-creation
+ * read, so the preview and what is actually built can never disagree.
+ */
+const BATCHABLE_QUANTITY_SQL = `
+  CASE
+    WHEN pi.white_cloth_count IS NULL
+     AND pi.color_cloth_count IS NULL
+     AND pi.white_socked IS NULL
+     AND pi.color_socked IS NULL
+    THEN COALESCE(oi.original_quantity, oi.quantity)
+    ELSE LEAST(
+      COALESCE(oi.original_quantity, oi.quantity),
+      GREATEST(
+        COALESCE(pi.white_cloth_count, 0)
+          -- Defective white pieces are not washed either. Subtracted from the
+          -- same side as the socked pieces, and for the same reason: the
+          -- count is what was COUNTED, not what is still going in a drum.
+          -- The read in sorter.service.listPendingItemsForOrder nets the
+          -- same figure for display, so screen and batch agree.
+          - COALESCE(oi.white_defective_quantity, 0)
+          - COALESCE(pi.white_socked, 0),
+        0
+      )
+    )
+  END`;
+
+/**
  * The eligible lines, and only them.
  *
  * ENFORCED IN SQL, not in the app. The four conditions the requirement lists
@@ -182,6 +251,9 @@ async function fetchEligibleLines(limit: number): Promise<EligibleLine[]> {
             o.order_number,
             oi.service_name AS item_name,
             COALESCE(oi.original_quantity, oi.quantity) AS ordered_quantity,
+            -- What may actually be washed: white, non-soaked cloth only.
+            -- See BATCHABLE_QUANTITY_SQL.
+            ${BATCHABLE_QUANTITY_SQL} AS batchable_quantity,
             -- PIECES ALREADY IN A LIVE BATCH. Since a line is splittable this
             -- is no longer all-or-nothing: 57 of 60 towels may be washing
             -- while the last 3 are still waiting for a drum.
@@ -207,9 +279,16 @@ async function fetchEligibleLines(limit: number): Promise<EligibleLine[]> {
        FROM order_items oi
        JOIN orders o ON o.id = oi.order_id
        LEFT JOIN services s ON s.id = oi.service_id
+       -- The Sorter's cloth counts for this line, if it was counted at all.
+       -- LEFT so an uncounted line still appears; the CASE above is what
+       -- decides that it batches in full.
+       LEFT JOIN pending_item pi ON pi.order_item_id = oi.id
       WHERE o.status = ?
         AND o.accepted_at IS NOT NULL
-        AND COALESCE(oi.original_quantity, oi.quantity) > COALESCE((
+        -- Compared against the BATCHABLE quantity, not the ordered one, so a
+        -- line whose washable pieces are all in a drum drops out — and a line
+        -- that is entirely colour or soaking never appears at all.
+        AND ${BATCHABLE_QUANTITY_SQL} > COALESCE((
               SELECT SUM(boi.quantity) FROM batch_order_items boi
                WHERE boi.active_order_item_id = oi.id
             ), 0)
@@ -221,10 +300,25 @@ async function fetchEligibleLines(limit: number): Promise<EligibleLine[]> {
   return result.rows.map((row) => {
     const ordered = Number(row.ordered_quantity || 0);
     const batched = Number(row.batched_quantity || 0);
-    const remaining = Math.max(0, ordered - batched);
+    /*
+     * REMAINING IS MEASURED AGAINST THE BATCHABLE PIECES, NOT THE ORDERED
+     * ONES. Colour and soaking cloth is not washed here, so it is not work
+     * still to do — counting it as remaining would keep offering the
+     * optimiser pieces that will never go in a drum.
+     */
+    const batchable = Number(row.batchable_quantity || 0);
+    const remaining = Math.max(0, batchable - batched);
     const orderedKg = Number(row.ordered_weight_kg || 0);
-    // The REMAINING pieces' weight, at the line's own per-piece weight. The
-    // optimiser must never be offered weight that is already in a drum.
+    /*
+     * The remaining pieces' weight, at the line's own PER-PIECE weight.
+     *
+     * Divided by the ORDERED quantity on purpose: that is the quantity the
+     * line's stored weight was measured over, so `orderedKg / ordered` is the
+     * true weight of one piece. Dividing by the batchable count instead would
+     * spread the whole line's weight — colour and soaking included — across
+     * only the white pieces, which is exactly the weight this change exists
+     * to leave out.
+     */
     const remainingKg =
       ordered > 0 ? Math.round((orderedKg / ordered) * remaining * 1000) / 1000 : 0;
 
@@ -635,10 +729,15 @@ async function confirmBatches(
               COALESCE(
                 s.washing_group,
                 IF(LOWER(oi.service_name) LIKE '%towel%', 'TOWEL', 'GENERAL')
-              ) AS washing_group
+              ) AS washing_group,
+              -- The same rule the eligibility read uses, on the LOCKED row.
+              -- Re-derived here rather than trusted from the request, so a
+              -- stale distribution cannot commit colour or soaking pieces.
+              ${BATCHABLE_QUANTITY_SQL} AS batchable_quantity
          FROM order_items oi
          JOIN orders o ON o.id = oi.order_id
          LEFT JOIN services s ON s.id = oi.service_id
+         LEFT JOIN pending_item pi ON pi.order_item_id = oi.id
         WHERE oi.id IN (${allItemIds.map(() => '?').join(', ')})
         ORDER BY oi.id ASC
           FOR UPDATE`,
@@ -707,12 +806,20 @@ async function confirmBatches(
       takenRows.map((row: any) => [String(row.order_item_id), Number(row.pieces || 0)])
     );
 
-    /** Pieces of each line still free to batch, before this confirmation. */
+    /**
+     * Pieces of each line still free to batch, before this confirmation.
+     *
+     * COUNTED AGAINST THE BATCHABLE PIECES, not the ordered ones. This is the
+     * gate that decides what actually goes into a drum, so it is where the
+     * colour-and-soaking exclusion has to hold: a distribution generated
+     * before the line was counted, or computed by any other caller, still
+     * cannot commit a piece this rule excludes.
+     */
     const piecesLeft = new Map<string, number>();
     for (const id of allItemIds) {
       const line = lines.get(id);
-      const ordered = Number(line.quantity || 0);
-      piecesLeft.set(id, Math.max(0, ordered - (alreadyBatched.get(id) || 0)));
+      const batchable = Number(line.batchable_quantity || 0);
+      piecesLeft.set(id, Math.max(0, batchable - (alreadyBatched.get(id) || 0)));
     }
 
     // Resolve "everything left" now that the real figure is known, then check

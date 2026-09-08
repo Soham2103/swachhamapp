@@ -17,6 +17,12 @@ import {
   getSummary,
 } from '../services/rider.service';
 import { acceptJob, declineJob, holdJob } from '../services/dispatch.service';
+import {
+  acceptWithCounting,
+  raiseUncountedTicket,
+  getTicketForRider,
+  listPendingTicketsForRider,
+} from '../services/riderDoorAcceptance.service';
 import { sendSuccess } from '../utils/response';
 import { authenticate, authorize, AuthenticatedRequest } from '../middleware/auth';
 import { AppError } from '../utils/appError';
@@ -135,6 +141,74 @@ router.post(
     try {
       const job = await acceptJob(String(req.params.jobId), riderId(req));
       return sendSuccess(res, job, 'Job accepted');
+    } catch (error) {
+      return next(error);
+    }
+  }
+);
+
+/**
+ * DOOR ACCEPTANCE — the same acceptance, plus what the rider found at the door.
+ *
+ * These two sit BESIDE `/accept` rather than replacing it. The plain route is
+ * still the one a customer pickup uses and is untouched, so nothing that
+ * already works had to learn about door modes.
+ */
+
+/** "With Counting & Checked" — accept, and tell the hotel it was checked. */
+router.post(
+  '/offers/:jobId/accept-with-counting',
+  async (req: AuthenticatedRequest, res: Response, next: NextFunction) => {
+    try {
+      const result = await acceptWithCounting(String(req.params.jobId), riderId(req));
+      return sendSuccess(res, result, 'Job accepted');
+    } catch (error) {
+      return next(error);
+    }
+  }
+);
+
+/**
+ * "Without Counting & Checked" — accept, and raise a ticket the hotel must
+ * answer before the rider proceeds. No message goes out here; the mismatch
+ * notice is sent when the hotel accepts.
+ */
+router.post(
+  '/offers/:jobId/accept-without-counting',
+  async (req: AuthenticatedRequest, res: Response, next: NextFunction) => {
+    try {
+      const result = await raiseUncountedTicket(String(req.params.jobId), riderId(req));
+      return sendSuccess(res, result, 'Waiting for the business to accept');
+    } catch (error) {
+      return next(error);
+    }
+  }
+);
+
+/** What the phone polls while it waits on a hotel. */
+router.get(
+  '/door-tickets/:ticketId',
+  async (req: AuthenticatedRequest, res: Response, next: NextFunction) => {
+    try {
+      const ticket = await getTicketForRider(String(req.params.ticketId), riderId(req));
+      return sendSuccess(res, ticket, 'Ticket status');
+    } catch (error) {
+      return next(error);
+    }
+  }
+);
+
+/**
+ * Everything this rider is still waiting on.
+ *
+ * Read on dashboard load, so a rider who closed the app mid-wait comes back
+ * to the waiting state instead of to a job with no explanation.
+ */
+router.get(
+  '/door-tickets',
+  async (req: AuthenticatedRequest, res: Response, next: NextFunction) => {
+    try {
+      return sendSuccess(res, await listPendingTicketsForRider(riderId(req)), 'Pending tickets');
     } catch (error) {
       return next(error);
     }

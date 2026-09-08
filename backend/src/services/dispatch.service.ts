@@ -817,12 +817,36 @@ async function reclaimStaleHolds(): Promise<number> {
  *
  * Bounded by MAX_DISPATCH_ATTEMPTS, so a job nobody ever takes ends up
  * UNASSIGNED for a human rather than cycling for ever.
+ *
+ * ============================================================
+ * WHY `UNASSIGNED` IS IN THE STATUS LIST
+ * ============================================================
+ *
+ * This swept only OFFERED jobs, and that left a DEAD END wide enough to
+ * strand every order placed while no rider happened to be pinging.
+ *
+ * `dispatchJob` sets a job to UNASSIGNED the moment `findNearbyRiders`
+ * returns nobody — which is the ordinary case, because a rider only counts as
+ * available if their last position fix is under STALE_FIX_MINUTES (15) old.
+ * An order placed while the rider app is closed therefore goes straight to
+ * UNASSIGNED on its first and only dispatch.
+ *
+ * Nothing then looked at it again. `dispatchJob` itself accepts an UNASSIGNED
+ * job perfectly well (see its status guard), so the job was always
+ * re-dispatchable — but this sweep, the only thing that retries automatically,
+ * could not see it. A rider coming on duty five minutes later never learned
+ * the order existed, and no amount of refreshing helped.
+ *
+ * Including UNASSIGNED closes that. The attempts bound is unchanged, so a job
+ * that has genuinely exhausted its retries still stops and waits for a human;
+ * what changes is only that missing the one dispatch window is no longer
+ * permanent.
  */
 async function redispatchStaleJobs(): Promise<number> {
   const stranded = await query<any>(
     `SELECT rj.id
        FROM rider_jobs rj
-      WHERE rj.status = 'OFFERED'
+      WHERE rj.status IN ('OFFERED','UNASSIGNED')
         AND rj.dispatch_attempts < ?
         AND NOT EXISTS (
               SELECT 1 FROM rider_job_offers o

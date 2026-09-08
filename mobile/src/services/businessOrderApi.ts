@@ -197,6 +197,23 @@ export interface BusinessOrderSummary {
   /** SUM(item weight x quantity) for the order, in kg. */
   total_weight_kg: number;
   created_at: string;
+  /**
+   * THE COLLECTION A MANAGER ASSIGNED, or null when none has been.
+   *
+   * `assigned_pickup_date` is YYYY-MM-DD and `assigned_pickup_time` is
+   * HH:MM:SS, exactly as the two `orders` columns store them. Both are null
+   * together: a Manager names a date and a time in one decision.
+   *
+   * These are the SAME FIELDS the customer's tracking endpoint returns for
+   * the same order, which is what keeps the two sides in step. They are not
+   * the booked pickup slot — that is a placeholder on a business order, and
+   * would show a collection nobody has agreed to.
+   *
+   * Optional so an older server, which does not send them, simply reads as
+   * "not assigned" instead of failing to type-check.
+   */
+  assigned_pickup_date?: string | null;
+  assigned_pickup_time?: string | null;
 }
 
 export interface LaundryServices {
@@ -308,6 +325,13 @@ export interface BusinessOrderTracking {
   current_stage: string | null;
   stages: Array<{ key: string; label: string; completed: boolean; current: boolean; at: string | null }>;
   history: Array<{ status: string; notes: string | null; created_at: string }>;
+  /**
+   * The collection a Manager assigned, or null when none has been — the same
+   * two `orders` columns the detail endpoint and the customer's tracker read,
+   * so one order cannot show two different times.
+   */
+  assigned_pickup_date?: string | null;
+  assigned_pickup_time?: string | null;
 }
 
 export interface BusinessProfile {

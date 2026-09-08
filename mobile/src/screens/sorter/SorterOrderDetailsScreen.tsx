@@ -27,7 +27,7 @@ import sorterApi, {
   defectCopies,
   defectFullyDelivered,
 } from '../../services/sorterApi';
-import MarkDefectiveModal from './MarkDefectiveModal';
+import MarkDefectiveModal, { DefectiveSplit } from './MarkDefectiveModal';
 import PendingItemsModal from './PendingItemsModal';
 import { API_BASE_URL } from '../../constants/api';
 import { extractErrorMessage } from '../../services/api';
@@ -117,6 +117,47 @@ const EMPTY_CLOTH_COUNTS: Record<ClothCountKey, string> = {
 
 /** Every line's boxes, keyed by order item id. */
 type ClothCountsByItem = Record<string, Record<ClothCountKey, string>>;
+
+/**
+ * A cloth count with its defective pieces taken off, for display.
+ *
+ *     updated = counted - defective
+ *
+ * Always computed, never stored, so it cannot double-subtract however many
+ * times a count or a defect is saved: both operands are the current figures.
+ *
+ * An empty box gives "—" rather than a number, because nothing was counted
+ * and a subtraction from nothing states a count that was never taken. Floored
+ * at zero so a defect recorded before its line was counted cannot render
+ * negative.
+ */
+function updatedCount(box: string, defective: number | null): string {
+  const raw = box.trim();
+  if (raw === '') return '—';
+  return String(Math.max(0, Number(raw) - (defective || 0)));
+}
+
+/**
+ * One line's socked total, for the Socked Details document.
+ *
+ * `white_socked + color_socked` when either was counted — those are the two
+ * boxes the screen writes. `socked_cloth_count` is the fallback for a row
+ * counted before migration 061 split that single box in two.
+ *
+ * NULL when nothing was counted at all, which the document prints as "—".
+ * That is a different fact from 0 ("counted, and there were none"), and the
+ * document is careful to keep them apart.
+ */
+function sockedTotalOf(record: PendingItemRecord | undefined): number | null {
+  if (!record) return null;
+
+  const white = record.white_socked;
+  const colour = record.color_socked;
+
+  if (white !== null || colour !== null) return (white || 0) + (colour || 0);
+
+  return record.socked_cloth_count;
+}
 
 /**
  * A saved record as its line's boxes show it.
@@ -403,14 +444,18 @@ export default function SorterOrderDetailsScreen({ navigation, route }: any) {
   const persistAdjustment = async (
     item: SorterOrderItem,
     defectiveQuantity: number,
-    reason: string
+    reason: string,
+    split: DefectiveSplit
   ) => {
     try {
       const response = await sorterApi.adjustDefectiveQuantity(
         String(orderId),
         item.id,
         defectiveQuantity,
-        reason
+        reason,
+        // The two boxes travel with the total. The server takes the total
+        // from their sum and checks each against its own cloth count.
+        split
       );
       setDefectiveFor(null);
       await load();
@@ -427,12 +472,16 @@ export default function SorterOrderDetailsScreen({ navigation, route }: any) {
     }
   };
 
-  const saveAdjustment = async (defectiveQuantity: number, reason: string) => {
+  const saveAdjustment = async (
+    defectiveQuantity: number,
+    reason: string,
+    split: DefectiveSplit
+  ) => {
     if (!defectiveFor || savingAdjustment) return;
     setSavingAdjustment(true);
     setError('');
     try {
-      const saved = await persistAdjustment(defectiveFor, defectiveQuantity, reason);
+      const saved = await persistAdjustment(defectiveFor, defectiveQuantity, reason, split);
       if (!saved) return;
 
       // Pieces only. No amount is shown, and none is sent — see the note at
@@ -470,13 +519,17 @@ export default function SorterOrderDetailsScreen({ navigation, route }: any) {
    * could be tapped without any of this context, and the report it produced
    * was the one that could not say what was wrong with what.
    */
-  const reportDefectivePiece = async (defectiveQuantity: number, reason: string) => {
+  const reportDefectivePiece = async (
+    defectiveQuantity: number,
+    reason: string,
+    split: DefectiveSplit
+  ) => {
     if (!defectiveFor || savingAdjustment || !order) return;
     const item = defectiveFor;
     setSavingAdjustment(true);
     setError('');
     try {
-      const saved = await persistAdjustment(item, defectiveQuantity, reason);
+      const saved = await persistAdjustment(item, defectiveQuantity, reason, split);
       if (!saved) return;
 
       navigation.navigate('SorterDefectCaptureScreen', {
@@ -692,7 +745,22 @@ export default function SorterOrderDetailsScreen({ navigation, route }: any) {
         business_name: order.customer_name,
         rows: order.items.map((item) => ({
           item_name: item.item_name,
-          socked_quantity: saved.get(item.id)?.socked_cloth_count ?? null,
+          /*
+           * THE SOCKED FIGURE, FROM THE COLUMNS THAT ARE ACTUALLY WRITTEN.
+           *
+           * This read `socked_cloth_count` — the older single "Socked Cloths"
+           * box, which migration 061 replaced with `white_socked` and
+           * `color_socked` and which THIS SCREEN NO LONGER WRITES. Every row
+           * counted since then has NULL there, so the document printed "—"
+           * on every line: it generated a valid PDF containing nothing.
+           *
+           * The two current columns are summed, because the column on the
+           * document is one total. The legacy column is the fallback so a row
+           * counted before 061 still prints the figure it does hold, and a
+           * line with no counts at all still prints "—" rather than a zero
+           * nobody counted.
+           */
+          socked_quantity: sockedTotalOf(saved.get(item.id)),
         })),
       });
 
@@ -852,6 +920,63 @@ export default function SorterOrderDetailsScreen({ navigation, route }: any) {
    */
   const defectsLocked = Boolean(order.accepted_at);
 
+  /**
+   * The cloth counts are a BEFORE-ACCEPTANCE decision.
+   *
+   * White/Colour and the two Socked figures are what the Sorter works out
+   * while deciding what to accept. Once the order is accepted it belongs to
+   * batching, and these boxes are gone from every later stage — the same
+   * moment `defectsLocked` uses, because it is the same acceptance.
+   *
+   * The server stops sending `pending_items` at that point too, so this is
+   * not a UI-only hide that another screen could undo: after acceptance there
+   * is nothing to show. The stored counts are untouched and are still what
+   * the batch weight calculation reads.
+   */
+  const showClothCounts = !order.accepted_at;
+
+  /**
+   * THE CARDS THAT ARE THE SORTER'S WORKING SURFACE.
+   *
+   * Items, Garment verification and Defective piece are how an order is
+   * WORKED — counted, scanned, and inspected for damage. Once it has been
+   * accepted that work is finished and its figures are settled, so the three
+   * go and the screen stops inviting an edit it would refuse anyway
+   * (`defectsLocked` already blocks the defect path, and the server refuses
+   * it too).
+   *
+   * DEFECTIVE ADJUSTMENT IS NOT ONE OF THEM AND MUST STAY. It is the RECORD
+   * of what was decided rather than a place to decide it — the history, and
+   * the notification the customer is sent — and that is exactly what someone
+   * needs to look at after acceptance. It is rendered on
+   * `order.has_adjustment` alone and no acceptance check may be added to it.
+   *
+   * Gated on `accepted_at`, which is server state, so the cards stay hidden
+   * across a refresh and on any device. Nothing is deleted: every figure
+   * these cards showed is still stored and still returned by the endpoints
+   * that own it.
+   */
+  const showWorkingCards = !order.accepted_at;
+
+  /**
+   * The counted white and colour cloth on the line the defect form is open
+   * for, or nulls when that line has never been counted.
+   *
+   * Read from `pending_items` rather than from the item, because that is
+   * where the counts live. The server sends them net of the defect already
+   * recorded, which is what the modal expects.
+   */
+  const countsForDefectiveLine = (() => {
+    if (!defectiveFor) return { white: null, colour: null };
+    const record = (order.pending_items ?? []).find(
+      (r) => r.order_item_id === defectiveFor.id
+    );
+    return {
+      white: record?.white_cloth_count ?? null,
+      colour: record?.color_cloth_count ?? null,
+    };
+  })();
+
   // Which scan session this stage needs, and whether it is complete.
   const scanStage = action?.scan ?? null;
   const scanScanned = scanStage === 'delivery' ? scan?.delivery_scanned ?? 0 : scan?.acceptance_scanned ?? 0;
@@ -890,6 +1015,10 @@ export default function SorterOrderDetailsScreen({ navigation, route }: any) {
           <Row label="Order Type" value={ORDER_LABEL[order.order_type || ''] || '—'} />
         </View>
 
+        {/*
+          * ITEMS — gone once the order is accepted. See showWorkingCards.
+          */}
+        {showWorkingCards ? (
         <View style={styles.card}>
           <Text style={styles.cardTitle}>Items ({order.item_count})</Text>
           {order.items.map((item) => {
@@ -907,8 +1036,22 @@ export default function SorterOrderDetailsScreen({ navigation, route }: any) {
              * line balancing says nothing about any other.
              */
             const clothCountTotal = clothCountTotalOf(clothCounts[item.id]);
+            /*
+             * CHECKED AGAINST `original_quantity`, NOT `quantity`.
+             *
+             * The boxes hold the count as counted off the pile, and the pile
+             * is the whole line — defective pieces included, because a torn
+             * sheet was still counted before it was found torn.
+             * `item.quantity` is the BILLABLE figure, already reduced by the
+             * defect, so checking against it would demand the counts fall
+             * short by exactly the number of defective pieces and would
+             * refuse to save an honest count.
+             *
+             * The two are equal on any line with no defect, so this is the
+             * same rule as before wherever nothing has been marked.
+             */
             const clothCountBalances =
-              clothCountTotal === item.quantity &&
+              clothCountTotal === item.original_quantity &&
               clothCountsWithinSocked(clothCounts[item.id]);
             const canSaveClothCounts =
               clothCountBalances &&
@@ -958,7 +1101,12 @@ export default function SorterOrderDetailsScreen({ navigation, route }: any) {
                 </View>
 
                 {/* THE COUNTS FOR THIS LINE. One card per item: each line is
-                    counted on its own and saved on its own. */}
+                    counted on its own and saved on its own.
+
+                    Both cards disappear once the order is accepted — see
+                    showClothCounts. */}
+                {showClothCounts ? (
+                <>
                 <View style={styles.clothCountBlock}>
                   <Text style={styles.clothCountTitle}>Cloth Count</Text>
                   {CLOTH_COUNT_FIELDS.map((field) => (
@@ -990,6 +1138,45 @@ export default function SorterOrderDetailsScreen({ navigation, route }: any) {
                       />
                     </View>
                   ))}
+
+                  {/*
+                    * THE SUBTRACTION, MADE VISIBLE.
+                    *
+                    * The boxes above hold the count as counted. This is what
+                    * is LEFT once the defective pieces are taken off, shown
+                    * only when there are any, so the arithmetic the rest of
+                    * the workflow uses is on screen rather than implied.
+                    *
+                    * Computed from the box and the saved defect every render,
+                    * so it cannot drift: editing a box or correcting the
+                    * defect both recompute from the two current figures, and
+                    * nothing here is ever stored.
+                    */}
+                  {(item.white_defective_quantity || item.color_defective_quantity) ? (
+                    <View style={styles.clothUpdatedBlock}>
+                      <Text style={styles.clothUpdatedTitle}>
+                        After defective pieces
+                      </Text>
+                      <View style={styles.clothCountRow}>
+                        <Text style={styles.clothCountLabel}>White Cloths</Text>
+                        <Text style={styles.clothUpdatedValue}>
+                          {updatedCount(
+                            (clothCounts[item.id] || EMPTY_CLOTH_COUNTS).white,
+                            item.white_defective_quantity
+                          )}
+                        </Text>
+                      </View>
+                      <View style={styles.clothCountRow}>
+                        <Text style={styles.clothCountLabel}>Color Cloths</Text>
+                        <Text style={styles.clothUpdatedValue}>
+                          {updatedCount(
+                            (clothCounts[item.id] || EMPTY_CLOTH_COUNTS).color,
+                            item.color_defective_quantity
+                          )}
+                        </Text>
+                      </View>
+                    </View>
+                  ) : null}
                 </View>
 
                 {/* SOCKED CLOTH FOR THIS LINE. Counted separately from the
@@ -1023,6 +1210,8 @@ export default function SorterOrderDetailsScreen({ navigation, route }: any) {
                     </View>
                   ))}
                 </View>
+                </>
+                ) : null}
 
                 {/* Held pieces, and the one action that releases them. */}
                 {item.pending_quantity > 0 ? (
@@ -1073,25 +1262,6 @@ export default function SorterOrderDetailsScreen({ navigation, route }: any) {
                   </View>
                 ) : null}
 
-                {/* Nothing typed since this line was last saved means
-                    nothing to save for it. */}
-                <TouchableOpacity
-                  style={[
-                    styles.clothCountSave,
-                    !canSaveClothCounts && styles.buttonDisabled,
-                  ]}
-                  onPress={() => saveClothCounts(item)}
-                  disabled={!canSaveClothCounts}
-                  accessibilityRole="button"
-                  accessibilityLabel={`Save cloth counts for ${item.item_name}`}
-                >
-                  {clothCountBusyId === item.id ? (
-                    <ActivityIndicator size="small" color={COLORS.Surface} />
-                  ) : (
-                    <Text style={styles.clothCountSaveText}>SAVE COUNTS</Text>
-                  )}
-                </TouchableOpacity>
-
                 {defectsLocked ? (
                   /* Accepted: the action is gone, the figure stays. */
                   isAdjusted ? (
@@ -1115,6 +1285,38 @@ export default function SorterOrderDetailsScreen({ navigation, route }: any) {
                     </Text>
                   </TouchableOpacity>
                 )}
+
+                {/*
+                  * SAVE COUNTS SITS BELOW MARK DEFECTIVE.
+                  *
+                  * Below and not above because marking a defect changes the
+                  * counts this button saves — the defect comes off the white
+                  * or colour figure — so the order of the two controls now
+                  * matches the order the work is done in.
+                  *
+                  * Unchanged in every other respect: same handler, same
+                  * enable rule (nothing typed since the last save means
+                  * nothing to save), and still gone once accepted along with
+                  * the boxes it saves.
+                  */}
+                {showClothCounts ? (
+                <TouchableOpacity
+                  style={[
+                    styles.clothCountSave,
+                    !canSaveClothCounts && styles.buttonDisabled,
+                  ]}
+                  onPress={() => saveClothCounts(item)}
+                  disabled={!canSaveClothCounts}
+                  accessibilityRole="button"
+                  accessibilityLabel={`Save cloth counts for ${item.item_name}`}
+                >
+                  {clothCountBusyId === item.id ? (
+                    <ActivityIndicator size="small" color={COLORS.Surface} />
+                  ) : (
+                    <Text style={styles.clothCountSaveText}>SAVE COUNTS</Text>
+                  )}
+                </TouchableOpacity>
+                ) : null}
               </View>
             );
           })}
@@ -1135,6 +1337,83 @@ export default function SorterOrderDetailsScreen({ navigation, route }: any) {
             </View>
           ) : null}
         </View>
+        ) : null}
+
+        {/*
+          * ---- CLOTH COUNT ---- the card that OUTLIVES acceptance.
+          *
+          * Before acceptance the counts are edited in their boxes inside the
+          * Items card above, beside the line each belongs to. That card is
+          * hidden once the order is accepted, but the COUNTS are required to
+          * stay on screen — so they reappear here, read-only, as a summary of
+          * every line.
+          *
+          * Rendered only after acceptance, so before it there is exactly one
+          * place showing a count and no chance of two disagreeing.
+          *
+          * The figures are already net of defective pieces: the server
+          * subtracts them (see listPendingItemsForOrder), which is what makes
+          * "White 20, 3 defective, shows 17" true here without this card
+          * doing any arithmetic of its own.
+          */}
+        {!showWorkingCards && (order.pending_items ?? []).length > 0 ? (
+          <View style={styles.card}>
+            <Text style={styles.cardTitle}>Cloth Count</Text>
+
+            {order.items.map((item) => {
+              const record = (order.pending_items ?? []).find(
+                (r) => r.order_item_id === item.id
+              );
+              // A line nobody counted is skipped rather than shown as zeros:
+              // "not counted" and "counted, none" are different facts and the
+              // rest of this screen is careful to keep them apart.
+              if (!record) return null;
+
+              const show = (value: number | null) => (value === null ? '—' : String(value));
+
+              /*
+               * The UPDATED figure — counted less defective. Computed here
+               * because the stored count is the original; the same
+               * subtraction the boxes show before acceptance, so the number
+               * does not change the moment the order is accepted.
+               */
+              const net = (counted: number | null, defective: number | null) =>
+                counted === null ? '—' : String(Math.max(0, counted - (defective || 0)));
+
+              return (
+                <View key={item.id} style={styles.clothSummaryBlock}>
+                  <Text style={styles.clothSummaryName}>{item.item_name}</Text>
+
+                  <View style={styles.clothSummaryRow}>
+                    <Text style={styles.clothSummaryLabel}>White Cloths</Text>
+                    <Text style={styles.clothSummaryValue}>
+                      {net(record.white_cloth_count, item.white_defective_quantity)}
+                    </Text>
+                  </View>
+                  <View style={styles.clothSummaryRow}>
+                    <Text style={styles.clothSummaryLabel}>Color Cloths</Text>
+                    <Text style={styles.clothSummaryValue}>
+                      {net(record.color_cloth_count, item.color_defective_quantity)}
+                    </Text>
+                  </View>
+                  <View style={styles.clothSummaryRow}>
+                    <Text style={styles.clothSummaryLabel}>White Socked</Text>
+                    <Text style={styles.clothSummaryValue}>{show(record.white_socked)}</Text>
+                  </View>
+                  <View style={styles.clothSummaryRow}>
+                    <Text style={styles.clothSummaryLabel}>Color Socked</Text>
+                    <Text style={styles.clothSummaryValue}>{show(record.color_socked)}</Text>
+                  </View>
+                </View>
+              );
+            })}
+
+            <Text style={styles.defectHint}>
+              These counts are final — the order has been accepted. Defective pieces have
+              already been taken off.
+            </Text>
+          </View>
+        ) : null}
 
         {/* ---- DEFECTIVE ADJUSTMENT: history, money position, notify ---- */}
         {order.has_adjustment ? (
@@ -1195,8 +1474,10 @@ export default function SorterOrderDetailsScreen({ navigation, route }: any) {
 
         {/* Garment verification. The counts come from the server, and the
             forward action stays locked until it reports a match — the server
-            re-checks the same rule when the button is pressed. */}
-        {scan ? (
+            re-checks the same rule when the button is pressed.
+
+            Gone once accepted, with the other working cards. */}
+        {showWorkingCards && scan ? (
           <View style={styles.card}>
             <Text style={styles.cardTitle}>Garment verification</Text>
             <Row label="Expected garments" value={String(scan.expected_count)} />
@@ -1245,7 +1526,10 @@ export default function SorterOrderDetailsScreen({ navigation, route }: any) {
           </View>
         ) : null}
 
-        {/* ---- Defective piece ---- */}
+        {/* ---- Defective piece ---- Gone once accepted. The RECORD of what
+             was adjusted lives in the Defective adjustment card above, which
+             deliberately stays. */}
+        {showWorkingCards ? (
         <View style={styles.card}>
           <Text style={styles.cardTitle}>DEFECTIVE PIECE</Text>
 
@@ -1357,7 +1641,18 @@ export default function SorterOrderDetailsScreen({ navigation, route }: any) {
               : 'To report a defective piece, use MARK DEFECTIVE on the item above.'}
           </Text>
         </View>
+        ) : null}
 
+        {/*
+          * AVAILABLE AT EVERY STAGE, acceptance included.
+          *
+          * This was hidden after acceptance only because the server stopped
+          * sending `order.pending_items` then, which would have produced a
+          * document of empty rows. The counts travel at every stage again, so
+          * the button has real data to print and there is no reason to
+          * withhold the document — a socked count is as worth reading after
+          * acceptance as before it.
+          */}
         <TouchableOpacity
           style={[styles.secondaryButton, isBuildingSockedPdf && styles.buttonDisabled]}
           onPress={handleSockedDetailsPdf}
@@ -1429,6 +1724,17 @@ export default function SorterOrderDetailsScreen({ navigation, route }: any) {
         onCancel={() => setDefectiveFor(null)}
         onSave={saveAdjustment}
         onReportPiece={reportDefectivePiece}
+        /*
+         * The cloth counted on the line being adjusted, so each box knows its
+         * own ceiling. These are the counts AS COUNTED, so they are the
+         * ceiling directly and a recorded defect can still be corrected
+         * upwards without any adding back.
+         *
+         * NULL when the line has not been counted — the modal then enforces
+         * no per-colour ceiling, exactly as the server does.
+         */
+        availableWhite={countsForDefectiveLine.white}
+        availableColour={countsForDefectiveLine.colour}
       />
 
       {/* Which items are pending, asked only after the Sorter says some are. */}
@@ -1602,6 +1908,63 @@ const styles = StyleSheet.create({
     paddingTop: SPACING.sm,
     borderTopWidth: 1,
     borderTopColor: COLORS.Border,
+  },
+
+  // ---- "After defective pieces": the visible subtraction under the boxes ----
+  clothUpdatedBlock: {
+    marginTop: SPACING.sm,
+    paddingTop: SPACING.sm,
+    borderTopWidth: 1,
+    borderTopColor: COLORS.Border,
+  },
+  clothUpdatedTitle: {
+    fontFamily: TYPOGRAPHY.fontFamily,
+    fontSize: TYPOGRAPHY.sizes.xs,
+    fontWeight: '700',
+    letterSpacing: 0.4,
+    color: COLORS.TextSecondary,
+    marginBottom: SPACING.xs,
+  },
+  clothUpdatedValue: {
+    fontFamily: TYPOGRAPHY.fontFamily,
+    fontSize: TYPOGRAPHY.sizes.sm,
+    fontWeight: '700',
+    color: COLORS.Primary,
+  },
+
+  // ---- the read-only Cloth Count card shown after acceptance ----
+  //
+  // Deliberately NOT the input styles above: nothing here is editable, so
+  // nothing here is drawn as a box that invites a tap.
+  clothSummaryBlock: {
+    marginTop: SPACING.sm,
+    paddingTop: SPACING.sm,
+    borderTopWidth: 1,
+    borderTopColor: COLORS.Border,
+  },
+  clothSummaryName: {
+    fontFamily: TYPOGRAPHY.fontFamily,
+    fontSize: TYPOGRAPHY.sizes.sm,
+    fontWeight: '700',
+    color: COLORS.TextPrimary,
+    marginBottom: SPACING.xs,
+  },
+  clothSummaryRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    paddingVertical: 3,
+  },
+  clothSummaryLabel: {
+    fontFamily: TYPOGRAPHY.fontFamily,
+    fontSize: TYPOGRAPHY.sizes.sm,
+    color: COLORS.TextSecondary,
+  },
+  clothSummaryValue: {
+    fontFamily: TYPOGRAPHY.fontFamily,
+    fontSize: TYPOGRAPHY.sizes.sm,
+    fontWeight: '700',
+    color: COLORS.TextPrimary,
   },
   clothCountTitle: {
     fontFamily: TYPOGRAPHY.fontFamily,

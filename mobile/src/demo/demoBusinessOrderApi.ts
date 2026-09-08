@@ -174,6 +174,10 @@ function toOrderSummary(order: DemoOrder): BusinessOrderSummary {
         .toFixed(3)
     ),
     created_at: order.created_at,
+    // Null until the order leaves PENDING_APPROVAL, matching the real API:
+    // no Manager has scheduled it, so there is nothing to show.
+    assigned_pickup_date: order.assigned_pickup_date ?? null,
+    assigned_pickup_time: order.assigned_pickup_time ?? null,
   };
 }
 
@@ -323,6 +327,10 @@ function toTracking(order: DemoOrder): BusinessOrderTracking {
     current_stage: currentIndex >= 0 ? TRACKING_STAGES[currentIndex].key : null,
     stages,
     history: order.history,
+    // The same two fields the real tracking endpoint returns, from the same
+    // order, so the tracking screen renders the pickup card identically here.
+    assigned_pickup_date: order.assigned_pickup_date ?? null,
+    assigned_pickup_time: order.assigned_pickup_time ?? null,
   };
 }
 
@@ -810,6 +818,25 @@ export async function advanceDemoOrderStatus(orderId: string): Promise<string | 
 
     const next = nextDemoStatus(order.status);
     if (!next) return null;
+
+    /*
+     * LEAVING PENDING_APPROVAL IS THE DEMO'S MANAGER APPROVAL, so it is where
+     * the collection is assigned — the one moment the real flow assigns it.
+     *
+     * The date and time come from the order's OWN booked pickup: its date,
+     * and the START of the slot it was booked into. Nothing is hardcoded and
+     * nothing is guessed, and it is written only onto THIS order.
+     *
+     * Only on the first crossing. A later step must not rewrite a collection
+     * that has already been agreed.
+     */
+    if (order.status === 'PENDING_APPROVAL' && !order.assigned_pickup_date) {
+      const slot = DEMO_TIME_SLOTS.find((option) => option.id === order.pickup.slot_id);
+      if (slot) {
+        order.assigned_pickup_date = order.pickup.date;
+        order.assigned_pickup_time = slot.start;
+      }
+    }
 
     order.status = next;
     order.history.push({ status: next, notes: null, created_at: new Date().toISOString() });

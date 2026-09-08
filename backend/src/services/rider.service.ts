@@ -283,6 +283,11 @@ async function listOffers(riderId: string): Promise<any[]> {
             rj.address_text, rj.contact_name, rj.latitude, rj.longitude,
             rj.origin_address, rj.origin_latitude, rj.origin_longitude,
             o.id AS order_id, o.order_number,
+            -- Whether a business account stands behind this order. The door
+            -- acceptance card is only offered when there is one, because the
+            -- uncounted path raises a ticket for that account and a plain
+            -- customer pickup has nobody to raise it with.
+            (o.business_user_id IS NOT NULL) AS has_business,
             (SELECT COUNT(*) FROM order_items oi WHERE oi.order_id = o.id) AS item_count
        FROM rider_job_offers rjo
        JOIN rider_jobs rj ON rj.id = rjo.job_id
@@ -309,6 +314,13 @@ async function listOffers(riderId: string): Promise<any[]> {
     origin_longitude: toNum(r.origin_longitude),
     distance_m: Number(r.distance_m || 0),
     distance_label: formatDistance(Number(r.distance_m || 0)),
+    /*
+     * Compared as a NUMBER, not tested for truthiness. MySQL returns a
+     * boolean expression as 1/0, and mysql2 hands those over as numbers —
+     * `Boolean(0)` is false, but a string '0' would be true. The same trap
+     * `dispatch.service` documents on `has_expired`.
+     */
+    has_business: Number(r.has_business) === 1,
     item_count: Number(r.item_count || 0),
     /*
      * The order's weight, shown as INFORMATION.
@@ -442,7 +454,8 @@ async function updateJobStatus(riderId: string, jobId: string, target: string): 
   }
 
   const current = await query<any>(
-    `SELECT id, status, order_id, job_type FROM rider_jobs WHERE id = ? AND rider_id = ?`,
+    `SELECT id, status, order_id, job_type, handover_code
+       FROM rider_jobs WHERE id = ? AND rider_id = ?`,
     [jobId, riderId]
   );
   const job = current.rows[0];
@@ -478,14 +491,53 @@ async function updateJobStatus(riderId: string, jobId: string, target: string): 
   }
 
   if (target === 'ARRIVED') {
+    /*
+     * THE CODE TRAVELS WITH THE MESSAGE.
+     *
+     * It used to say "Please share your handover code" and stop there —
+     * asking for a number that had never been sent. The code is generated in
+     * `dispatch.service.generateHandoverCode` at job creation and stored on
+     * `rider_jobs.handover_code`, and NOTHING read it back out except the
+     * rider's own `completeJob` validation. There is no SMS for it
+     * (`sms.service` only sends login OTPs, and its production provider is an
+     * unimplemented stub), no API field exposing it, and for a business order
+     * no notification row is even possible. So the other party was asked to
+     * read out a number they had no way of knowing, and every handover
+     * stalled at ARRIVED.
+     *
+     * Sending the digits is the whole point of the message. The code still
+     * proves presence: it reaches the party's own account, and the rider
+     * cannot see it — `getJobDetail` exposes only `handover_code_required`,
+     * never the code itself.
+     */
+    const code = job.handover_code ? String(job.handover_code) : null;
+
+    const ask = job.job_type === 'PICKUP'
+      ? 'Your rider is at the pickup point.'
+      : 'Your rider is at your door with your order.';
+
     await notifyOrderParty(
       orderId,
       'RIDER_ARRIVED',
       'Your rider has arrived',
-      job.job_type === 'PICKUP'
-        ? 'Your rider is at the pickup point. Please share your handover code.'
-        : 'Your rider is at your door with your order. Please share your handover code.'
+      code
+        ? `${ask} Share this handover code with them to confirm: ${code}`
+        : `${ask} Please share your handover code.`
     );
+
+    /*
+     * And to the log, matching what `sms.service` already does for login
+     * OTPs in development. This is the only channel that reaches a BUSINESS
+     * order today: `notifyOrderParty` cannot write a notification row for one
+     * (the FK points at `users`, hotels live in `business_users`) and falls
+     * back to a socket the app has no client for.
+     */
+    if (code) {
+      logger.info(
+        `[Rider] Handover code for job ${jobId} (order ${orderId}): ${code} — ` +
+          `rider ${riderId} has ARRIVED`
+      );
+    }
   }
 
   socketService.emitJobUpdate(orderId, { jobId, status: target });
@@ -930,6 +982,39 @@ async function notifyOrderParty(
 
     if (row.user_id) {
       await createNotification(String(row.user_id), orderId, type, title, body, { orderId });
+    } else if (row.business_user_id) {
+      /*
+       * A BUSINESS ORDER NOW GETS A DURABLE MESSAGE, not just a socket emit.
+       *
+       * The emit below stays, but on its own it delivered nothing: the mobile
+       * app has no socket client (`socket.io-client` is not a dependency), so
+       * every notification to a hotel — including "your rider has arrived",
+       * which carries the handover code — was written to a channel with no
+       * listener. A hotel could not learn its own code, and the handover
+       * could not be completed.
+       *
+       * `business_messages` is the table that exists for exactly this (see
+       * migration 062), and the hotel reads it on the Pickup Approvals
+       * screen.
+       *
+       * WRAPPED SEPARATELY so that a missing table — migration 062 not yet
+       * run — degrades to the old behaviour instead of failing the status
+       * change that triggered it.
+       */
+      try {
+        await query(
+          `INSERT INTO business_messages (business_user_id, order_id, ticket_id, type, body, is_read)
+           VALUES (?, ?, NULL, ?, ?, false)`,
+          [String(row.business_user_id), orderId, type, body]
+        );
+      } catch (error) {
+        logger.warn(
+          `[Rider] Could not write business message for order ${orderId} ` +
+            `(is migration 062 applied?): ${error instanceof Error ? error.message : String(error)}`
+        );
+      }
+
+      socketService.emitJobUpdate(orderId, { orderId, type, title, body });
     } else {
       socketService.emitJobUpdate(orderId, { orderId, type, title, body });
     }

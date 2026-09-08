@@ -14,6 +14,30 @@ import { AppError } from '../utils/appError';
    40.00-above-399.00 rule that used to live here is gone. */
 
 /**
+ * A DATE column as the plain YYYY-MM-DD key the app expects.
+ *
+ * A MySQL DATE read through `SELECT *` arrives as a JavaScript Date, and
+ * serialising that to JSON produces a UTC timestamp a device then reads in
+ * its own timezone -- enough to show a pickup assigned for the 10th as the
+ * 9th. Every other reader of these columns formats them in SQL; this is the
+ * one query that cannot, because `*` is what the caller spreads.
+ *
+ * THE LOCAL FIELDS, NOT THE UTC ONES. mysql2 builds a DATE as local midnight,
+ * so on a server anywhere east of UTC the UTC date is the day BEFORE. Reading
+ * the same fields the driver wrote round-trips exactly, whatever the server's
+ * timezone -- which reading `getUTC*` does not.
+ */
+function dateKeyOf(value: unknown): string | null {
+  if (!value) return null;
+  if (typeof value === 'string') return value.slice(0, 10);
+  if (value instanceof Date) {
+    const pad = (n: number) => String(n).padStart(2, '0');
+    return `${value.getFullYear()}-${pad(value.getMonth() + 1)}-${pad(value.getDate())}`;
+  }
+  return null;
+}
+
+/**
  * WHEN A CUSTOMER MAY STILL CANCEL. Unchanged -- this is the existing rule,
  * now exported so the app can ask rather than keep its own copy of it.
  *
@@ -554,6 +578,16 @@ async function getOrderById(userId: string, orderId: string): Promise<OrderRow |
   const order = orderResult.rows[0];
   if (!order) return null;
 
+  /*
+   * The assigned pickup DATE as a plain YYYY-MM-DD string.
+   *
+   * `SELECT *` brings the column back as a DATE, which serialises to a
+   * timestamp the device then reads in its own timezone — enough to shift a
+   * collection into the previous day for anyone west of IST. Normalised here
+   * so this endpoint agrees with the tracking one, which formats it in SQL.
+   */
+  (order as any).assigned_pickup_date = dateKeyOf((order as any).assigned_pickup_date);
+
   const items = await query<any>(
     `SELECT oi.id, oi.service_id, s.name AS service_name, oi.quantity,
             oi.unit_price, oi.total_price, s.unit
@@ -666,7 +700,23 @@ async function cancelOrder(
  */
 async function getOrderTracking(userId: string, orderId: string): Promise<object | null> {
   const orderResult = await query<any>(
-    `SELECT o.id, o.order_number, o.status, o.total AS total_amount, o.created_at
+    `SELECT o.id, o.order_number, o.status, o.total AS total_amount, o.created_at,
+            /*
+             * THE PICKUP A MANAGER ASSIGNED, read from the order itself.
+             *
+             * NULL until a Manager has actually chosen one, which is what
+             * lets the tracker show a collection only when there is one to
+             * show. It is not the same as the pickups row below: that
+             * always exists (both order flows write one at creation, and on
+             * the Business side it is a placeholder), so it can never answer
+             * "has a pickup been assigned yet".
+             *
+             * DATE_FORMAT because a bare DATE arrives as a timestamp the
+             * device would then read in its own timezone — and shift a
+             * collection into the previous day for anyone west of IST.
+             */
+            DATE_FORMAT(o.assigned_pickup_date, '%Y-%m-%d') AS assigned_pickup_date,
+            o.assigned_pickup_time
        FROM orders o
       WHERE o.id = ? AND o.user_id = ?`,
     [orderId, userId]

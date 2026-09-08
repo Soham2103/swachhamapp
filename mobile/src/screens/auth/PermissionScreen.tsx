@@ -14,7 +14,7 @@ import {
 
 import { Ionicons } from '@expo/vector-icons';
 
-import * as Notifications from 'expo-notifications';
+import { getNotifications } from '../../services/expoNotifications';
 import * as Location from 'expo-location';
 import { Camera } from 'expo-camera';
 import * as ImagePicker from 'expo-image-picker';
@@ -111,6 +111,21 @@ export default function PermissionScreen() {
 
   const requestNotifications =
     async () => {
+
+      // Null in Expo Go on Android, where the module cannot be imported at
+      // all. Notifications are optional and both callers discard this result,
+      // so reporting "not granted" is the honest answer and blocks nothing.
+      const Notifications = getNotifications();
+
+      if (!Notifications) {
+
+        setPermissions(prev => ({
+          ...prev,
+          notifications: false,
+        }));
+
+        return false;
+      }
 
       try {
 

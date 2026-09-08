@@ -21,6 +21,7 @@
 import dotenv from 'dotenv';
 import { query } from '../src/config/database';
 import { generateAccessToken } from '../src/utils/jwt';
+import { getBusinessNow, addDays } from '../src/utils/istTime';
 
 dotenv.config();
 
@@ -53,6 +54,25 @@ async function api(
   let json: any = null;
   try { json = JSON.parse(text); } catch { /* html error page */ }
   return { status: res.status, json, text };
+}
+
+/**
+ * A pickup a Manager could assign: tomorrow, at the first time the server
+ * offers for that day.
+ *
+ * Accepting requires one — a Manager names the collection as part of saying
+ * yes — so every accept in this run goes through here. Tomorrow rather than
+ * today so a late run cannot fall past the last time of the working day, and
+ * the time comes from the server's list rather than a constant so this cannot
+ * drift from what the working day actually is.
+ */
+async function pickupFor(token: string): Promise<{ pickupDate: string; pickupTime: string }> {
+  const now = await getBusinessNow();
+  const pickupDate = addDays(now.date, 1);
+  const res = await api(`/api/manager/order-requests/pickup-times?date=${pickupDate}`, token);
+  const first = (res.json?.data || []).find((time: any) => time.available);
+  if (!first) throw new Error('the server offered no pickup times for tomorrow');
+  return { pickupDate, pickupTime: first.id };
 }
 
 /**
@@ -267,11 +287,18 @@ async function main() {
      * ============================================================ */
     console.log('\n4. MANAGER ACCEPTS');
 
+    const pickup = await pickupFor(managerToken);
     const accepted = await api(
-      `/api/manager/order-requests/${orderId}/accept`, managerToken, { method: 'POST' }
+      `/api/manager/order-requests/${orderId}/accept`, managerToken,
+      { method: 'POST', body: pickup }
     );
     check('accept succeeds', accepted.status === 200, `status ${accepted.status}`);
     check('SAME order id back', String(accepted.json?.data?.id) === orderId);
+    check('the pickup the manager assigned is stored on THAT order',
+      (await query<any>(
+        `SELECT DATE_FORMAT(assigned_pickup_date, '%Y-%m-%d') AS d FROM orders WHERE id = ?`,
+        [orderId]
+      )).rows[0].d === pickup.pickupDate);
 
     const after = (await query<any>(
       `SELECT status FROM orders WHERE id = ?`, [orderId]
@@ -433,7 +460,8 @@ async function main() {
               .some((r: any) => String(r.id) === bizOrderId));
 
           const bizAccept = await api(
-            `/api/manager/order-requests/${bizOrderId}/accept`, managerToken, { method: 'POST' }
+            `/api/manager/order-requests/${bizOrderId}/accept`, managerToken,
+            { method: 'POST', body: await pickupFor(managerToken) }
           );
           check('the manager accepts it', bizAccept.status === 200, `status ${bizAccept.status}`);
           check('it is reported as a BUSINESS order',

@@ -26,6 +26,7 @@ import dotenv from 'dotenv';
 import { query } from '../src/config/database';
 import { generateAccessToken } from '../src/utils/jwt';
 import { PENDING_STATUS, APPROVED_STATUS } from '../src/services/managerOrderApproval.service';
+import { getBusinessNow, addDays } from '../src/utils/istTime';
 
 dotenv.config();
 
@@ -54,6 +55,27 @@ async function api(path: string, token: string, init: { method?: string; body?: 
   let json: any = null;
   try { json = JSON.parse(text); } catch { /* html error page */ }
   return { status: res.status, json };
+}
+
+/**
+ * A pickup a Manager could actually assign: tomorrow, at the first time the
+ * server offers for that day.
+ *
+ * TOMORROW rather than today, so the run cannot fail because it happened
+ * after the last slot; and the TIME comes from the server's own list rather
+ * than a constant here, so this cannot drift from what the working day is.
+ */
+async function pickupFor(token: string): Promise<{ pickupDate: string; pickupTime: string }> {
+  const now = await getBusinessNow();
+  const pickupDate = addDays(now.date, 1);
+
+  const res = await api(
+    `/api/manager/order-requests/pickup-times?date=${pickupDate}`, token
+  );
+  const first = (res.json?.data || []).find((time: any) => time.available);
+  if (!first) throw new Error('the server offered no pickup times for tomorrow');
+
+  return { pickupDate, pickupTime: first.id };
 }
 
 /** The Sorter's own queue predicate, as `sorter.service` defines it. */
@@ -167,15 +189,42 @@ async function main() {
      * ============================================================ */
     console.log('\n3. THE MANAGER ACCEPTS');
 
-    const accepted = await api(
+    /*
+     * THE PICKUP IS PART OF THE ACCEPTANCE, so an accept without one must be
+     * refused rather than quietly placing an order nobody has agreed to
+     * collect. Checked BEFORE the real accept, on the same order, so a
+     * regression here cannot hide behind a later success.
+     */
+    const noPickup = await api(
       `/api/manager/order-requests/${customerOrderId}/accept`, managerToken, { method: 'POST' }
+    );
+    check('an accept with NO pickup is refused with 400', noPickup.status === 400,
+      `status ${noPickup.status}`);
+    check('and the order is still pending',
+      (await query<any>(`SELECT status FROM orders WHERE id = ?`, [customerOrderId]))
+        .rows[0].status === PENDING_STATUS);
+
+    const pastPickup = await api(
+      `/api/manager/order-requests/${customerOrderId}/accept`, managerToken,
+      { method: 'POST', body: { pickupDate: '2020-01-01', pickupTime: '09:00' } }
+    );
+    check('a pickup in the PAST is refused', pastPickup.status === 400,
+      `status ${pastPickup.status} — ${pastPickup.json?.message}`);
+
+    const pickup = await pickupFor(managerToken);
+    const accepted = await api(
+      `/api/manager/order-requests/${customerOrderId}/accept`, managerToken,
+      { method: 'POST', body: pickup }
     );
     check('the accept succeeds', accepted.status === 200, `status ${accepted.status}`);
     check('it returns THE SAME order id', String(accepted.json?.data?.id) === customerOrderId,
       `${accepted.json?.data?.id} vs ${customerOrderId}`);
 
     const stored = await query<any>(
-      `SELECT status, manager_approved_at, manager_approved_by FROM orders WHERE id = ?`,
+      `SELECT status, manager_approved_at, manager_approved_by,
+              DATE_FORMAT(assigned_pickup_date, '%Y-%m-%d') AS assigned_pickup_date,
+              assigned_pickup_time, pickup_assigned_by
+         FROM orders WHERE id = ?`,
       [customerOrderId]
     );
     check('THE DATABASE holds ORDER_PLACED — not just the response',
@@ -183,6 +232,23 @@ async function main() {
     check('and it records who accepted it, and when',
       String(stored.rows[0].manager_approved_by) === String(manager.id)
         && !!stored.rows[0].manager_approved_at);
+    check('THE ASSIGNED PICKUP is stored against the order',
+      stored.rows[0].assigned_pickup_date === pickup.pickupDate
+        && String(stored.rows[0].assigned_pickup_time).startsWith(pickup.pickupTime),
+      `${stored.rows[0].assigned_pickup_date} ${stored.rows[0].assigned_pickup_time}`);
+    check('and records which manager assigned it',
+      String(stored.rows[0].pickup_assigned_by) === String(manager.id));
+
+    // The operational row is kept in step, so the rider and the delivery rule
+    // work to the Manager's decision rather than to the booking placeholder.
+    const pickupRow = await query<any>(
+      `SELECT DATE_FORMAT(scheduled_date, '%Y-%m-%d') AS d, time_slot_start
+         FROM pickups WHERE order_id = ?`, [customerOrderId]
+    );
+    check('the pickups row was moved to match',
+      pickupRow.rows[0]?.d === pickup.pickupDate
+        && String(pickupRow.rows[0]?.time_slot_start).startsWith(pickup.pickupTime),
+      `${pickupRow.rows[0]?.d} ${pickupRow.rows[0]?.time_slot_start}`);
 
     const history = await query<any>(
       `SELECT status, notes FROM order_status_history
@@ -216,7 +282,8 @@ async function main() {
     console.log('\n5. ACCEPTING TWICE');
 
     const again = await api(
-      `/api/manager/order-requests/${customerOrderId}/accept`, managerToken, { method: 'POST' }
+      `/api/manager/order-requests/${customerOrderId}/accept`, managerToken,
+      { method: 'POST', body: await pickupFor(managerToken) }
     );
     check('a second accept is refused with 409', again.status === 409, `status ${again.status}`);
     check('and says why', /already been accepted/i.test(again.json?.message || ''),
@@ -233,14 +300,86 @@ async function main() {
      * ============================================================ */
     console.log('\n6. THE BUSINESS FLOW');
 
+    /*
+     * A DIFFERENT PICKUP FROM THE CUSTOMER ORDER'S, deliberately: the point
+     * of the checks below is that one order's collection never reaches
+     * another's, and two identical times could not tell the two apart.
+     */
+    const bizPickup = await pickupFor(managerToken);
+    const bizTimes = await api(
+      `/api/manager/order-requests/pickup-times?date=${bizPickup.pickupDate}`, managerToken
+    );
+    const laterTime = (bizTimes.json?.data || [])
+      .filter((t: any) => t.available)
+      .find((t: any) => t.id !== pickup.pickupTime);
+    if (laterTime) bizPickup.pickupTime = laterTime.id;
+
     const bizAccepted = await api(
-      `/api/manager/order-requests/${businessOrderId}/accept`, managerToken, { method: 'POST' }
+      `/api/manager/order-requests/${businessOrderId}/accept`, managerToken,
+      { method: 'POST', body: bizPickup }
     );
     check('a business booking accepts too', bizAccepted.status === 200,
       `status ${bizAccepted.status}`);
     check('it is reported as a BUSINESS order',
       bizAccepted.json?.data?.source === 'BUSINESS', bizAccepted.json?.data?.source);
     check('and reaches the Sorter queue', await inSorterQueue(businessOrderId));
+
+    /* ============================================================
+     * 6b. ONE ORDER'S PICKUP NEVER REACHES ANOTHER
+     * ============================================================ */
+    console.log('\n6b. PICKUPS ARE PER-ORDER');
+
+    const both = await query<any>(
+      `SELECT id, DATE_FORMAT(assigned_pickup_date, '%Y-%m-%d') AS d, assigned_pickup_time
+         FROM orders WHERE id IN (?, ?)`,
+      [customerOrderId, businessOrderId]
+    );
+    const custRow = both.rows.find((r: any) => String(r.id) === customerOrderId);
+    const bizRow = both.rows.find((r: any) => String(r.id) === businessOrderId);
+    check('the business order kept ITS OWN pickup',
+      bizRow?.d === bizPickup.pickupDate
+        && String(bizRow?.assigned_pickup_time).startsWith(bizPickup.pickupTime),
+      `${bizRow?.d} ${bizRow?.assigned_pickup_time}`);
+    check('and the customer order was not touched by it',
+      custRow?.d === pickup.pickupDate
+        && String(custRow?.assigned_pickup_time).startsWith(pickup.pickupTime),
+      `${custRow?.d} ${custRow?.assigned_pickup_time}`);
+
+    /* ============================================================
+     * 6c. CHANGING A PICKUP AFTERWARDS
+     * ============================================================ */
+    console.log('\n6c. RESCHEDULING');
+
+    const later = await pickupFor(managerToken);
+    const moved = { pickupDate: addDays(later.pickupDate, 1), pickupTime: later.pickupTime };
+    const rescheduled = await api(
+      `/api/manager/order-requests/${customerOrderId}/pickup`, managerToken,
+      { method: 'PATCH', body: moved }
+    );
+    check('a manager can move an accepted order\'s pickup', rescheduled.status === 200,
+      `status ${rescheduled.status}`);
+
+    const afterMove = await query<any>(
+      `SELECT status, DATE_FORMAT(assigned_pickup_date, '%Y-%m-%d') AS d, assigned_pickup_time
+         FROM orders WHERE id = ?`, [customerOrderId]
+    );
+    check('the new pickup is stored', afterMove.rows[0].d === moved.pickupDate,
+      `${afterMove.rows[0].d} vs ${moved.pickupDate}`);
+    check('THE STATUS IS UNCHANGED by rescheduling',
+      afterMove.rows[0].status === APPROVED_STATUS, afterMove.rows[0].status);
+
+    const bizUnmoved = await query<any>(
+      `SELECT DATE_FORMAT(assigned_pickup_date, '%Y-%m-%d') AS d FROM orders WHERE id = ?`,
+      [businessOrderId]
+    );
+    check('and the OTHER order was not moved with it',
+      bizUnmoved.rows[0].d === bizPickup.pickupDate,
+      `${bizUnmoved.rows[0].d} vs ${bizPickup.pickupDate}`);
+
+    const scheduledTab = await api('/api/manager/order-requests/scheduled', managerToken);
+    check('both accepted orders appear on the Scheduled tab',
+      (scheduledTab.json?.data || []).some((r: any) => String(r.id) === customerOrderId)
+        && (scheduledTab.json?.data || []).some((r: any) => String(r.id) === businessOrderId));
 
     /* ============================================================
      * 7. ONLY A MANAGER MAY DO THIS

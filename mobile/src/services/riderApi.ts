@@ -63,6 +63,14 @@ export interface JobOffer {
   origin_longitude: number | null;
   distance_m: number;
   distance_label: string;
+  /**
+   * Whether a business account stands behind this order.
+   *
+   * The door acceptance card is shown only when it does: the uncounted path
+   * raises a ticket for that account, and a plain customer pickup has nobody
+   * to raise it with.
+   */
+  has_business: boolean;
   item_count: number;
   /**
    * The order's weight, shown as INFORMATION only.
@@ -134,6 +142,25 @@ export interface RiderSummary {
   lifetime: { completed: number; cancelled: number };
 }
 
+/** How the rider accepted at the door. */
+export type DoorAcceptanceMode = 'WITH_COUNT' | 'WITHOUT_COUNT';
+
+/**
+ * The ticket raised when a load was taken WITHOUT being counted.
+ *
+ * PENDING until the business accepts it. The rider does not proceed while it
+ * is pending, which is the whole point of it existing.
+ */
+export interface DoorTicket {
+  ticket_id: string;
+  order_id: string;
+  order_number: string | null;
+  job_id: string;
+  status: 'PENDING' | 'ACCEPTED';
+  created_at: string;
+  accepted_at: string | null;
+}
+
 /** A job parked until the rider has room, with its reclaim countdown. */
 export interface HeldJob extends RiderJob {
   held_minutes: number;
@@ -200,6 +227,49 @@ const riderApi = {
    */
   acceptOffer: async (jobId: string): Promise<ApiResponse<RiderJob>> => {
     const response = await apiClient.post(`/api/rider/offers/${jobId}/accept`);
+    return response.data;
+  },
+
+  /**
+   * "With Counting & Checked."
+   *
+   * The same acceptance as `acceptOffer`, and additionally tells the business
+   * the order was checked at the door. `messaged` is false when the order has
+   * no business behind it or the message could not be written — the job is
+   * accepted either way, so this is information, not a failure.
+   */
+  acceptOfferWithCounting: async (
+    jobId: string
+  ): Promise<ApiResponse<{ job: RiderJob; messaged: boolean }>> => {
+    const response = await apiClient.post(`/api/rider/offers/${jobId}/accept-with-counting`);
+    return response.data;
+  },
+
+  /**
+   * "Without Counting & Checked."
+   *
+   * Claims the job AND raises a ticket the business must accept before the
+   * rider proceeds. The job is claimed straight away on purpose — an offer
+   * lives 90 seconds and is raced by every nearby rider, so waiting for the
+   * business first would lose it. The rider is still gated: the dashboard
+   * holds them in a waiting state until `getDoorTicket` reports ACCEPTED.
+   */
+  acceptOfferWithoutCounting: async (
+    jobId: string
+  ): Promise<ApiResponse<{ job: RiderJob; ticket: DoorTicket }>> => {
+    const response = await apiClient.post(`/api/rider/offers/${jobId}/accept-without-counting`);
+    return response.data;
+  },
+
+  /** Polled while waiting on a business. */
+  getDoorTicket: async (ticketId: string): Promise<ApiResponse<DoorTicket>> => {
+    const response = await apiClient.get(`/api/rider/door-tickets/${ticketId}`);
+    return response.data;
+  },
+
+  /** Read on dashboard load, so a wait survives the app being closed. */
+  getPendingDoorTickets: async (): Promise<ApiResponse<DoorTicket[]>> => {
+    const response = await apiClient.get('/api/rider/door-tickets');
     return response.data;
   },
 

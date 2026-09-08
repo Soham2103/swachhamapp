@@ -569,6 +569,15 @@ export interface BusinessOrderSummary {
   /** SUM(item weight x quantity) for the order, in kg. */
   total_weight_kg: number;
   created_at: Date;
+  /**
+   * The collection a Manager assigned, or NULL when none has been.
+   *
+   * YYYY-MM-DD and HH:MM:SS, the shapes the columns store. Carried on the
+   * SUMMARY, not only the detail, so the orders list can show a business when
+   * each of its orders will be collected without opening every one.
+   */
+  assigned_pickup_date: string | null;
+  assigned_pickup_time: string | null;
 }
 
 /** Orders belonging to the authenticated business only, newest first. */
@@ -576,6 +585,8 @@ async function getOrders(businessUserId: string): Promise<BusinessOrderSummary[]
   const result = await query<BusinessOrderSummary>(
     `SELECT o.id, o.order_number, o.laundry_type, o.order_type, o.service_type,
             s.name AS service_name, o.status, o.created_at,
+            DATE_FORMAT(o.assigned_pickup_date, '%Y-%m-%d') AS assigned_pickup_date,
+            o.assigned_pickup_time,
             COUNT(oi.id) AS item_count,
             COALESCE(SUM(oi.quantity), 0) AS total_quantity,
             COALESCE(ROUND(SUM(oi.total_weight_kg), 3), 0) AS total_weight_kg
@@ -740,6 +751,21 @@ async function fetchOrderDetail(
              * NULL and print "N/A".
              */
             o.placed_by_mobile,
+            /*
+             * THE PICKUP A MANAGER ASSIGNED. Both NULL until one has been,
+             * which is what lets the screen show a collection only when there
+             * is one -- the pickups row cannot answer that, because this
+             * flow writes a placeholder into it at creation.
+             *
+             * The SAME TWO COLUMNS the customer's tracking endpoint reads, so
+             * a business and its customer can never be shown different times
+             * for one order.
+             *
+             * DATE_FORMAT so a DATE cannot reach the device as a timestamp it
+             * then shifts into the previous day.
+             */
+            DATE_FORMAT(o.assigned_pickup_date, '%Y-%m-%d') AS assigned_pickup_date,
+            o.assigned_pickup_time,
             COALESCE(bu.email, b.email) AS business_email,
             COALESCE(b.establishment_address, b.address) AS business_address
      FROM orders o
@@ -956,6 +982,14 @@ export interface BusinessOrderTracking {
   current_stage: string | null;
   stages: Array<{ key: string; label: string; completed: boolean; current: boolean; at: Date | null }>;
   history: Array<{ status: string; notes: string | null; created_at: Date }>;
+  /**
+   * The collection a Manager assigned, or NULL when none has been.
+   *
+   * The same two `orders` columns the customer's tracking endpoint returns,
+   * so the business and its customer read one source and cannot disagree.
+   */
+  assigned_pickup_date: string | null;
+  assigned_pickup_time: string | null;
 }
 
 async function getOrderTracking(
@@ -967,8 +1001,15 @@ async function getOrderTracking(
     order_number: string;
     status: string;
     created_at: Date;
+    assigned_pickup_date: string | null;
+    assigned_pickup_time: string | null;
   }>(
-    `SELECT id, order_number, status, created_at
+    // The assigned pickup travels with the status, so the tracking screen
+    // shows both from one read — and from the same two columns the customer's
+    // tracker uses for the same order.
+    `SELECT id, order_number, status, created_at,
+            DATE_FORMAT(assigned_pickup_date, '%Y-%m-%d') AS assigned_pickup_date,
+            assigned_pickup_time
      FROM orders
      WHERE id = ? AND business_user_id = ?`,
     [orderId, businessUserId]
@@ -1015,6 +1056,8 @@ async function getOrderTracking(
     current_stage: currentIndex >= 0 ? TRACKING_STAGES[currentIndex].key : null,
     stages,
     history,
+    assigned_pickup_date: order.assigned_pickup_date ?? null,
+    assigned_pickup_time: order.assigned_pickup_time ?? null,
   };
 }
 

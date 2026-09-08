@@ -13,6 +13,7 @@ import { Ionicons } from '@expo/vector-icons';
 import { COLORS, SPACING, TYPOGRAPHY, BORDER_RADIUS, SHADOWS } from '../../constants/theme';
 import BusinessHeader from '../../components/business/BusinessHeader';
 import CancelOrderModal from '../../components/business/CancelOrderModal';
+import PickupScheduleCard from '../../components/PickupScheduleCard';
 import businessOrderApi, { BusinessOrderTracking } from '../../services/businessOrderApi';
 import { extractErrorMessage } from '../../services/api';
 import { DEMO_MODE } from '../../demo/demoMode';
@@ -153,6 +154,22 @@ export default function BusinessOrderTrackingScreen({ navigation, route }: any) 
               <Text style={styles.cancelledText}>This order was cancelled.</Text>
             </View>
           ) : null}
+
+          {/*
+            THE COLLECTION A MANAGER ASSIGNED — the same component, the same
+            two fields and therefore the same wording the customer sees.
+
+            Under the status, because "when are you collecting" is what a
+            business opens this screen for. Suppressed on a cancelled order:
+            nothing is being collected, and the line above has just said so.
+            Renders nothing until a pickup has actually been assigned.
+          */}
+          {!tracking.is_cancelled && (
+            <PickupScheduleCard
+              date={tracking.assigned_pickup_date}
+              time={tracking.assigned_pickup_time}
+            />
+          )}
 
           <View style={styles.card}>
             {tracking.stages.map((stage, index) => {

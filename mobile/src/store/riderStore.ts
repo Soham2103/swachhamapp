@@ -1,7 +1,8 @@
 import { create } from 'zustand';
 import * as Location from 'expo-location';
-import * as Notifications from 'expo-notifications';
+import { getNotifications } from '../services/expoNotifications';
 import riderApi, {
+  DoorTicket,
   HeldJob,
   JobOffer,
   RiderJob,
@@ -92,12 +93,38 @@ export interface RiderState {
   /** True while the ping/poll timers are running. */
   isWatching: boolean;
 
+  /**
+   * The ticket the rider is currently held by, or null when free to proceed.
+   *
+   * Set when a job is accepted WITHOUT counting, and cleared when the
+   * business accepts it. While it is set the dashboard shows a waiting card
+   * instead of letting the rider move on — that is the gate the brief calls
+   * "the rider must remain waiting".
+   *
+   * ONE AT A TIME on purpose. A rider is at one door; holding a list here
+   * would raise the question of which one the screen is waiting on.
+   */
+  awaitingTicket: DoorTicket | null;
+
+  /** True only for the moment a door choice is in flight. */
+  isSubmittingDoorChoice: boolean;
+
   loadDashboard: () => Promise<void>;
   goOnline: () => Promise<{ ok: boolean; message?: string }>;
   goOffline: () => Promise<void>;
   refreshOffers: () => Promise<void>;
   refreshJobs: () => Promise<void>;
   acceptOffer: (jobId: string) => Promise<{ ok: boolean; message: string }>;
+  /** "With Counting & Checked" — accept and tell the business. */
+  acceptOfferWithCounting: (jobId: string) => Promise<{ ok: boolean; message: string }>;
+  /** "Without Counting & Checked" — accept, raise a ticket, then wait. */
+  acceptOfferWithoutCounting: (jobId: string) => Promise<{ ok: boolean; message: string }>;
+  /** One poll of the ticket the rider is waiting on. */
+  pollAwaitingTicket: () => Promise<{ accepted: boolean }>;
+  /** Restores a wait that outlived the app being closed. */
+  refreshDoorTickets: () => Promise<void>;
+  /** Drops the waiting card once the rider has been shown the outcome. */
+  clearAwaitingTicket: () => void;
   holdOffer: (jobId: string) => Promise<{ ok: boolean; message: string }>;
   declineOffer: (jobId: string) => Promise<void>;
   refreshHeld: () => Promise<void>;
@@ -167,6 +194,10 @@ async function currentPosition(): Promise<Location.LocationObject | null> {
  * never break the poll that found the offer.
  */
 async function announceOffer(offer: JobOffer): Promise<void> {
+  // Null in Expo Go on Android, where the module cannot be imported at all.
+  const Notifications = getNotifications();
+  if (!Notifications) return;
+
   try {
     await Notifications.scheduleNotificationAsync({
       content: {
@@ -191,6 +222,8 @@ export const useRiderStore = create<RiderState>((set, get) => ({
   isTogglingDuty: false,
   error: null,
   isWatching: false,
+  awaitingTicket: null,
+  isSubmittingDoorChoice: false,
 
   loadDashboard: async () => {
     set({ isLoading: true, error: null });
@@ -200,6 +233,10 @@ export const useRiderStore = create<RiderState>((set, get) => ({
         riderApi.getJobs('active'),
         riderApi.getHeldJobs(),
       ]);
+
+      // Best-effort and separate: a rider whose wait cannot be restored still
+      // gets a working dashboard.
+      void get().refreshDoorTickets();
       set({
         summary: summary.data,
         profile: summary.data.profile,
@@ -317,6 +354,130 @@ export const useRiderStore = create<RiderState>((set, get) => ({
   },
 
   /**
+   * "With Counting & Checked."
+   *
+   * The job is accepted and the business is told it was checked at the door.
+   * The rider is not held: this path has nothing to wait for.
+   */
+  acceptOfferWithCounting: async (jobId: string) => {
+    set({ isSubmittingDoorChoice: true });
+    try {
+      const response = await riderApi.acceptOfferWithCounting(jobId);
+      set({ offers: get().offers.filter((o) => o.job_id !== jobId) });
+      await Promise.all([get().refreshJobs(), get().refreshOffers()]);
+
+      /*
+       * `messaged` false means the order had no business behind it, or the
+       * message could not be written. The job is accepted either way, so this
+       * changes the wording and never the outcome.
+       */
+      const messaged = Boolean(response.data?.messaged);
+      return {
+        ok: true,
+        message: messaged
+          ? 'Accepted. The business has been told the order was checked at the door.'
+          : 'Accepted.',
+      };
+    } catch (error: any) {
+      const lost = error?.response?.status === 409 || error?.response?.status === 410;
+      set({ offers: get().offers.filter((o) => o.job_id !== jobId) });
+      return {
+        ok: false,
+        message: lost
+          ? 'Another rider took this one.'
+          : extractErrorMessage(error, 'Could not accept this job.'),
+      };
+    } finally {
+      set({ isSubmittingDoorChoice: false });
+    }
+  },
+
+  /**
+   * "Without Counting & Checked."
+   *
+   * Claims the job and raises the ticket, then puts the rider into the
+   * waiting state. `awaitingTicket` is what the dashboard renders the waiting
+   * card from, so setting it IS the gate.
+   */
+  acceptOfferWithoutCounting: async (jobId: string) => {
+    set({ isSubmittingDoorChoice: true });
+    try {
+      const response = await riderApi.acceptOfferWithoutCounting(jobId);
+      const ticket = response.data?.ticket || null;
+
+      set({
+        offers: get().offers.filter((o) => o.job_id !== jobId),
+        awaitingTicket: ticket,
+      });
+      await Promise.all([get().refreshJobs(), get().refreshOffers()]);
+
+      return {
+        ok: true,
+        message: 'Ticket raised. Waiting for the business to accept.',
+      };
+    } catch (error: any) {
+      const lost = error?.response?.status === 409 || error?.response?.status === 410;
+      set({ offers: get().offers.filter((o) => o.job_id !== jobId) });
+      return {
+        ok: false,
+        message: lost
+          ? 'Another rider took this one.'
+          : extractErrorMessage(error, 'Could not raise a ticket for this job.'),
+      };
+    } finally {
+      set({ isSubmittingDoorChoice: false });
+    }
+  },
+
+  /**
+   * One poll of the ticket being waited on.
+   *
+   * Deliberately silent on failure: this runs on a timer, and a dropped
+   * request on a moving phone is ordinary. The next tick tries again rather
+   * than putting an error in front of a rider who can do nothing about it.
+   */
+  pollAwaitingTicket: async () => {
+    const current = get().awaitingTicket;
+    if (!current) return { accepted: false };
+
+    try {
+      const response = await riderApi.getDoorTicket(current.ticket_id);
+      const ticket = response.data;
+      if (!ticket) return { accepted: false };
+
+      if (ticket.status === 'ACCEPTED') {
+        set({ awaitingTicket: { ...ticket } });
+        return { accepted: true };
+      }
+
+      return { accepted: false };
+    } catch {
+      return { accepted: false };
+    }
+  },
+
+  refreshDoorTickets: async () => {
+    try {
+      const response = await riderApi.getPendingDoorTickets();
+      const pending = response.data || [];
+
+      /*
+       * Only ADOPTS a ticket; never clears one. Clearing here would race the
+       * acceptance poll — a ticket that has just been accepted is no longer
+       * pending, and dropping it would take the rider's "accepted" card away
+       * before they saw it.
+       */
+      if (!get().awaitingTicket && pending.length > 0) {
+        set({ awaitingTicket: pending[0] });
+      }
+    } catch {
+      // Silent: the dashboard is still usable without the wait restored.
+    }
+  },
+
+  clearAwaitingTicket: () => set({ awaitingTicket: null }),
+
+  /**
    * Park the offer instead of answering yes or no.
    *
    * The card leaves the offers list and reappears under "On hold", so the
@@ -426,6 +587,8 @@ export const useRiderStore = create<RiderState>((set, get) => ({
       isLoading: false,
       isTogglingDuty: false,
       error: null,
+      awaitingTicket: null,
+      isSubmittingDoorChoice: false,
     });
   },
 }));

@@ -10,10 +10,13 @@ import {
 import { verifyGstin } from '../services/gstVerification.service';
 import {
   listPendingOrders,
+  listScheduledOrders,
   pendingOrderCounts,
   acceptOrder,
+  reschedulePickup,
   RequestSource,
 } from '../services/managerOrderApproval.service';
+import { getPickupTimesForDate } from '../services/pickupSlot.service';
 import { sendSuccess } from '../utils/response';
 import { authenticate, authorize, AuthenticatedRequest } from '../middleware/auth';
 import { AppError } from '../utils/appError';
@@ -76,6 +79,60 @@ router.get('/order-requests/counts', async (_req: Request, res: Response, next: 
 });
 
 /**
+ * GET /api/manager/order-requests/pickup-times?date=YYYY-MM-DD
+ *
+ * The times a collection may be assigned to. The app renders this list rather
+ * than one of its own, and `resolvePickupAssignment` validates against the
+ * same list — so what is offered and what will be accepted are one list.
+ *
+ * `?date` marks each time available or not FOR THAT DAY, in the business
+ * timezone: on today, a time that has already gone by comes back
+ * `available: false`.
+ *
+ * DECLARED BEFORE `/:source`, which would otherwise match "pickup-times" and
+ * answer with a 400 about the tab name.
+ */
+router.get(
+  '/order-requests/pickup-times',
+  async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      const times = await getPickupTimesForDate(req.query.date);
+      sendSuccess(
+        res,
+        times.map((time) => ({
+          id: time.id,
+          label: time.label,
+          // Minutes since midnight, so the app can apply the same cutoff
+          // between fetches — the shape the slot endpoint already returns.
+          start_minutes: time.minutes,
+          available: time.available,
+        })),
+        'Pickup times fetched'
+      );
+    } catch (error) {
+      next(error);
+    }
+  }
+);
+
+/**
+ * GET /api/manager/order-requests/scheduled
+ *
+ * Accepted orders whose collection has not happened yet, soonest first — the
+ * tab a Manager changes a pickup from. Approving an order takes it out of the
+ * pending queues, so this is the only place it can be reached afterwards.
+ *
+ * DECLARED BEFORE `/:source` for the same reason `pickup-times` is.
+ */
+router.get('/order-requests/scheduled', async (_req: Request, res: Response, next: NextFunction) => {
+  try {
+    sendSuccess(res, await listScheduledOrders(), 'Scheduled orders fetched');
+  } catch (error) {
+    next(error);
+  }
+});
+
+/**
  * GET /api/manager/order-requests/:source   (customer | business)
  *
  * The bookings waiting in one tab, oldest first — the order they should be
@@ -91,19 +148,54 @@ router.get('/order-requests/:source', async (req: Request, res: Response, next: 
 });
 
 /**
- * POST /api/manager/order-requests/:orderId/accept
+ * POST /api/manager/order-requests/:orderId/accept   { pickupDate, pickupTime }
  *
  * Accepts one booking: its status becomes ORDER_PLACED, which is what makes
- * it visible to the Sorter and raises the Rider advisory. NOTHING ELSE about
- * the order is touched — no item, price, schedule or address.
+ * it visible to the Sorter and raises the Rider advisory.
+ *
+ * THE COLLECTION IS PART OF THE ACCEPTANCE. Both fields are required — the
+ * service refuses a missing, malformed or past time before the order is
+ * touched — because accepting is the moment the business commits to when it
+ * will collect. Nothing else about the order is changed: no item, price or
+ * address.
  */
 router.post(
   '/order-requests/:orderId/accept',
   async (req: Request, res: Response, next: NextFunction) => {
     try {
       const authReq = req as AuthenticatedRequest;
-      const result = await acceptOrder(req.params.orderId, authReq.user!.id);
-      sendSuccess(res, result, `Order ${result.order_number} accepted`);
+      const result = await acceptOrder(req.params.orderId, authReq.user!.id, {
+        pickupDate: req.body?.pickupDate,
+        pickupTime: req.body?.pickupTime,
+      });
+      sendSuccess(
+        res,
+        result,
+        `Order ${result.order_number} accepted · pickup ${result.pickup_label}`
+      );
+    } catch (error) {
+      next(error);
+    }
+  }
+);
+
+/**
+ * PATCH /api/manager/order-requests/:orderId/pickup   { pickupDate, pickupTime }
+ *
+ * Moves the collection on an order that has already been accepted. The status
+ * is not touched; only the pickup changes, and only on the order named in the
+ * path.
+ */
+router.patch(
+  '/order-requests/:orderId/pickup',
+  async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      const authReq = req as AuthenticatedRequest;
+      const result = await reschedulePickup(req.params.orderId, authReq.user!.id, {
+        pickupDate: req.body?.pickupDate,
+        pickupTime: req.body?.pickupTime,
+      });
+      sendSuccess(res, result, `Pickup updated · ${result.pickup_label}`);
     } catch (error) {
       next(error);
     }

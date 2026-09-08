@@ -334,3 +334,159 @@ export async function resolveDeliverySchedule(
 
   return { deliveryDate, delivery };
 }
+
+/* ===================================================================
+ * THE PICKUP TIMES A MANAGER MAY ASSIGN
+ *
+ * The customer and the business book a two-hour SLOT; a Manager names a
+ * MOMENT -- "4:00 PM" -- because that is the appointment the customer is
+ * told to expect and a two-hour window is not an appointment.
+ *
+ * THE WORKING DAY IS NOT REDEFINED HERE. Both the first and last time below
+ * are derived from `PICKUP_SLOTS`, which remains the single statement of when
+ * Swachham operates: change the slot list and these move with it. That is the
+ * whole reason this is computed rather than typed out.
+ *
+ * As with the slots, the list is served to the app and the same list
+ * validates what comes back, so the two cannot drift apart.
+ * =================================================================== */
+
+/** How finely a Manager may place a collection within the working day. */
+const PICKUP_TIME_STEP_MINUTES = 30;
+
+export interface PickupTime {
+  /** Stable id the app sends back, e.g. "16:00". */
+  id: string;
+  /** What everyone is shown, e.g. "4:00 PM". */
+  label: string;
+  /** The SQL TIME value stored on the order. */
+  value: string;
+  /** Minutes since midnight, for the same cutoff the slots use. */
+  minutes: number;
+}
+
+/** 960 -> "16:00:00". */
+function minutesToTime(minutes: number): string {
+  const pad = (value: number) => String(value).padStart(2, '0');
+  return `${pad(Math.floor(minutes / 60))}:${pad(minutes % 60)}:00`;
+}
+
+/** 960 -> "4:00 PM". The wording is fixed, not the device's locale. */
+export function formatClockLabel(minutes: number): string {
+  const hour24 = Math.floor(minutes / 60);
+  const minute = minutes % 60;
+  const suffix = hour24 >= 12 ? 'PM' : 'AM';
+  const hour12 = hour24 % 12 === 0 ? 12 : hour24 % 12;
+  return `${hour12}:${String(minute).padStart(2, '0')} ${suffix}`;
+}
+
+/**
+ * Every time a collection may be assigned to, through the working day.
+ *
+ * Opens when the first slot opens and stops one step BEFORE the last slot
+ * closes: an appointment made exactly at closing time leaves no window to
+ * keep it in, so the last offer is 6:30 PM for a day that ends at 7:00 PM.
+ */
+export const PICKUP_TIMES: PickupTime[] = (() => {
+  const opens = timeToMinutes(PICKUP_SLOTS[0].start);
+  const closes = timeToMinutes(PICKUP_SLOTS[PICKUP_SLOTS.length - 1].end);
+
+  const times: PickupTime[] = [];
+  for (let minutes = opens; minutes <= closes - PICKUP_TIME_STEP_MINUTES; minutes += PICKUP_TIME_STEP_MINUTES) {
+    times.push({
+      id: minutesToTime(minutes).slice(0, 5),
+      label: formatClockLabel(minutes),
+      value: minutesToTime(minutes),
+      minutes,
+    });
+  }
+  return times;
+})();
+
+/**
+ * The times that may still be assigned on a given date, in the business
+ * timezone — the same shape, and the same rule, as `getSlotsForDate`.
+ *
+ * A past date offers nothing, a future date offers the whole day, and today
+ * offers only what has not yet come round.
+ */
+export async function getPickupTimesForDate(
+  dateInput?: unknown
+): Promise<Array<PickupTime & { available: boolean }>> {
+  const withAvailability = (available: (time: PickupTime) => boolean) =>
+    PICKUP_TIMES.map((time) => ({ ...time, available: available(time) }));
+
+  const date = typeof dateInput === 'string' ? dateInput.trim() : '';
+  if (!date || !DATE_ONLY.test(date)) return withAvailability(() => true);
+
+  const now = await getBusinessNow();
+  if (date < now.date) return withAvailability(() => false);
+  if (date > now.date) return withAvailability(() => true);
+
+  return withAvailability((time) => time.minutes > now.minutes);
+}
+
+/**
+ * A pickup date and time a Manager submitted, validated against the working
+ * day and against the clock.
+ *
+ * THE PAST IS REFUSED HERE, not in the app. The screen offers only what is
+ * still ahead, and this is what makes a request that skipped the screen —
+ * or one that sat on it until the chosen time went by — fail the same way.
+ * Both halves are judged in IST through `getBusinessNow`, never against the
+ * database server's UTC clock.
+ */
+export async function resolvePickupAssignment(input: {
+  pickupDate?: unknown;
+  pickupTime?: unknown;
+}): Promise<{ date: string; time: PickupTime }> {
+  const date = requireDate(
+    input.pickupDate,
+    'Please choose a pickup date.',
+    'Pickup date must be in YYYY-MM-DD form.'
+  );
+
+  const id = typeof input.pickupTime === 'string' ? input.pickupTime.trim() : '';
+  if (!id) throw new AppError('Please choose a pickup time.', 400);
+
+  /*
+   * Accepted as "16:00" or "16:00:00" — the id the list is served with, and
+   * the value a stored assignment reads back as. A Manager changing the time
+   * of an order that already has one is otherwise sending back something the
+   * list would not recognise.
+   */
+  const time = PICKUP_TIMES.find((option) => option.id === id || option.value === id);
+  if (!time) {
+    throw new AppError('That pickup time is not one of the available times.', 400);
+  }
+
+  const now = await getBusinessNow();
+  if (date < now.date) {
+    throw new AppError('Pickup date cannot be in the past.', 400);
+  }
+  if (date === now.date && time.minutes <= now.minutes) {
+    throw new AppError('That pickup time has already passed. Please choose a later time.', 400);
+  }
+
+  return { date, time };
+}
+
+/**
+ * The operational window for an assigned time, for the `pickups` row.
+ *
+ * `pickups` stores a start and an end because that is the shape a booked slot
+ * has had since the first schema, and the rider and the delivery-turnaround
+ * rule both read it. An assigned time is a single moment, so the window it
+ * implies is one slot long — the same two hours the booking slots use, taken
+ * from the slot list rather than restated — and it never runs past closing.
+ */
+export function pickupWindowFor(time: PickupTime): { start: string; end: string } {
+  const firstSlot = PICKUP_SLOTS[0];
+  const slotLength = timeToMinutes(firstSlot.end) - timeToMinutes(firstSlot.start);
+  const closes = timeToMinutes(PICKUP_SLOTS[PICKUP_SLOTS.length - 1].end);
+
+  return {
+    start: time.value,
+    end: minutesToTime(Math.min(time.minutes + slotLength, closes)),
+  };
+}

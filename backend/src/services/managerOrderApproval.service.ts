@@ -8,6 +8,11 @@ import {
   createJobForOrder,
   dispatchJob,
 } from './dispatch.service';
+import {
+  PickupTime,
+  pickupWindowFor,
+  resolvePickupAssignment,
+} from './pickupSlot.service';
 
 /**
  * MANAGER APPROVAL — the gate every booking now passes through.
@@ -101,6 +106,18 @@ export interface PendingOrderRow {
   pickup_date: string | null;
   pickup_slot_start: string | null;
   pickup_slot_end: string | null;
+  /**
+   * THE PICKUP A MANAGER ASSIGNED, which is a different thing from the three
+   * fields above.
+   *
+   * Those are what the customer or the business asked for when they booked —
+   * and on a Business order they are a placeholder the app sent only because
+   * the create endpoint still insists on a schedule. These two are NULL until
+   * a Manager has actually named a collection, which is what lets every
+   * screen show nothing rather than guess.
+   */
+  assigned_pickup_date: string | null;
+  assigned_pickup_time: string | null;
   special_notes: string | null;
   created_at: string;
 }
@@ -138,7 +155,11 @@ export async function listPendingOrders(source: RequestSource): Promise<PendingO
             (SELECT COUNT(*) FROM order_items oi WHERE oi.order_id = o.id) AS item_count,
             pk.scheduled_date  AS pickup_date,
             pk.time_slot_start AS pickup_slot_start,
-            pk.time_slot_end   AS pickup_slot_end
+            pk.time_slot_end   AS pickup_slot_end,
+            -- Formatted here so a DATE column cannot reach the app as a
+            -- timestamp the device then shifts into another day.
+            DATE_FORMAT(o.assigned_pickup_date, '%Y-%m-%d') AS assigned_pickup_date,
+            o.assigned_pickup_time
        FROM orders o
        LEFT JOIN users u           ON u.id = o.user_id
        LEFT JOIN business_users bu ON bu.id = o.business_user_id
@@ -171,6 +192,84 @@ export async function listPendingOrders(source: RequestSource): Promise<PendingO
     pickup_date: row.pickup_date ?? null,
     pickup_slot_start: row.pickup_slot_start ?? null,
     pickup_slot_end: row.pickup_slot_end ?? null,
+    assigned_pickup_date: row.assigned_pickup_date ?? null,
+    assigned_pickup_time: row.assigned_pickup_time ?? null,
+    special_notes: row.special_notes ?? null,
+    created_at: row.created_at,
+  }));
+}
+
+/**
+ * The statuses at which an assigned collection can still be moved.
+ *
+ * An order past these has been collected — the van has been — so there is
+ * nothing left to reschedule. Kept beside the list that shows them and the
+ * guard in `reschedulePickup`, so what is offered and what is allowed are
+ * one rule rather than two that can drift.
+ */
+const RESCHEDULABLE_STATUSES = ['ORDER_PLACED', 'PICKUP_SCHEDULED', 'PICKUP_ASSIGNED'];
+
+/**
+ * Accepted orders whose collection has not happened yet, soonest first.
+ *
+ * THE THIRD TAB, and the answer to "a Manager changes the pickup later".
+ * Approving takes an order out of the pending queue, so without this there
+ * would be an endpoint for rescheduling and nowhere to reach it from.
+ *
+ * Deliberately NOT split by source. The pending queues are split because a
+ * Manager works through customer bookings and business bookings as separate
+ * jobs; this list answers a different question — "what are we collecting, and
+ * is any of it wrong?" — which is asked across both at once. The source is
+ * still returned per row, so the tab can label each one.
+ */
+export async function listScheduledOrders(): Promise<PendingOrderRow[]> {
+  const result = await query<any>(
+    `SELECT o.id, o.order_number, o.status, o.total, o.laundry_type,
+            o.total_weight_kg, o.special_notes, o.created_at,
+            o.business_user_id,
+            COALESCE(
+              NULLIF(TRIM(b.establishment_name), ''), b.name,
+              NULLIF(TRIM(u.name), ''),
+              NULLIF(TRIM(o.placed_by_mobile), ''),
+              'Customer'
+            ) AS customer_name,
+            COALESCE(bu.mobile_number, u.mobile_number, o.placed_by_mobile) AS customer_contact,
+            (SELECT COUNT(*) FROM order_items oi WHERE oi.order_id = o.id) AS item_count,
+            pk.scheduled_date  AS pickup_date,
+            pk.time_slot_start AS pickup_slot_start,
+            pk.time_slot_end   AS pickup_slot_end,
+            DATE_FORMAT(o.assigned_pickup_date, '%Y-%m-%d') AS assigned_pickup_date,
+            o.assigned_pickup_time
+       FROM orders o
+       LEFT JOIN users u           ON u.id = o.user_id
+       LEFT JOIN business_users bu ON bu.id = o.business_user_id
+       LEFT JOIN businesses b      ON b.id = bu.business_id
+       LEFT JOIN pickups pk        ON pk.order_id = o.id
+      WHERE o.assigned_pickup_date IS NOT NULL
+        AND o.status IN (${RESCHEDULABLE_STATUSES.map(() => '?').join(',')})
+      ORDER BY o.assigned_pickup_date ASC, o.assigned_pickup_time ASC, o.id ASC
+      LIMIT 100`,
+    RESCHEDULABLE_STATUSES
+  );
+
+  return result.rows.map((row) => ({
+    id: String(row.id),
+    order_number: String(row.order_number ?? ''),
+    source: row.business_user_id ? 'BUSINESS' : 'CUSTOMER',
+    customer_name: String(row.customer_name ?? ''),
+    customer_contact: row.customer_contact ?? null,
+    status: String(row.status),
+    total: Number(row.total ?? 0),
+    item_count: Number(row.item_count ?? 0),
+    total_weight_kg: row.total_weight_kg === null || row.total_weight_kg === undefined
+      ? null
+      : Number(row.total_weight_kg),
+    laundry_type: row.laundry_type ?? null,
+    pickup_date: row.pickup_date ?? null,
+    pickup_slot_start: row.pickup_slot_start ?? null,
+    pickup_slot_end: row.pickup_slot_end ?? null,
+    assigned_pickup_date: row.assigned_pickup_date ?? null,
+    assigned_pickup_time: row.assigned_pickup_time ?? null,
     special_notes: row.special_notes ?? null,
     created_at: row.created_at,
   }));
@@ -195,11 +294,79 @@ export async function pendingOrderCounts(): Promise<{ CUSTOMER: number; BUSINESS
 }
 
 /**
+ * THE PICKUP, WRITTEN IN TWO PLACES BECAUSE THEY ANSWER TWO QUESTIONS.
+ *
+ *   `orders.assigned_pickup_*`  the Manager's DECISION. NULL until one is
+ *                               made, which is what every screen tests to
+ *                               decide whether to show a collection at all.
+ *
+ *   `pickups`                   the OPERATIONAL schedule, which already
+ *                               existed and which the rider and the
+ *                               delivery-turnaround rule read. Every order
+ *                               has a row from creation -- on the Business
+ *                               side a deliberate placeholder -- so it can
+ *                               never mean "not assigned yet", but it must
+ *                               still agree with the decision.
+ *
+ * Both in the CALLER'S TRANSACTION, so the two can never disagree: an order
+ * cannot come out of this with a decision recorded and the shop floor still
+ * working to the placeholder, or the reverse.
+ *
+ * `status` is deliberately left alone on the existing `pickups` row. A
+ * collection already marked COMPLETED must not be dragged back to SCHEDULED
+ * by a Manager editing the time afterwards.
+ */
+async function writePickupAssignment(
+  connection: any,
+  orderId: string,
+  managerId: string,
+  date: string,
+  time: PickupTime
+): Promise<void> {
+  await connection.execute(
+    `UPDATE orders
+        SET assigned_pickup_date = ?, assigned_pickup_time = ?,
+            pickup_assigned_by = ?, pickup_assigned_at = NOW(),
+            updated_at = NOW()
+      WHERE id = ?`,
+    [date, time.value, managerId, orderId]
+  );
+
+  const window = pickupWindowFor(time);
+  await connection.execute(
+    `INSERT INTO pickups (order_id, scheduled_date, time_slot_start, time_slot_end, status)
+     VALUES (?, ?, ?, ?, 'SCHEDULED')
+     ON DUPLICATE KEY UPDATE
+       scheduled_date  = VALUES(scheduled_date),
+       time_slot_start = VALUES(time_slot_start),
+       time_slot_end   = VALUES(time_slot_end)`,
+    [orderId, date, window.start, window.end]
+  );
+}
+
+/** The order id as it must be, or the error the Manager should see. */
+function requireOrderId(orderId: unknown): string {
+  const id = String(orderId ?? '').trim();
+  if (!/^\d+$/.test(id)) {
+    throw new AppError('A valid order is required.', 400);
+  }
+  return id;
+}
+
+/**
  * A Manager accepts one booking. The order becomes ORDER_PLACED.
  *
- * ONE TRANSACTION for the status, the audit columns and the history row, so
- * an order can never be half-accepted -- placed without a record of who
- * placed it, or recorded as accepted while still pending.
+ * THE COLLECTION IS NAMED AT THE SAME MOMENT. A Manager cannot accept without
+ * choosing a pickup date and time: the two are one decision -- "yes, and we
+ * will collect it then" -- and an order that is placed with nobody having
+ * said when it will be collected is exactly what this step exists to prevent.
+ * `resolvePickupAssignment` runs BEFORE the transaction opens, so a bad or
+ * past time is refused without ever locking the row.
+ *
+ * ONE TRANSACTION for the status, the audit columns, the pickup and the
+ * history row, so an order can never be half-accepted -- placed without a
+ * record of who placed it, recorded as accepted while still pending, or
+ * accepted with no collection against it.
  *
  * THE STATUS IS CHANGED WHERE IT IS STORED, so every reader picks it up with
  * no further work: the Sorter queue, the customer tracker, the Orders list,
@@ -212,12 +379,22 @@ export async function pendingOrderCounts(): Promise<{ CUSTOMER: number; BUSINESS
  */
 export async function acceptOrder(
   orderId: string,
-  managerId: string
-): Promise<{ id: string; order_number: string; status: string; source: RequestSource }> {
-  const id = String(orderId ?? '').trim();
-  if (!/^\d+$/.test(id)) {
-    throw new AppError('A valid order is required.', 400);
-  }
+  managerId: string,
+  pickupInput: { pickupDate?: unknown; pickupTime?: unknown }
+): Promise<{
+  id: string;
+  order_number: string;
+  status: string;
+  source: RequestSource;
+  assigned_pickup_date: string;
+  assigned_pickup_time: string;
+  pickup_label: string;
+}> {
+  const id = requireOrderId(orderId);
+
+  // Before the transaction: nothing is locked while the clock is consulted,
+  // and a rejected time costs the queue nothing.
+  const { date, time } = await resolvePickupAssignment(pickupInput);
 
   const connection = await getClient();
   let order: any;
@@ -254,10 +431,20 @@ export async function acceptOrder(
       [APPROVED_STATUS, managerId, id, PENDING_STATUS]
     );
 
+    // The collection, in the same transaction as the acceptance it is part of.
+    await writePickupAssignment(connection, id, managerId, date, time);
+
     await connection.execute(
       `INSERT INTO order_status_history (order_id, status, changed_by, notes)
-       VALUES (?, ?, ?, 'Accepted by manager')`,
-      [id, APPROVED_STATUS, managerId]
+       VALUES (?, ?, ?, ?)`,
+      [
+        id,
+        APPROVED_STATUS,
+        managerId,
+        // The trail says WHAT was decided, not merely that a decision
+        // happened — the pickup is the substance of this one.
+        `Accepted by manager · pickup ${date} ${time.label}`,
+      ]
     );
 
     await connection.commit();
@@ -284,7 +471,8 @@ export async function acceptOrder(
       id,
       APPROVED_STATUS,
       'Order Placed!',
-      `Your order ${order.order_number} has been confirmed and is now being arranged.`
+      `Your order ${order.order_number} has been confirmed. `
+        + `Pickup is scheduled for ${formatPickupSentence(date, time.label)}.`
     ).catch((error) => logger.error('[ManagerApproval] notification failed:', error));
   }
 
@@ -330,6 +518,7 @@ export async function acceptOrder(
 
   logger.info(
     `[ManagerApproval] order ${order.order_number} (${source}) accepted by manager ${managerId}`
+      + ` · pickup ${date} ${time.label}`
   );
 
   return {
@@ -337,5 +526,139 @@ export async function acceptOrder(
     order_number: String(order.order_number),
     status: APPROVED_STATUS,
     source,
+    assigned_pickup_date: date,
+    assigned_pickup_time: time.value,
+    pickup_label: `${formatPickupSentence(date, time.label)}`,
+  };
+}
+
+/** "10 September 2026 at 4:00 PM" — for notifications and log lines. */
+function formatPickupSentence(date: string, timeLabel: string): string {
+  const MONTHS = [
+    'January', 'February', 'March', 'April', 'May', 'June',
+    'July', 'August', 'September', 'October', 'November', 'December',
+  ];
+  const [year, month, day] = date.split('-').map(Number);
+  const readable = MONTHS[month - 1] ? `${day} ${MONTHS[month - 1]} ${year}` : date;
+  return `${readable} at ${timeLabel}`;
+}
+
+/**
+ * A Manager changes the collection on an order that is already accepted.
+ *
+ * THE SAME WRITE AS ACCEPTANCE, deliberately: one function puts a pickup on
+ * an order, so a rescheduled collection cannot end up recorded differently
+ * from an originally assigned one, and `pickups` is kept in step either way.
+ *
+ * IT DOES NOT TOUCH THE STATUS. Rescheduling is not a step in the order's
+ * life; the order stays exactly where it is on the ladder, and the customer
+ * and the business simply see a new time.
+ *
+ * ONLY ONE ORDER. The id is the whole predicate — every write here names it —
+ * so a change to one booking cannot reach another.
+ *
+ * REFUSED ONCE THE ORDER IS PAST COLLECTING. A cancelled order has no
+ * collection to arrange, and one already picked up has been collected: moving
+ * either would be recording something that did not happen.
+ */
+export async function reschedulePickup(
+  orderId: string,
+  managerId: string,
+  pickupInput: { pickupDate?: unknown; pickupTime?: unknown }
+): Promise<{
+  id: string;
+  order_number: string;
+  status: string;
+  assigned_pickup_date: string;
+  assigned_pickup_time: string;
+  pickup_label: string;
+}> {
+  const id = requireOrderId(orderId);
+  const { date, time } = await resolvePickupAssignment(pickupInput);
+
+  const connection = await getClient();
+  let order: any;
+  try {
+    await connection.beginTransaction();
+
+    const [rows]: any = await connection.execute(
+      `SELECT id, order_number, status, user_id, business_user_id
+         FROM orders WHERE id = ? FOR UPDATE`,
+      [id]
+    );
+    order = rows[0];
+    if (!order) throw new AppError('Order not found.', 404);
+
+    /*
+     * THE SAME RULE THE THIRD TAB LISTS BY, so a Manager is never shown an
+     * order they cannot actually reschedule, and a stale screen is refused
+     * rather than allowed to record a collection that already happened.
+     */
+    if (!RESCHEDULABLE_STATUSES.includes(String(order.status))) {
+      throw new AppError(
+        order.status === 'CANCELLED'
+          ? 'This order was cancelled, so its pickup cannot be changed.'
+          : order.status === PENDING_STATUS
+            ? 'This booking has not been accepted yet. Accept it to set its pickup.'
+            : 'This order has already been collected, so its pickup can no longer be changed.',
+        409
+      );
+    }
+
+    await writePickupAssignment(connection, id, managerId, date, time);
+
+    await connection.execute(
+      `INSERT INTO order_status_history (order_id, status, changed_by, notes)
+       VALUES (?, ?, ?, ?)`,
+      [
+        id,
+        // The order's CURRENT status, not a new one: this row records a
+        // change of plan at the point the order already stands.
+        order.status,
+        managerId,
+        `Pickup rescheduled by manager · ${date} ${time.label}`,
+      ]
+    );
+
+    await connection.commit();
+  } catch (error) {
+    await connection.rollback();
+    throw error;
+  } finally {
+    connection.release();
+  }
+
+  // After the commit, and unable to fail it — as in `acceptOrder`.
+  if (order.user_id) {
+    void createNotification(
+      String(order.user_id),
+      id,
+      String(order.status),
+      'Pickup time updated',
+      `The pickup for order ${order.order_number} is now `
+        + `${formatPickupSentence(date, time.label)}.`
+    ).catch((error) => logger.error('[ManagerApproval] reschedule notification failed:', error));
+  }
+
+  // The event every screen watching this order already listens for, so the
+  // new time arrives without either app knowing a Manager was involved.
+  socketService.emitOrderStatusUpdate(id, {
+    orderId: id,
+    orderNumber: order.order_number,
+    status: String(order.status),
+  });
+
+  logger.info(
+    `[ManagerApproval] order ${order.order_number} pickup rescheduled by manager ${managerId}`
+      + ` · ${date} ${time.label}`
+  );
+
+  return {
+    id,
+    order_number: String(order.order_number),
+    status: String(order.status),
+    assigned_pickup_date: date,
+    assigned_pickup_time: time.value,
+    pickup_label: formatPickupSentence(date, time.label),
   };
 }

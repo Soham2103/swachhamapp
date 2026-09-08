@@ -16,6 +16,7 @@ import { Ionicons } from '@expo/vector-icons';
 import { COLORS, SPACING, TYPOGRAPHY, BORDER_RADIUS, SHADOWS } from '../../constants/theme';
 import BusinessHeader from '../../components/business/BusinessHeader';
 import businessOrderApi, { BusinessOrderSummary } from '../../services/businessOrderApi';
+import businessDoorApi from '../../services/businessDoorApi';
 import { extractErrorMessage } from '../../services/api';
 
 /**
@@ -101,10 +102,29 @@ export default function BusinessOrdersScreen({ navigation }: any) {
     }
   }, []);
 
+  /**
+   * How many pickups are waiting on this business, for the header dot.
+   *
+   * Separate from `load` and deliberately silent on failure: this is a badge,
+   * and a badge that cannot be fetched must not put an error over the order
+   * list.
+   */
+  const [pendingTickets, setPendingTickets] = useState(0);
+
+  const loadPendingTickets = useCallback(async () => {
+    try {
+      const response = await businessDoorApi.getInboxCounts();
+      setPendingTickets(response.data?.pending_tickets ?? 0);
+    } catch {
+      // Ignored: the orders list is the screen, the dot is a hint.
+    }
+  }, []);
+
   useFocusEffect(
     useCallback(() => {
       load();
-    }, [load])
+      void loadPendingTickets();
+    }, [load, loadPendingTickets])
   );
 
   const activeFilter = ORDER_FILTERS.find((option) => option.key === filter) || ORDER_FILTERS[0];
@@ -230,6 +250,26 @@ export default function BusinessOrdersScreen({ navigation }: any) {
       <BusinessHeader
         title="Your Orders"
         onBack={canGoBack ? () => navigation.goBack() : undefined}
+        /*
+         * The way in to Pickup Approvals. It is HERE and not on a tab of its
+         * own because a rider raising a ticket is blocked until it is
+         * answered, and this is the screen a business is already on when it
+         * cares about a collection.
+         *
+         * The dot appears only when something is actually waiting, so the
+         * header is unchanged on the ordinary day.
+         */
+        action={
+          <TouchableOpacity
+            style={styles.approvalsButton}
+            onPress={() => navigation.navigate('BusinessDoorTicketsScreen')}
+            activeOpacity={0.85}
+            accessibilityLabel="Pickup approvals"
+          >
+            <Ionicons name="clipboard-outline" size={20} color={COLORS.Primary} />
+            {pendingTickets > 0 ? <View style={styles.approvalsDot} /> : null}
+          </TouchableOpacity>
+        }
       />
 
       {isLoading ? (
@@ -297,6 +337,28 @@ const SHOW_TOP_BUTTON_AFTER = 400;
 
 const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: COLORS.Background },
+
+  // ---- pickup approvals entry point ----
+  approvalsButton: {
+    width: 40,
+    height: 40,
+    alignItems: 'center',
+    justifyContent: 'center',
+    borderRadius: BORDER_RADIUS.md,
+    backgroundColor: COLORS.Surface,
+    borderWidth: 1,
+    borderColor: COLORS.Border,
+  },
+  /** Present only when something is waiting — see the header comment. */
+  approvalsDot: {
+    position: 'absolute',
+    top: 6,
+    right: 6,
+    width: 9,
+    height: 9,
+    borderRadius: 5,
+    backgroundColor: COLORS.Warning,
+  },
 
   /**
    * Floating, bottom-centre, above the list rather than inside it — a footer
