@@ -7,6 +7,7 @@ import { logger } from '../utils/logger';
 import {
   displayInvoiceNumber,
   invoiceNumberFor,
+  issuedInvoiceNumberFor,
   parseLaundryType,
   buildInvoice,
 } from '../services/gstInvoice.service';
@@ -221,10 +222,61 @@ router.get(
        * out for the same reason.
        */
       const cycle = await cycleForBusiness(business.id);
+
+      /*
+       * THE NUMBER EACH ORDER'S INVOICE WAS ACTUALLY ISSUED UNDER.
+       *
+       * This used to DERIVE the number from the business and the period, which
+       * worked while an invoice number was a pure function of those. It is not
+       * one any more — the digits come from a counter — so a derived
+       * `SWC/INV/0047` would name no invoice that exists, and would sit in this
+       * list beside the real `SWCH/INV/27` the Invoices tab shows for the very
+       * same period.
+       *
+       * So the issued invoices are read ONCE, keyed by period and laundry type,
+       * and each order is matched to its own. An order in a period that has not
+       * been invoiced yet gets null, which the app already renders as "—": the
+       * honest answer, rather than a number nothing was issued under.
+       */
+      const issued = await query<{
+        invoice_number: string;
+        period_from: unknown;
+        period_to: unknown;
+        laundry_type: string | null;
+      }>(
+        `SELECT invoice_number, period_from, period_to, laundry_type
+           FROM business_invoices
+          WHERE business_id = ?
+          ORDER BY id ASC`,
+        [business.id]
+      );
+      const dateOnly = (value: unknown): string =>
+        value instanceof Date
+          ? `${value.getFullYear()}-${String(value.getMonth() + 1).padStart(2, '0')}-${String(
+              value.getDate()
+            ).padStart(2, '0')}`
+          : String(value ?? '').slice(0, 10);
+      // Later rows win, so a re-issued invoice's current number is the one
+      // shown — the same rule the Invoices tab's own de-duplication follows.
+      const issuedByKey = new Map<string, string>();
+      for (const row of issued.rows) {
+        const key = `${dateOnly(row.period_from)}_${dateOnly(row.period_to)}_${row.laundry_type ?? ''}`;
+        issuedByKey.set(key, row.invoice_number);
+      }
+
       const invoiceNumberOf = (row: any): string | null => {
         if (row.status === 'CANCELLED' || !row.order_date) return null;
         const period = periodFor(cycle, String(row.order_date));
-        return invoiceNumberFor(business.id, period.from, period.to);
+        /*
+         * The order's own laundry type first — Hotel and Guest are separate
+         * invoices over the same dates — then an untyped invoice, which is what
+         * a period billed before the split was issued as.
+         */
+        return (
+          issuedByKey.get(`${period.from}_${period.to}_${row.laundry_type ?? ''}`) ??
+          issuedByKey.get(`${period.from}_${period.to}_`) ??
+          null
+        );
       };
 
       sendSuccess(
@@ -544,7 +596,22 @@ router.get(
       const to = asString(req.query.to);
       if (!from || !to) throw new AppError('A period is required.', 400);
 
-      const full = `SWC/INV/${String(business.id).padStart(4, '0')}/${from.replace(/-/g, '')}-${to.replace(/-/g, '')}`;
+      /*
+       * THE ISSUED NUMBER, when this period has one.
+       *
+       * The legacy string was built inline here, which named the invoice
+       * correctly only while a number could be derived from the business and
+       * the dates. It comes from a counter now, so the issued number is read;
+       * `laundry_type` picks between the Hotel and the Guest invoice for the
+       * period, and its absence asks for the untyped one, exactly as before.
+       *
+       * A period with no invoice still answers with the derived string rather
+       * than nothing, so a screen asking only for a label keeps working.
+       */
+      const laundryType = parseLaundryType(req.query.laundry_type);
+      const full =
+        (await issuedInvoiceNumberFor(String(business.id), from, to, laundryType)) ??
+        invoiceNumberFor(String(business.id), from, to, laundryType);
       sendSuccess(
         res,
         { invoice_number: full, invoice_number_display: displayInvoiceNumber(full) },
@@ -634,7 +701,20 @@ router.get(
         // Re-issued with the deduction it was issued under, so a stored
         // invoice reopens as the document that was sent rather than at full
         // price. 0 for every invoice that never had one.
-        stored.discount_percent
+        stored.discount_percent,
+        // Not an issue: reopening a stored invoice takes no number.
+        false,
+        /*
+         * EXACTLY THE PERIOD ON THE ROW.
+         *
+         * This is the document of record being reopened, not a new invoice, so
+         * its dates are rendered as they were issued rather than resolved
+         * against today's billing cycle. An invoice raised for 1–30 August
+         * before periods were pinned to the cycle spans two of a fortnightly
+         * account's periods; generation rightly refuses that, and reopening
+         * must not — it would leave an already-issued invoice unopenable.
+         */
+        true
       );
       const pdf = await renderInvoicePdf(invoice);
       const fileName = invoiceFileName(invoice);
@@ -646,6 +726,10 @@ router.get(
       res.setHeader('Content-Type', 'application/pdf');
       res.setHeader('Content-Disposition', `attachment; filename="${fileName}"`);
       res.setHeader('Content-Length', String(pdf.length));
+      // Re-rendered on every request, so two identical URLs can legitimately
+      // return different bytes — see the note on the invoice PDF in
+      // superAdmin.routes.ts. Nothing may serve this from a cache.
+      res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
       res.end(pdf);
     } catch (error) {
       next(error);

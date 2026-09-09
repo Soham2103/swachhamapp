@@ -2,7 +2,7 @@ import { query } from '../config/database';
 import { config } from '../config/env';
 import { AppError } from '../utils/appError';
 import { logger } from '../utils/logger';
-import { periodForBusiness, BillingCycle } from './billingCycle.service';
+import { periodForBusiness, periodFor, BillingCycle } from './billingCycle.service';
 import { buildInvoiceUpiPayment, UpiPayment } from './upiPayment.service';
 
 /**
@@ -78,7 +78,16 @@ export interface InvoiceLine {
   unit: string;
   /** Price per unit, exclusive of tax — the "Price/ unit" column. */
   rate: number;
-  /** What the order actually charged for this line, before tax. Drives totals. */
+  /**
+   * The pre-tax value of this line, and the figure every total is built from.
+   *
+   * IT IS THE SAME NUMBER AS `amount`, deliberately. It used to be
+   * `SUM(order_items.total_price)` while `amount` was quantity x rate, so an
+   * invoice carried two per-line figures and added the columns up from the one
+   * it did not print — which is how a Sub Total that did not equal the Amount
+   * column above it was possible at all. There is now one line value: the
+   * document prints it, the subtotal sums it and the tax is taken on it.
+   */
   taxable: number;
   /**
    * Tax on this line.
@@ -92,12 +101,22 @@ export interface InvoiceLine {
    * The "Amount" column: QUANTITY x RATE, exclusive of tax.
    *
    * Stated as the multiplication the reader can do in their head from the two
-   * columns beside it. It is deliberately not the tax-inclusive figure it used
-   * to be — an Amount that did not equal Quantity x Price/unit is the thing
-   * this replaces — and deliberately not `taxable`, which is what the order
-   * recorded and may differ if a line was ever adjusted.
+   * columns beside it, and — since it is `taxable` — also the figure the Sub
+   * Total is the sum of. The column, the total closing the column and the Sub
+   * Total in the summary block are therefore one number three times over,
+   * rather than three separately-written expressions that agree by luck.
    */
   amount: number;
+  /**
+   * What `order_items.total_price` recorded for this line, for reconciliation.
+   *
+   * NOT USED BY ANY TOTAL. It is the charge the orders behind the line stored,
+   * kept beside the billed figure so a divergence between the two is visible
+   * (it is also logged) instead of silently landing in the subtotal. On every
+   * line whose stored price is its quantity x its rate — which is what the
+   * order writers produce — it is identical to `amount`.
+   */
+  recorded_amount: number;
 }
 
 export interface InvoiceOrderRef {
@@ -120,30 +139,55 @@ export interface InvoiceOrderRef {
  */
 /** The prefix that says which kind of invoice this is. */
 const TYPE_PREFIX: Record<InvoiceLaundryType, string> = {
-  hotel: 'SWC/HL/INV',
-  guest: 'SWC/GL/INV',
+  hotel: 'SWCH/INV',
+  guest: 'SWCG/INV',
 };
 /** An invoice covering both types, which only pre-split callers produce. */
 const UNTYPED_PREFIX = 'SWC/INV';
 
 /**
- * The number an invoice is ISSUED under: a prefix for the type, and one
- * global serial.
+ * THE PREFIXES THE PREVIOUS SCHEME USED, kept so its numbers stay readable.
  *
- *   SWC/HL/INV/0059   hotel
- *   SWC/GL/INV/0060   guest laundry
+ * Nothing new is issued under them. They exist for `displayInvoiceNumber`,
+ * which has to recognise an already-issued `SWC/HL/INV/0059` and show it
+ * whole — an invoice's number is permanent, and a number already printed on a
+ * document and recorded against a payment cannot be re-formatted later.
+ */
+const LEGACY_SERIAL_NUMBER = /^SWC\/(HL|GL)\/INV\//;
+
+/**
+ * The current shape: a type prefix and the business's own running number,
+ * with nothing after it. `SWC/INV/27` is the untyped form of the same thing.
  *
- * THE SERIAL IS THE WHOLE POINT. It is allocated once, from one counter, for
- * the entire application — not per business and not per type — so the digits
- * run 0059, 0060, 0061 whoever issues the next invoice and whichever kind it
- * is. `allocateInvoiceSerial` below is what hands them out.
+ * Anchored at BOTH ends so it cannot match the original
+ * `SWC/INV/0025/20260801-20260831`, which starts identically and must still
+ * be trimmed for display.
+ */
+const SERIAL_NUMBER = /^SWC[HG]?\/INV\/\d+$/;
+
+/**
+ * The number an invoice is ISSUED under: a prefix for the type, and the
+ * business's own running number.
+ *
+ *   SWCH/INV/27   hotel
+ *   SWCG/INV/28   guest laundry
+ *
+ * ONE SEQUENCE PER BUSINESS, SHARED BY BOTH TYPES. The prefix is the only
+ * thing the laundry type decides. The digits come from a counter held against
+ * the business, so an account's invoices run 1, 2, 3, 4 in the order they were
+ * issued whether each one is a Hotel or a Guest invoice — a Guest invoice
+ * never restarts the numbering and never runs in parallel with the Hotel one.
+ * `allocateBusinessSerial` below is what hands them out.
+ *
+ * NOT PADDED. `SWCH/INV/27` is the whole number; a 0027 would make the same
+ * invoice two different strings depending on who wrote it down.
  */
 export function invoiceNumberForSerial(
   serial: number,
   laundryType?: InvoiceLaundryType | null
 ): string {
   const prefix = laundryType ? TYPE_PREFIX[laundryType] : UNTYPED_PREFIX;
-  return `${prefix}/${String(serial).padStart(4, '0')}`;
+  return `${prefix}/${serial}`;
 }
 
 /**
@@ -201,100 +245,250 @@ export async function resolveInvoiceNumber(
   laundryType: InvoiceLaundryType | null,
   opts: { allocate: boolean }
 ): Promise<{ invoiceNumber: string; serial: number | null }> {
-  // Already issued? Then it keeps what it was issued under, whatever shape.
-  const existing = await query<{ invoice_number: string; serial: number | null }>(
-    `SELECT invoice_number, serial
-       FROM business_invoices
-      WHERE business_id = ? AND period_from = ? AND period_to = ?
-        AND ((laundry_type IS NULL AND ? IS NULL) OR laundry_type = ?)
-      LIMIT 1`,
-    [businessId, from, to, laundryType, laundryType]
-  );
-  if (existing.rows.length > 0) {
-    const row = existing.rows[0];
+  /*
+   * ALREADY ISSUED? THEN IT KEEPS WHAT IT WAS ISSUED UNDER, whatever shape.
+   *
+   * This branch is what makes an invoice number permanent across every change
+   * to the numbering scheme — including this one. An invoice issued as
+   * `SWC/HL/INV/0059` reopens, re-renders and takes payment as that string;
+   * it is never restated as `SWCH/INV/…` because a document has already been
+   * sent under the old number and receipts are recorded against it.
+   */
+  const existing = await findInvoiceForPeriod(businessId, from, to, laundryType);
+  if (existing) {
+    // The business's own number when it has one; the old global serial is
+    // what an invoice issued before this scheme reports.
+    const serial = existing.business_serial ?? existing.serial;
     return {
-      invoiceNumber: row.invoice_number,
-      serial: row.serial === null ? null : Number(row.serial),
+      invoiceNumber: existing.invoice_number,
+      serial: serial === null ? null : Number(serial),
     };
   }
 
   /*
-   * ALREADY CLAIMED A SERIAL?
+   * ALREADY CLAIMED A NUMBER?
    *
-   * The invoice row is written after the document is rendered, and that write
-   * is not awaited — so between rendering and recording, and for good if the
-   * record ever fails, `business_invoices` cannot answer "what number did
-   * this invoice take?". The claim can, from the moment the serial is handed
-   * out, which is what stops a second download minting a second number.
+   * The claim is written the moment a number is allocated, before the invoice
+   * row exists — so if recording the invoice fails, `business_invoices` cannot
+   * answer "what number did this take?" and the claim can. That is what stops
+   * a second download of the same invoice minting a second number.
    */
   const typeKey = laundryType ?? '';
-  const claimed = await query<{ serial: number }>(
-    `SELECT serial FROM invoice_serial_claims
+  const claimed = await query<{ serial: number | null; business_serial: number | null }>(
+    `SELECT serial, business_serial FROM invoice_serial_claims
       WHERE business_id = ? AND period_from = ? AND period_to = ? AND laundry_type = ?
       LIMIT 1`,
     [businessId, from, to, typeKey]
   );
   if (claimed.rows.length > 0) {
-    const serial = Number(claimed.rows[0].serial);
+    const row = claimed.rows[0];
+    /*
+     * A claim made under the OLD scheme has only a global serial, and the
+     * number it stands for is the old-format one — rebuilding it with today's
+     * prefixes would hand back a number the claim was never for.
+     */
+    if (row.business_serial === null) {
+      const serial = Number(row.serial);
+      return { invoiceNumber: legacySerialNumber(serial, laundryType), serial };
+    }
+    const serial = Number(row.business_serial);
     return { invoiceNumber: invoiceNumberForSerial(serial, laundryType), serial };
   }
 
   if (!opts.allocate) {
-    // A peek, for the preview only: what the next one would be, without
-    // taking it. Two operators previewing at once may see the same figure;
-    // neither has reserved it, and issuing is what decides.
+    /*
+     * A peek, for the PREVIEW only: what this business's next invoice would be
+     * numbered, without taking it. Two operators previewing at once may see
+     * the same figure; neither has reserved it, and issuing is what decides.
+     *
+     * No row yet means this business has never been issued an invoice, and
+     * its first one is 1 — the same value `allocateBusinessSerial` would
+     * create the counter with.
+     */
     const peek = await query<{ next_value: number }>(
-      `SELECT next_value FROM invoice_number_sequence WHERE id = 1`
+      `SELECT next_value FROM business_invoice_sequence WHERE business_id = ?`,
+      [businessId]
     );
     const next = peek.rows.length > 0 ? Number(peek.rows[0].next_value) : 1;
     return { invoiceNumber: invoiceNumberForSerial(next, laundryType), serial: null };
   }
 
-  const allocated = await allocateInvoiceSerial();
+  const allocated = await allocateBusinessSerial(businessId);
   /*
    * The claim is written under a unique key on the identity, so if a second
-   * request for the same invoice got here first its serial stands and ours is
+   * request for the same invoice got here first its number stands and ours is
    * simply not used. Re-reading rather than trusting `allocated` is what makes
    * both requests agree on one number.
    */
   await query(
-    `INSERT INTO invoice_serial_claims (business_id, period_from, period_to, laundry_type, serial)
+    `INSERT INTO invoice_serial_claims
+       (business_id, period_from, period_to, laundry_type, business_serial)
      VALUES (?, ?, ?, ?, ?)
-     ON DUPLICATE KEY UPDATE serial = serial`,
+     ON DUPLICATE KEY UPDATE business_serial = COALESCE(business_serial, VALUES(business_serial))`,
     [businessId, from, to, typeKey, allocated]
   );
-  const settled = await query<{ serial: number }>(
-    `SELECT serial FROM invoice_serial_claims
+  const settled = await query<{ business_serial: number | null }>(
+    `SELECT business_serial FROM invoice_serial_claims
       WHERE business_id = ? AND period_from = ? AND period_to = ? AND laundry_type = ?
       LIMIT 1`,
     [businessId, from, to, typeKey]
   );
-  const serial = settled.rows.length > 0 ? Number(settled.rows[0].serial) : allocated;
+  const serial =
+    settled.rows.length > 0 && settled.rows[0].business_serial !== null
+      ? Number(settled.rows[0].business_serial)
+      : allocated;
   return { invoiceNumber: invoiceNumberForSerial(serial, laundryType), serial };
 }
 
 /**
- * Takes the next serial from the one global counter.
+ * The number a GLOBAL serial was issued under, in the shape that scheme used.
  *
- * ATOMIC, so two invoices issued at the same instant cannot take the same
- * number. `LAST_INSERT_ID(expr)` makes MySQL compute the new value and hand
- * it back on the SAME statement, under the row lock the UPDATE already
- * holds — there is no read-then-write window for a second connection to slip
- * into, and no explicit transaction is needed.
+ * Only ever used to re-read a claim written before migration 066. Nothing is
+ * issued under this shape, and it is deliberately not exported: a caller
+ * reaching for it would be minting an old-format number for a new invoice.
  */
-async function allocateInvoiceSerial(): Promise<number> {
-  const updated = await query(
-    `UPDATE invoice_number_sequence
-        SET next_value = LAST_INSERT_ID(next_value) + 1
-      WHERE id = 1`
+function legacySerialNumber(serial: number, laundryType: InvoiceLaundryType | null): string {
+  const prefix = laundryType ? (laundryType === 'hotel' ? 'SWC/HL/INV' : 'SWC/GL/INV') : 'SWC/INV';
+  return `${prefix}/${String(serial).padStart(4, '0')}`;
+}
+
+/**
+ * Takes the next invoice number from THIS BUSINESS's counter.
+ *
+ * ONE COUNTER PER BUSINESS, SHARED BY HOTEL AND GUEST. The laundry type is
+ * not a parameter and deliberately cannot be: it decides the prefix and
+ * nothing else, so the digits keep running 1, 2, 3, 4 across both kinds.
+ *
+ * ATOMIC, so two invoices issued for one business at the same instant cannot
+ * take the same number. It is a SINGLE statement:
+ *
+ *   - the business has no counter yet — the INSERT creates it, hands back 1
+ *     through `LAST_INSERT_ID(1)` and stores 2 as the next value;
+ *   - it already has one — `LAST_INSERT_ID(next_value)` returns the number the
+ *     counter was on and moves it past, under the row lock the UPDATE half of
+ *     the statement already holds.
+ *
+ * Either way MySQL computes the value and remembers it on the SAME statement,
+ * so there is no read-then-write window for a second connection to slip into
+ * and no explicit transaction is needed. `business_invoice_sequence` has no
+ * AUTO_INCREMENT column, which is what keeps `LAST_INSERT_ID()` reporting the
+ * number we asked it to rather than a new row id.
+ */
+async function allocateBusinessSerial(businessId: string): Promise<number> {
+  await query(
+    `INSERT INTO business_invoice_sequence (business_id, next_value)
+     VALUES (?, LAST_INSERT_ID(1) + 1)
+     ON DUPLICATE KEY UPDATE next_value = LAST_INSERT_ID(next_value) + 1`,
+    [businessId]
   );
-  if (updated.rowCount === 0) {
-    throw new AppError('The invoice number sequence is missing. Run the migrations.', 500);
-  }
-  // LAST_INSERT_ID(next_value) handed back the value the counter was ON, and
-  // the counter moved past it in the same statement. That value is the serial.
   const got = await query<{ serial: number }>(`SELECT LAST_INSERT_ID() AS serial`);
-  return Number(got.rows[0].serial);
+  const serial = Number(got.rows[0]?.serial);
+  if (!Number.isFinite(serial) || serial < 1) {
+    throw new AppError('The invoice number could not be allocated. Run the migrations.', 500);
+  }
+  return serial;
+}
+
+/** One stored invoice, as the period lookup below returns it. */
+export interface StoredInvoiceRef {
+  id: number;
+  invoice_number: string;
+  serial: number | null;
+  business_serial: number | null;
+  /** True when the row's period IS the cycle period, not merely inside it. */
+  exact: boolean;
+}
+
+/**
+ * THE INVOICE THAT ALREADY COVERS THIS BILLING PERIOD, if there is one.
+ *
+ * ONE DEFINITION OF "THE SAME INVOICE", used by everything that has to decide
+ * between updating an invoice and issuing a new one — the number resolver and
+ * the history recorder both call this, so they cannot disagree about whether
+ * an invoice exists. They used to decide separately, one on an exact period
+ * match and the other on a month bucket, which is how a second document could
+ * take a fresh number while overwriting the first one's row.
+ *
+ * MATCHING IS BY BUSINESS + PERIOD + LAUNDRY TYPE. Hotel and Guest remain two
+ * documents over one period, as they always have been — they carry different
+ * prefixes and different totals and cannot be one row.
+ *
+ * A CONTAINED PERIOD COUNTS AS THE SAME INVOICE. An exact match wins, but a
+ * row whose period sits INSIDE this billing cycle is adopted when there is no
+ * exact one: it was raised for part of this cycle, before the period was
+ * pinned to the registered cycle, and it is that cycle's invoice. Adopting it
+ * is what lets an invoice first raised for 1–9 September keep its number when
+ * September's cycle is billed in full — rather than stranding it and issuing a
+ * second invoice for the same month, which is the duplicate this exists to
+ * prevent. A row covering MORE than the cycle is never adopted: it describes a
+ * different, wider span and is not this invoice.
+ */
+export async function findInvoiceForPeriod(
+  businessId: string,
+  from: string,
+  to: string,
+  laundryType: InvoiceLaundryType | null
+): Promise<StoredInvoiceRef | null> {
+  const rows = await query<{
+    id: number;
+    invoice_number: string;
+    serial: number | null;
+    business_serial: number | null;
+    exact: number;
+  }>(
+    `SELECT id, invoice_number, serial, business_serial,
+            (period_from = ? AND period_to = ?) AS exact
+       FROM business_invoices
+      WHERE business_id = ?
+        AND ((laundry_type IS NULL AND ? IS NULL) OR laundry_type = ?)
+        AND period_from >= ? AND period_to <= ?
+      ORDER BY exact DESC, last_generated_at DESC, id DESC
+      LIMIT 1`,
+    [from, to, businessId, laundryType, laundryType, from, to]
+  );
+  if (rows.rows.length === 0) return null;
+  const row = rows.rows[0];
+  return {
+    id: Number(row.id),
+    invoice_number: row.invoice_number,
+    serial: row.serial === null ? null : Number(row.serial),
+    business_serial: row.business_serial === null ? null : Number(row.business_serial),
+    exact: Number(row.exact) === 1,
+  };
+}
+
+/**
+ * THE NUMBER AN INVOICE WAS ACTUALLY ISSUED UNDER, or null if it never was.
+ *
+ * WHY ANYTHING NEEDS THIS. Several screens name the invoice a period falls
+ * under — the Orders list, the defect-adjustment notice, the item report — and
+ * each of them used to DERIVE that name with `invoiceNumberFor`, from the
+ * business id and the dates. That worked while the number was a pure function
+ * of those inputs. It stopped being one the moment numbers came from a
+ * counter: a derived `SWC/INV/0047` names no invoice that exists, and printing
+ * it beside a real `SWCH/INV/27` invites exactly the confusion of two numbers
+ * for one document.
+ *
+ * So the issued number is READ. Null means this period has not been invoiced
+ * yet, which is a fact worth showing as "not invoiced" rather than papering
+ * over with a number nothing was issued under.
+ */
+export async function issuedInvoiceNumberFor(
+  businessId: string,
+  from: string,
+  to: string,
+  laundryType: InvoiceLaundryType | null
+): Promise<string | null> {
+  const rows = await query<{ invoice_number: string }>(
+    `SELECT invoice_number
+       FROM business_invoices
+      WHERE business_id = ? AND period_from = ? AND period_to = ?
+        AND ((laundry_type IS NULL AND ? IS NULL) OR laundry_type = ?)
+      ORDER BY id DESC
+      LIMIT 1`,
+    [businessId, from, to, laundryType, laundryType]
+  );
+  return rows.rows.length > 0 ? rows.rows[0].invoice_number : null;
 }
 
 /** How many characters of the invoice number are shown to people. */
@@ -321,14 +515,19 @@ export const INVOICE_NUMBER_DISPLAY_LENGTH = 12;
 export function displayInvoiceNumber(invoiceNumber: string): string {
   const full = String(invoiceNumber ?? '');
   /*
-   * A GLOBALLY SERIALLED NUMBER IS SHOWN WHOLE.
+   * A SERIALLED NUMBER IS SHOWN WHOLE.
    *
-   * `SWC/HL/INV/0059` carries nothing but the type and the serial, so there
-   * is nothing to trim — and trimming it to twelve characters would cut the
-   * serial in half. The rule below applies only to the older shape, whose
-   * tail is the period and the type and was never meant to be shown.
+   * `SWCH/INV/27` — and the `SWC/HL/INV/0059` the scheme before it issued —
+   * carry nothing but the type and the number, so there is nothing to trim.
+   * Trimming would be actively wrong: twelve characters of `SWCH/INV/1234`
+   * is `SWCH/INV/123`, which cuts the number in half and reads as a
+   * different invoice.
+   *
+   * The slice below applies only to the ORIGINAL shape,
+   * `SWC/INV/0025/20260801-20260831`, whose tail is the period and the type
+   * and was never meant to be read.
    */
-  if (/^SWC\/(HL|GL)\/INV\//.test(full)) return full;
+  if (SERIAL_NUMBER.test(full) || LEGACY_SERIAL_NUMBER.test(full)) return full;
   return full.slice(0, INVOICE_NUMBER_DISPLAY_LENGTH);
 }
 
@@ -340,9 +539,13 @@ export interface GstInvoice {
    */
   invoice_number: string;
   /**
-   * The global serial this invoice was issued under, or null for one issued
-   * before the sequence existed. The number above is what identifies it;
-   * this is what the sequence handed out.
+   * The running number this invoice was issued under WITHIN ITS BUSINESS —
+   * the digits in `invoice_number`, shared by Hotel and Guest.
+   *
+   * Null on a preview, which has not taken a number, and on an invoice issued
+   * before the per-business sequence existed, where it reports the global
+   * serial that scheme handed out instead. The number above is what
+   * identifies the invoice; this is what the counter gave it.
    */
   invoice_serial: number | null;
   /**
@@ -354,6 +557,21 @@ export interface GstInvoice {
    * `invoice_number` above stays the identifier.
    */
   invoice_number_display: string;
+  /**
+   * THE INVOICE DATE: two days after the billing period ends.
+   *
+   * NOT the day the document was generated. An invoice is dated from the
+   * period it bills, so September's invoice is dated 2 October whether it was
+   * produced on the 2nd, the 5th or re-produced in November — regenerating it
+   * to pick up late orders must not move the date on a document that has
+   * already been sent, and two operators generating it on different days must
+   * not produce two differently-dated invoices for one period.
+   *
+   * Derived from `period.to` by `invoiceDateFor`, so it is a fact about the
+   * billing cycle rather than about the moment of generation. When the
+   * document WAS generated is a separate thing entirely, recorded as
+   * `last_generated_at` on the stored invoice.
+   */
   invoice_date: string;
 
   /**
@@ -502,6 +720,50 @@ function money(value: number): number {
   return Math.round((Number(value) + Number.EPSILON) * 100) / 100;
 }
 
+/**
+ * "2026-08-14" + 1 -> "2026-08-15". Rolls over months and years by
+ * construction, so a period ending on the 30th or the 31st needs no special
+ * case and 30 December + 2 lands in the next year.
+ */
+function addDays(dateKey: string, days: number): string {
+  const [y, m, d] = dateKey.split('-').map(Number);
+  // UTC, so a local DST shift cannot move the date by a day.
+  const next = new Date(Date.UTC(y, m - 1, d + days));
+  const pad = (n: number) => String(n).padStart(2, '0');
+  return `${next.getUTCFullYear()}-${pad(next.getUTCMonth() + 1)}-${pad(next.getUTCDate())}`;
+}
+
+/** "2026-08-14" -> "2026-08-15". Used to step from one billing period to the next. */
+function addOneDay(dateKey: string): string {
+  return addDays(dateKey, 1);
+}
+
+/** How long after a billing period closes the invoice for it is dated. */
+export const INVOICE_DATE_DAYS_AFTER_PERIOD = 2;
+
+/**
+ * THE INVOICE DATE FOR A BILLING PERIOD: its last day plus two.
+ *
+ *   1–30 September  ->  2 October
+ *   1–15 October    ->  17 October
+ *
+ * ONE DEFINITION, EXPORTED, because three things have to agree on it: the
+ * invoice object the PDF is drawn from, the Invoice Details block at the head
+ * of that PDF, and the Acknowledgment strip at its foot. They all read the
+ * single `invoice_date` field this produces rather than working the date out
+ * again, so the two places the document prints it cannot drift apart.
+ *
+ * The stored invoice history derives it the same way, from the period on the
+ * row — so an invoice listed in the Business Account and the same invoice
+ * reopened as a PDF are dated identically, without the date being stored
+ * twice.
+ *
+ * IT DOES NOT DEPEND ON TODAY. That is the whole point: see `invoice_date`.
+ */
+export function invoiceDateFor(periodTo: string): string {
+  return addDays(periodTo, INVOICE_DATE_DAYS_AFTER_PERIOD);
+}
+
 function requireDate(value: unknown, label: string): string {
   const date = typeof value === 'string' ? value.trim() : '';
   if (!date || !DATE_ONLY.test(date)) {
@@ -571,40 +833,111 @@ export async function buildInvoice(
    * puts it on record. That is the one moment a serial may be taken from the
    * global sequence; a preview must never consume one.
    */
-  issue: boolean = false
+  issue: boolean = false,
+  /**
+   * RE-RENDER THE GIVEN DATES EXACTLY, without resolving them to a cycle.
+   *
+   * For REOPENING AN INVOICE THAT WAS ALREADY ISSUED, and nothing else. A
+   * stored invoice's PDF is re-rendered from the period on its row rather than
+   * kept as bytes, and that row is the document of record: an invoice issued
+   * for 1–30 August has to reopen as 1–30 August, whatever the business's
+   * cycle would make of those dates today. Snapping it would restate a
+   * document that has already been sent, and an invoice raised before the
+   * period was pinned to the cycle can span two of today's periods — which
+   * generation rightly refuses and re-rendering must not.
+   *
+   * Generation never passes this. Every path that CREATES or UPDATES an
+   * invoice goes through the cycle, which is what keeps one invoice per
+   * billing period true.
+   */
+  exactPeriod: boolean = false
 ): Promise<GstInvoice> {
   /*
-   * Two ways in.
+   * THE PERIOD IS THE BUSINESS'S REGISTERED BILLING CYCLE. ALWAYS.
    *
-   * With both dates: an ad-hoc statement for exactly that range, which is
-   * what the date pickers produce.
+   * The dates on the request no longer define the window — they only say
+   * WHICH window. The period containing the From date is looked up from the
+   * cycle stored against the business at registration, and that cycle period
+   * is what gets billed, end to end.
    *
-   * With neither: the business's CURRENT billing period, derived from the
-   * cycle stored against it. `onDate` may be given instead to bill the period
-   * containing some other day — that is how a past period is re-issued.
+   * WHY THE DATES CANNOT DEFINE IT ANY MORE. They used to: two dates produced
+   * an invoice for exactly that range. That makes "the invoice for September"
+   * a different document depending on which day the operator happened to pick
+   * as the To date, so 1–29, 1–30 and 1–31 August were three invoices, with
+   * three numbers, for one billing period — which is exactly what this data
+   * already contains. An invoice is now identified by the CYCLE it covers, so
+   * billing the same cycle again finds the invoice that exists and updates it
+   * instead of raising another.
+   *
+   * With no dates at all, the CURRENT period is billed, as before.
+   *
+   * The From date is what anchors the lookup; a To date is still validated so
+   * a malformed one is refused rather than silently ignored, and a range that
+   * runs backwards is still an error. Beyond that the To date only matters
+   * when it picks a different cycle than the From date, which is reported
+   * below rather than guessed at.
    */
   const explicit =
     (typeof fromDate === 'string' && fromDate.trim() !== '') ||
     (typeof toDate === 'string' && toDate.trim() !== '');
 
-  let from: string;
-  let to: string;
-  let cycle: BillingCycle | undefined;
-  let periodLabel: string | undefined;
-
+  let anchor: string | undefined;
   if (explicit) {
-    from = requireDate(fromDate, 'From date');
-    to = requireDate(toDate, 'To date');
-  } else {
-    const period = await periodForBusiness(businessId, undefined);
-    from = period.from;
-    to = period.to;
-    cycle = period.cycle;
-    periodLabel = period.label;
+    const askedFrom = requireDate(fromDate, 'From date');
+    const askedTo = requireDate(toDate, 'To date');
+    if (askedFrom > askedTo) {
+      throw new AppError('From date cannot be after To date.', 400);
+    }
+    anchor = askedFrom;
   }
 
-  if (from > to) {
-    throw new AppError('From date cannot be after To date.', 400);
+  const period = await periodForBusiness(businessId, anchor);
+  /*
+   * `exactPeriod` re-renders the dates as given — see the parameter. The cycle
+   * and its label still come from the business, because the document names the
+   * cycle it was raised under, but they do not move the window.
+   */
+  const reRender = exactPeriod && explicit;
+  const from = reRender ? String(fromDate).trim() : period.from;
+  const to = reRender ? String(toDate).trim() : period.to;
+  const cycle: BillingCycle | undefined = period.cycle;
+  const periodLabel: string | undefined = reRender ? undefined : period.label;
+
+  /*
+   * A RANGE THAT SPANS MORE THAN ONE BILLING PERIOD IS REFUSED, NOT NARROWED.
+   *
+   * An invoice covers exactly one billing cycle, so a range crossing a
+   * boundary names no single invoice. Quietly billing the period around the
+   * From date looked reasonable and is not: on a fortnightly account, asking
+   * for the whole of August bills 1–14 and DROPS every order from the 15th
+   * onwards — an invoice that is wrong rather than one that is missing. If
+   * the orders happen to all sit in the half that was dropped, the operator
+   * is told there is no data at all, for a month that has plenty.
+   *
+   * So the ambiguity goes back to the operator, naming the periods the range
+   * touches so the next pick is a single one. Nothing is refused when the
+   * range sits inside one period, which is every ordinary request.
+   */
+  if (explicit && !reRender) {
+    const askedFrom = String(fromDate).trim();
+    const askedTo = String(toDate).trim();
+    if (askedTo > to) {
+      const spanned: string[] = [];
+      let cursor = from;
+      // Bounded: one step per period, and a range cannot touch more of them
+      // than it has days.
+      for (let i = 0; i < 64 && cursor <= askedTo; i += 1) {
+        const p = periodFor(cycle!, cursor);
+        spanned.push(p.label ? `${p.label} (${p.from} to ${p.to})` : `${p.from} to ${p.to}`);
+        cursor = addOneDay(p.to);
+      }
+      throw new AppError(
+        `${askedFrom} to ${askedTo} covers ${spanned.length} billing periods of this ` +
+          `business's ${cycle} cycle, and an invoice covers one. Choose a date inside the ` +
+          `period you want to bill: ${spanned.join('; ')}.`,
+        400
+      );
+    }
   }
 
   const businessResult = await query<any>(
@@ -696,7 +1029,12 @@ export async function buildInvoice(
             -- current quantity IS the original and nothing was defective.
             SUM(COALESCE(oi.original_quantity, oi.quantity)) AS ordered_quantity,
             SUM(COALESCE(oi.defective_quantity, 0)) AS defective_quantity,
-            SUM(COALESCE(oi.total_price, 0)) AS amount
+            -- The charge the order rows RECORDED, carried for reconciliation
+            -- only. The billed figure is quantity x rate, computed below, so
+            -- the Amount column and the Sub Total cannot come from two
+            -- different sums. Aliased recorded_amount rather than amount so
+            -- the two can never be confused at the point of use.
+            SUM(COALESCE(oi.total_price, 0)) AS recorded_amount
        FROM order_items oi
        JOIN orders o ON o.id = oi.order_id
       WHERE oi.order_id IN (${placeholders})${laundryType ? ' AND oi.laundry_type = ?' : ''}
@@ -711,10 +1049,36 @@ export async function buildInvoice(
   const gstRate = Number(config.GST_RATE_PERCENT) || 0;
 
   const lines: InvoiceLine[] = linesResult.rows.map((row: any) => {
-    const taxable = money(row.amount);
-    const gstAmount = money((taxable * gstRate) / 100);
     const quantity = Number(row.quantity || 0);
     const rate = money(row.rate);
+
+    /*
+     * THE LINE'S VALUE, COMPUTED ONCE.
+     *
+     * Quantity x Price/unit, rounded to the paisa here and nowhere else. It is
+     * what the Amount column prints, what the subtotal is the sum of and what
+     * the line's tax is taken on — the three used to be derived from two
+     * different sums, which is precisely how a Sub Total could disagree with
+     * the column of amounts printed above it.
+     */
+    const amount = money(quantity * rate);
+
+    /*
+     * The charge the order rows stored. Equal to `amount` for everything the
+     * order writers produce (`total_price = unit_price x quantity`), so a
+     * difference means the line's stored price and its own two columns
+     * disagree — a data problem worth seeing, not something to quietly bill.
+     * Said once here rather than left to surface as an invoice that does not
+     * add up.
+     */
+    const recordedAmount = money(row.recorded_amount);
+    if (Math.abs(recordedAmount - amount) >= 0.01) {
+      logger.warn(
+        `[Invoice] line "${row.description}" bills ${amount} (${quantity} x ${rate}) but ` +
+          `order_items.total_price records ${recordedAmount}; the invoice uses the billed figure.`
+      );
+    }
+
     return {
       description: row.description,
       service: row.service || null,
@@ -726,23 +1090,27 @@ export async function buildInvoice(
       defective_quantity: Number(row.defective_quantity || 0),
       unit: row.unit || 'Nos',
       rate,
-      taxable,
-      gst_amount: gstAmount,
-      // Quantity x price, which is what the Amount column states.
-      amount: money(quantity * rate),
+      // ONE figure, under both names: the subtotal sums `taxable` and the
+      // document prints `amount`, and they cannot differ because they are it.
+      taxable: amount,
+      gst_amount: money((amount * gstRate) / 100),
+      amount,
+      recorded_amount: recordedAmount,
     };
   });
 
   /*
    * THE DEDUCTION, TAKEN OFF BEFORE TAX.
    *
-   * The subtotal is the lines added up, exactly as it always was. A deduction
-   * comes off that, and GST is then charged on what remains — so the tax
+   * The subtotal is the AMOUNT COLUMN added up — `line.amount`, the very field
+   * the document prints on each row — so the figure closing the table and the
+   * Sub Total in the summary block are the same addition, not two. A deduction
+   * comes off that, and GST is then charged on what remains, so the tax
    * follows the money actually being billed rather than a figure the customer
    * is not paying. No deduction leaves `taxableValue` identical to the
    * subtotal, which is every invoice that does not ask for one.
    */
-  const subtotal = money(lines.reduce((sum, line) => sum + line.taxable, 0));
+  const subtotal = money(lines.reduce((sum, line) => sum + line.amount, 0));
   const discountPercent = normaliseDiscountPercent(discountPercentInput);
   const discountAmount = discountPercent > 0 ? money((subtotal * discountPercent) / 100) : 0;
   const taxableValue = money(subtotal - discountAmount);
@@ -760,28 +1128,38 @@ export async function buildInvoice(
   const intraState = !customerState || stateKey(customerState) === stateKey(supplierState);
 
   /*
-   * Summed from the lines so the total always equals the column above it.
+   * THE TAX, TAKEN ON THE FIGURE THE INVOICE PRINTS.
    *
-   * A DEDUCTION IS THE ONE CASE THAT CANNOT BE. The per-line tax describes
-   * the undiscounted line, so once money has come off the subtotal the sum of
-   * those figures is no longer the tax being charged. Then, and only then,
-   * the tax is taken on the revised taxable value at the SAME configured
-   * rate — leaving every undiscounted invoice on the identical arithmetic it
-   * has always used, down to the rounding.
+   * The rate is applied to `taxableValue` — the Sub Total less any deduction,
+   * which is the number stated immediately above the tax rows — so a reader
+   * checking the document can reproduce every line of the summary block from
+   * the two figures in front of them.
+   *
+   * IT WAS THE SUM OF THE PER-LINE TAX, and only fell back to this when a
+   * deduction had been applied. Rounding each line's tax to the paisa and then
+   * adding those up can land a paisa away from the rate applied to their
+   * total, which on the printed document reads as a Total that does not follow
+   * from the Sub Total above it. `gst_amount` is still computed per line and
+   * still carried — nothing consumes it as a total any more.
    */
-  const lineTax = money(lines.reduce((sum, line) => sum + line.gst_amount, 0));
-  const totalTax = discountAmount > 0 ? money((taxableValue * gstRate) / 100) : lineTax;
+  const totalTax = money((taxableValue * gstRate) / 100);
   const halfTax = money(totalTax / 2);
 
   const cgst = intraState ? halfTax : 0;
   const sgst = intraState ? money(totalTax - halfTax) : 0;
   const igst = intraState ? 0 : totalTax;
 
-  const invoiceDateResult = await query<{ d: string }>(
-    `SELECT DATE_FORMAT(CONVERT_TZ(UTC_TIMESTAMP(), '+00:00', ?), '%Y-%m-%d') AS d`,
-    [config.BUSINESS_TZ_OFFSET]
-  );
-  const invoiceDate = String(invoiceDateResult.rows[0].d);
+  /*
+   * THE INVOICE DATE, FROM THE PERIOD RATHER THAN FROM THE CLOCK.
+   *
+   * This used to read today's date in the business timezone, so the same
+   * invoice was dated differently every time it was produced — and after a
+   * regeneration to pick up late orders, the reissued document contradicted
+   * the one already sent. It is now the billing period's last day plus two,
+   * which is a fact about the cycle and stays put however often the invoice
+   * is regenerated.
+   */
+  const invoiceDate = invoiceDateFor(to);
 
   /*
    * THE NUMBER. Reused if this invoice already has one, so regenerating it

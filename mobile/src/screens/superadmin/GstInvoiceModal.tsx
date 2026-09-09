@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import {
   View, Text, Modal, TouchableOpacity, ActivityIndicator, Platform, Alert, ScrollView,
   TextInput, Image,
@@ -10,10 +10,11 @@ import * as Sharing from 'expo-sharing';
 import { Ionicons } from '@expo/vector-icons';
 import { COLORS, SPACING, BORDER_RADIUS, TYPOGRAPHY } from '../../constants/theme';
 import { sa } from './styles';
-import superAdminApi, { LaundryTypeValue } from '../../services/superAdminApi';
+import superAdminApi, { LaundryTypeValue, BillingPeriod } from '../../services/superAdminApi';
 import SorterCalendar from '../../components/sorter/SorterCalendar';
 import { formatLongDate, toDateKey } from '../../utils/sorterDates';
 import { businessDocumentFileName } from '../../utils/pdfFileName';
+import { freshDownloadTarget } from '../../utils/pdfFile';
 
 /**
  * Generate GST Invoice, for one business over one period.
@@ -38,6 +39,17 @@ interface Props {
   businessId: string | null;
   businessName: string;
   onClose: () => void;
+  /**
+   * Called once the invoice PDF has actually been ISSUED by the server.
+   *
+   * Downloading the document is what puts the invoice on record, so this is
+   * the moment the Issued Invoice list behind this sheet is out of date. The
+   * list used to be reloaded only when the sheet was CLOSED, which meant an
+   * operator who generated an invoice and stayed here — to raise the Guest one
+   * next, say — was looking at a list that did not contain either. Optional,
+   * so a caller that has no list to refresh is unaffected.
+   */
+  onGenerated?: () => void;
 }
 
 type Picking = 'from' | 'to' | null;
@@ -48,14 +60,42 @@ export const LAUNDRY_TYPES: Array<{ value: LaundryTypeValue; label: string; icon
   { value: 'guest', label: 'Guest Laundry', icon: 'person' },
 ];
 
-export default function GstInvoiceModal({ visible, businessId, businessName, onClose }: Props) {
+export default function GstInvoiceModal({
+  visible,
+  businessId,
+  businessName,
+  onClose,
+  onGenerated,
+}: Props) {
   // Defaults to the current month so far, from the device's own calendar.
+  // Only a fallback: `periods` below replaces it as soon as the business's
+  // own billing cycle has been read.
   const today = toDateKey(new Date());
   const monthStart = `${today.slice(0, 8)}01`;
 
   const [from, setFrom] = useState(monthStart);
   const [to, setTo] = useState(today);
   const [picking, setPicking] = useState<Picking>(null);
+
+  /**
+   * THE BUSINESS'S OWN BILLING PERIODS, newest first.
+   *
+   * WHY THIS REPLACED TWO DATE PICKERS. An invoice covers exactly one billing
+   * cycle, so two free dates could express something no invoice can be: a
+   * range crossing a period boundary. On a fortnightly account, "1 to 31
+   * August" is not August's invoice — it is two of them — and the server can
+   * only refuse it. Worse, a range that lands wholly inside an EMPTY half of
+   * the month reports "no data" for a month with plenty of orders, which is
+   * what this screen was doing.
+   *
+   * Picking from the periods the cycle actually defines removes the whole
+   * class of problem: every option is exactly one invoice, and the label says
+   * which. The dates still travel to the server unchanged, so nothing about
+   * how an invoice is built or numbered changes.
+   */
+  const [periods, setPeriods] = useState<BillingPeriod[]>([]);
+  const [periodsError, setPeriodsError] = useState('');
+  const [loadingPeriods, setLoadingPeriods] = useState(false);
   /**
    * Which invoice is being generated. Hotel first, because it is the larger
    * of the two for most businesses. There is deliberately no "both" option:
@@ -97,6 +137,45 @@ export default function GstInvoiceModal({ visible, businessId, businessName, onC
     setPreview(null);
     setError('');
   };
+
+  /*
+   * The periods are read when the sheet opens, and again if it is reopened for
+   * a different business — each business has its own cycle, so a list carried
+   * over from the last one would offer the wrong windows.
+   *
+   * The most recent period is selected by default, which is the one an
+   * operator generating an invoice today almost always wants. If the list
+   * cannot be read the two date pickers below are still there, so the sheet
+   * degrades to exactly what it was rather than becoming unusable.
+   */
+  useEffect(() => {
+    if (!visible || !businessId) return;
+    let cancelled = false;
+    setLoadingPeriods(true);
+    setPeriodsError('');
+    superAdminApi
+      .getBillingPeriods(businessId, 12)
+      .then((list) => {
+        if (cancelled) return;
+        setPeriods(list);
+        if (list.length > 0) {
+          setFrom(list[0].from);
+          setTo(list[0].to);
+        }
+      })
+      .catch((e: any) => {
+        if (cancelled) return;
+        setPeriodsError(
+          e?.response?.data?.message || e.message || 'Could not read this business’s billing periods.'
+        );
+      })
+      .finally(() => {
+        if (!cancelled) setLoadingPeriods(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [visible, businessId]);
 
   /** The totals, so the operator sees what is about to be billed. */
   const loadPreview = async () => {
@@ -144,7 +223,16 @@ export default function GstInvoiceModal({ visible, businessId, businessName, onC
         laundryTypeLabel: typeLabel,
         kind: 'invoice',
       });
-      const target = `${FileSystem.cacheDirectory}${fileName}`;
+      /*
+       * A PATH NOTHING HAS USED BEFORE.
+       *
+       * The name the user sees is unchanged — the uniqueness is in the
+       * directory. Writing every generation of this invoice to one fixed path
+       * left the share sheet and the device's PDF viewer with a URI they had
+       * already seen, and a viewer that caches by URI would show the previous
+       * render of a document that had just been regenerated.
+       */
+      const target = await freshDownloadTarget(fileName);
 
       const result = await FileSystem.downloadAsync(url, target, { headers });
       if (result.status !== 200) {
@@ -152,6 +240,18 @@ export default function GstInvoiceModal({ visible, businessId, businessName, onC
           `No ${typeLabel} data could be found for this period.`
         );
       }
+
+      /*
+       * THE INVOICE IS NOW ISSUED, SO THE LIST BEHIND THIS SHEET IS STALE.
+       *
+       * Announced here — after a 200 and before the share sheet — because the
+       * server records the invoice in the business's history as part of
+       * serving these bytes, and it awaits that write, so the row exists by
+       * the time this line runs. Announcing it before the share sheet means
+       * the refresh happens whether the operator shares the file, saves it or
+       * dismisses the sheet without doing either.
+       */
+      onGenerated?.();
 
       const title = `${typeLabel} invoice — ${businessName}`;
 
@@ -241,10 +341,88 @@ export default function GstInvoiceModal({ visible, businessId, businessName, onC
               })}
             </View>
 
-            <View style={{ flexDirection: 'row', gap: SPACING.sm, marginTop: SPACING.sm }}>
-              {dateButton('From', from, 'from')}
-              {dateButton('To', to, 'to')}
-            </View>
+            {/* WHICH BILLING PERIOD. One invoice covers one billing cycle, so
+                the choice is a cycle, not a range — every row here is exactly
+                one invoice, drawn from the cycle registered against this
+                business. Generating a period that already has an invoice
+                updates that invoice; it does not raise a second. */}
+            <Text style={sa.label}>BILLING PERIOD</Text>
+            {loadingPeriods ? (
+              <View style={{ paddingVertical: SPACING.sm }}>
+                <ActivityIndicator color={COLORS.Primary} />
+              </View>
+            ) : periods.length > 0 ? (
+              <View style={{ gap: SPACING.xs }}>
+                {periods.map((period) => {
+                  const on = period.from === from && period.to === to;
+                  return (
+                    <TouchableOpacity
+                      key={`${period.from}_${period.to}`}
+                      style={[
+                        sa.input,
+                        {
+                          flexDirection: 'row',
+                          alignItems: 'center',
+                          gap: 8,
+                          borderColor: on ? COLORS.Primary : COLORS.Border,
+                          borderWidth: on ? 2 : 1,
+                        },
+                      ]}
+                      onPress={() => {
+                        setFrom(period.from);
+                        setTo(period.to);
+                        // The preview belongs to the period it was fetched for.
+                        reset();
+                      }}
+                      accessibilityRole="radio"
+                      accessibilityState={{ selected: on }}
+                      accessibilityLabel={`Bill the ${period.label} period, ${period.from} to ${period.to}`}
+                    >
+                      <Ionicons
+                        name={on ? 'radio-button-on' : 'radio-button-off'}
+                        size={18}
+                        color={on ? COLORS.Primary : COLORS.TextSecondary}
+                      />
+                      <View style={{ flex: 1 }}>
+                        <Text
+                          style={{
+                            color: COLORS.TextPrimary,
+                            fontFamily: TYPOGRAPHY.fontFamily,
+                            fontWeight: on ? '700' : '500',
+                          }}
+                        >
+                          {period.label}
+                        </Text>
+                        <Text style={sa.cardMeta}>
+                          {formatLongDate(period.from)} – {formatLongDate(period.to)}
+                        </Text>
+                      </View>
+                    </TouchableOpacity>
+                  );
+                })}
+              </View>
+            ) : (
+              <>
+                {/* THE FALLBACK, when the periods could not be read. The two
+                    pickers this screen has always had, so a failure to load
+                    the cycle leaves the sheet usable rather than empty. Dates
+                    must still land inside one billing period; the server says
+                    so plainly if they do not. */}
+                {!!periodsError && (
+                  <View style={sa.errorBox}>
+                    <Ionicons name="alert-circle-outline" size={16} color={COLORS.Error} />
+                    <Text style={sa.errorText}>{periodsError}</Text>
+                  </View>
+                )}
+                <View style={{ flexDirection: 'row', gap: SPACING.sm }}>
+                  {dateButton('From', from, 'from')}
+                  {dateButton('To', to, 'to')}
+                </View>
+                <Text style={sa.cardMeta}>
+                  Both dates must fall inside one billing period of this business's cycle.
+                </Text>
+              </>
+            )}
 
             {/* THE DEDUCTION, taken off the subtotal before GST is charged.
                 Typed before generating; left blank the invoice is unchanged.
@@ -291,22 +469,41 @@ export default function GstInvoiceModal({ visible, businessId, businessName, onC
                 <Text style={[sa.cardLine, { fontWeight: '700' }]}>
                   Type: {preview.laundry_type_label || 'Hotel & Guest Laundry'}
                 </Text>
+                {/* THE BILLING PERIOD THIS INVOICE ACTUALLY COVERS.
+                    The dates below choose WHICH billing cycle to bill, not the
+                    range — the server pins the period to the cycle registered
+                    against the business — so the resolved period is shown
+                    here rather than leaving the operator to infer it from the
+                    two dates they picked. */}
+                {preview.period?.from && preview.period?.to ? (
+                  <Text style={[sa.cardLine, { fontWeight: '700' }]}>
+                    Billing period: {preview.period.label
+                      ? `${preview.period.label} (${preview.period.from} to ${preview.period.to})`
+                      : `${preview.period.from} to ${preview.period.to}`}
+                  </Text>
+                ) : null}
                 <Text style={sa.cardLine}>Orders: {preview.orders?.length ?? 0}</Text>
                 <Text style={sa.cardLine}>Items billed: {preview.lines?.length ?? 0}</Text>
+                {/* SUB TOTAL IS ALWAYS SHOWN, not only when a deduction was
+                    taken. It is the figure the PDF closes its Amount column
+                    with, so an operator checking the preview against the
+                    document is comparing the same row; hiding it on an
+                    undiscounted invoice left the screen starting at the
+                    taxable value and the PDF starting at the sub total. */}
+                <Text style={sa.cardLine}>
+                  Sub total: INR {Number(preview.totals?.subtotal ?? 0).toFixed(2)}
+                </Text>
                 {preview.totals?.discount_amount > 0 ? (
                   <>
-                    <Text style={sa.cardLine}>
-                      Sub total: INR {Number(preview.totals?.subtotal ?? 0).toFixed(2)}
-                    </Text>
                     <Text style={sa.cardLine}>
                       Less {preview.totals.discount_percent}%: INR{' '}
                       {Number(preview.totals.discount_amount).toFixed(2)}
                     </Text>
+                    <Text style={sa.cardLine}>
+                      Taxable value: INR {Number(preview.totals?.taxable_value ?? 0).toFixed(2)}
+                    </Text>
                   </>
                 ) : null}
-                <Text style={sa.cardLine}>
-                  Taxable value: INR {Number(preview.totals?.taxable_value ?? 0).toFixed(2)}
-                </Text>
                 {preview.totals?.intra_state ? (
                   <>
                     <Text style={sa.cardLine}>

@@ -144,12 +144,24 @@ async function main() {
   check('no obsolete item appears in the business price list', bizObsolete.length === 0,
     `${bizRows.length} rows, ${bizObsolete.length} obsolete`);
 
-  // Cross-check against the database rather than trusting the API's own count.
+  /*
+   * Cross-check against the database rather than trusting the API's own count.
+   *
+   * SCOPED TO THE BUSINESS CATALOGUE, because that is what a Hotel Laundry
+   * price list is. `services` holds the customer catalogue and the business
+   * catalogue in one table, told apart by `scope`, and `listBusinessPrices`
+   * lists `scope='BUSINESS'` for hotel — see the note on that function.
+   *
+   * Without the filter this counted BOTH catalogues (216 items against the
+   * 121 the endpoint returns) and failed on every run, reporting the scope
+   * split as a missing-items bug. The endpoint was right and the count was
+   * not.
+   */
   const expected = await query<{ n: number }>(
     `SELECT COUNT(*) AS n FROM services i
        JOIN service_categories c ON c.id = i.category_id
        LEFT JOIN service_categories pc ON pc.id = c.parent_id
-      WHERE i.kind = 'ITEM' AND i.is_active = true
+      WHERE i.kind = 'ITEM' AND i.is_active = true AND i.scope = 'BUSINESS'
         AND c.is_active = true AND (c.parent_id IS NULL OR pc.is_active = true)`
   );
   /*

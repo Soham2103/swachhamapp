@@ -462,6 +462,12 @@ export interface InvoiceHistoryEntry {
   period_label: string;
   laundry_type: 'hotel' | 'guest' | null;
   laundry_type_label: string | null;
+  /** The deduction the invoice was issued with, as a percentage. 0 for none. */
+  discount_percent: number;
+  /** The lines added up before any deduction — the Sub Total the PDF prints. */
+  subtotal_amount: number;
+  /** What that deduction came to in rupees. 0 when there was none. */
+  discount_amount: number;
   taxable_amount: number;
   tax_amount: number;
   total_amount: number;
@@ -471,7 +477,22 @@ export interface InvoiceHistoryEntry {
   amount_paid: number;
   amount_due: number;
   generated_at: string;
-  /** The day the invoice was generated. */
+  /**
+   * The last time the document was produced — what the list is ordered by, so
+   * a re-issued invoice comes back to the top without its invoice date moving.
+   */
+  last_generated_at: string;
+  /**
+   * "Last Generated On": the same moment as a plain YYYY-MM-DD, already in the
+   * server's calendar. Use this for display — `last_generated_at` is a UTC
+   * instant and slicing it can be a day out.
+   */
+  last_generated_on: string;
+  /**
+   * THE INVOICE DATE the PDF prints: the billing period's last day plus two.
+   * A fact about the cycle, so regenerating the invoice never moves it — which
+   * is exactly what distinguishes it from `last_generated_on`.
+   */
   invoice_date: string;
 }
 

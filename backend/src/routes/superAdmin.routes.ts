@@ -500,23 +500,33 @@ router.get('/businesses/:id/invoice.pdf', async (req: Request, res: Response, ne
     const pdf = await renderInvoicePdf(invoice);
 
     /*
-     * THE INVOICE IS NOW ON RECORD.
+     * THE INVOICE IS NOW ON RECORD, BEFORE THE BYTES GO OUT.
      *
      * Recorded here, at the PDF, rather than at the JSON endpoint above:
      * `/invoice` is the preview the operator looks at before deciding, and a
      * preview is not an issued invoice. Downloading the document is the act
      * that issues it, so that is what puts it in the business's history.
      *
-     * Deliberately not awaited into the response path's failure modes: the
-     * PDF has been rendered and the operator is entitled to it, so a history
-     * write that fails is logged and swallowed rather than turned into a
-     * failed download. Idempotent, so a retried download does not duplicate.
+     * AWAITED, WHICH IT WAS NOT. The write was started and left to finish on
+     * its own while the response was already being sent — so the app, which
+     * reloads the Issued Invoice list the moment the download returns, raced
+     * the INSERT and routinely refetched a list that did not yet contain the
+     * invoice just generated. That is the "it only appears after a manual
+     * refresh" the operator sees, and awaiting the write closes it: by the
+     * time the client holds the PDF, the row it will ask for exists.
+     *
+     * ITS FAILURE STILL COSTS NOTHING. The PDF has been rendered and the
+     * operator is entitled to it, so a history write that throws is logged
+     * and swallowed here rather than turned into a failed download — exactly
+     * as before. Idempotent, so a retried download does not duplicate.
      */
-    recordInvoice(invoice, { generatedBy: authReq.user!.id }).catch((e) => {
+    try {
+      await recordInvoice(invoice, { generatedBy: authReq.user!.id });
+    } catch (e: any) {
       logger.error(
         `[Invoice] could not record ${invoice.invoice_number} in history: ${e?.message || e}`
       );
-    });
+    }
 
     // Named by the establishment and the period — see `invoiceFileName`. The
     // full invoice number stays the identifier, in the log line below and on
@@ -529,6 +539,17 @@ router.get('/businesses/:id/invoice.pdf', async (req: Request, res: Response, ne
     res.setHeader('Content-Type', 'application/pdf');
     res.setHeader('Content-Disposition', `attachment; filename="${fileName}"`);
     res.setHeader('Content-Length', String(pdf.length));
+    /*
+     * NEVER CACHED, ANYWHERE ON THE WAY BACK.
+     *
+     * The document is re-rendered from the orders on every request, so its
+     * bytes legitimately change between two identical URLs — a corrected
+     * quantity, a regenerated invoice. Nothing here carries a validator, so a
+     * client heuristically caching a 200 for a GET would hand the operator an
+     * invoice that no longer exists in the database. Said explicitly rather
+     * than left to the intermediaries to guess.
+     */
+    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
     res.end(pdf);
   } catch (error) {
     next(error);

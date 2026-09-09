@@ -44,6 +44,7 @@ import {
  * same way on the same device.
  */
 import { openPdfInDeviceViewer } from '../../utils/openPdf';
+import { freshDownloadTarget } from '../../utils/pdfFile';
 
 /**
  * Business Account.
@@ -85,6 +86,30 @@ function today(): string {
 const dmy = (iso: string) => {
   const [y, m, d] = String(iso || '').split('-');
   return y && m && d ? `${d}/${m}/${y}` : String(iso || '');
+};
+
+/**
+ * A generation moment: the date AND the time it happened.
+ *
+ * WHY THE TIME IS SHOWN. "Last generated on" sits directly under "Invoice
+ * date" on the invoice card, and the two are different things that can land on
+ * the same day — an invoice for a period ending on the 30th is dated the 1st,
+ * and generating it on the 1st makes both lines read 01/09/2026. That looks
+ * exactly like one value printed twice, which is precisely the doubt this
+ * removes: a clock time can only be a moment something was done, never a date
+ * derived from a billing period.
+ *
+ * Falls back to the plain date if the instant cannot be parsed, so a card
+ * never renders "Invalid Date".
+ */
+const whenGenerated = (isoInstant: string, fallbackDate: string) => {
+  const at = new Date(isoInstant);
+  if (Number.isNaN(at.getTime())) return dmy(fallbackDate);
+  const pad = (n: number) => String(n).padStart(2, '0');
+  const hours = at.getHours();
+  const suffix = hours < 12 ? 'am' : 'pm';
+  const hour12 = hours % 12 === 0 ? 12 : hours % 12;
+  return `${pad(at.getDate())}/${pad(at.getMonth() + 1)}/${at.getFullYear()}, ${hour12}:${pad(at.getMinutes())} ${suffix}`;
 };
 
 /** The four native things More Options can do with a PDF that is already on disk. */
@@ -865,7 +890,9 @@ function InvoiceHistoryTab({ business }: { business: BusinessAccountSummary }) {
     const safeName = `${business.name} ${invoice.period_from} to ${invoice.period_to}`
       .replace(/[<>:"/\\|?* -]/g, '')
       .trim();
-    const target = `${FileSystem.cacheDirectory}${encodeURIComponent(`${safeName}.pdf`)}`;
+    // A path nothing has used before, so a viewer that caches by URI cannot
+    // show the render from the last time this invoice was opened.
+    const target = await freshDownloadTarget(`${safeName}.pdf`);
     const result = await FileSystem.downloadAsync(url, target, { headers });
     if (result.status !== 200) throw new Error('That invoice could not be downloaded.');
     return { uri: result.uri, fileName: `${safeName}.pdf` };
@@ -915,7 +942,16 @@ function InvoiceHistoryTab({ business }: { business: BusinessAccountSummary }) {
       const safeName = `${business.name} ${invoice.period_from} to ${invoice.period_to}`
         .replace(/[<>:"/\\|?* -]/g, '')
         .trim();
-      const target = `${FileSystem.cacheDirectory}${encodeURIComponent(`${safeName}.pdf`)}`;
+      /*
+       * A FRESH PATH FOR EVERY OPEN.
+       *
+       * This wrote to one fixed path per invoice. The bytes were replaced on
+       * each download, but Android derives the `content://` URI it hands the
+       * device's PDF viewer from the PATH — so the viewer was given a URI it
+       * had already rendered and could show its cached copy. An invoice
+       * reopened after being regenerated then still displayed the old figures.
+       */
+      const target = await freshDownloadTarget(`${safeName}.pdf`);
 
       const result = await FileSystem.downloadAsync(url, target, { headers });
       if (result.status !== 200) throw new Error('That invoice could not be downloaded.');
@@ -1030,9 +1066,20 @@ function InvoiceHistoryTab({ business }: { business: BusinessAccountSummary }) {
                     {dmy(inv.period_from)} – {dmy(inv.period_to)} · {inv.billing_cycle_label}
                     {inv.laundry_type_label ? ` · ${inv.laundry_type_label}` : ''}
                   </Text>
+                  {/* TWO DIFFERENT DATES, AND THEY ARE NOT INTERCHANGEABLE.
+                      Invoice Date is the billing period's last day plus two —
+                      what the PDF prints, fixed by the cycle. Last Generated
+                      On is when the document was actually produced, and moves
+                      every time the invoice is regenerated to pick up more
+                      orders. Shown on separate lines because they routinely
+                      differ and reading one as the other is the confusion this
+                      replaces. */}
                   <Text style={sa.cardMeta}>
                     Invoice date: {dmy(inv.invoice_date)} · {inv.order_count} order
                     {inv.order_count === 1 ? '' : 's'}
+                  </Text>
+                  <Text style={sa.cardMeta}>
+                    Last generated on: {whenGenerated(inv.last_generated_at, inv.last_generated_on)}
                   </Text>
                 </View>
                 <View
@@ -1067,6 +1114,20 @@ function InvoiceHistoryTab({ business }: { business: BusinessAccountSummary }) {
                   paddingTop: SPACING.sm,
                 }}
               >
+                {/* THE SAME CHAIN THE PDF PRINTS, in the same order:
+                    Sub Total − Deduction = Taxable, + GST = Total. Every one
+                    of them is the figure the invoice was ISSUED for, stored
+                    when it was generated and read straight off the response —
+                    nothing here is derived, so the card, the document and the
+                    invoice screen cannot disagree.
+
+                    The deduction row appears only on an invoice that had one,
+                    so an ordinary invoice reads exactly as it did. */}
+                <Amount label="Sub Total" value={inv.subtotal_amount} />
+                {inv.discount_amount > 0 ? (
+                  <Amount label={`Less ${inv.discount_percent}%`} value={inv.discount_amount} />
+                ) : null}
+                <Amount label="GST" value={inv.tax_amount} />
                 <Amount label="Total" value={inv.total_amount} strong />
                 <Amount label="Paid" value={inv.amount_paid} />
                 <Amount label="Outstanding" value={inv.amount_due} />
@@ -1110,12 +1171,19 @@ function InvoiceHistoryTab({ business }: { business: BusinessAccountSummary }) {
       )}
 
       {/* The SAME GstInvoiceModal the Order Detail tab used to open — same
-          props, same API, same document. Closing it reloads the list, so an
-          invoice just generated appears without a manual refresh. */}
+          props, same API, same document.
+
+          `onGenerated` reloads the list the moment the server has ISSUED an
+          invoice, rather than waiting for the sheet to be closed: the newly
+          generated invoice is at the top of the list underneath before the
+          operator has finished with the share sheet, and it is there whether
+          they close the sheet or go straight on to generate the other type.
+          `onClose` still reloads, so nothing that relied on that changed. */}
       <GstInvoiceModal
         visible={invoiceOpen}
         businessId={business.id}
         businessName={business.name}
+        onGenerated={load}
         onClose={() => { setInvoiceOpen(false); load(); }}
       />
 

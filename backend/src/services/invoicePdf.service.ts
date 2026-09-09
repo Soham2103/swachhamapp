@@ -278,7 +278,15 @@ export function renderInvoicePdf(invoice: GstInvoice): Promise<Buffer> {
     };
 
     detail('Invoice No.:', invoice.invoice_number_display);
-    detail('Date:', dmy(invoice.invoice_date));
+    /*
+     * INVOICE DATE — the billing period's last day plus two, NOT the day the
+     * document was produced. Labelled in full because "Date" beside a billing
+     * period invited reading it as the generation date, which is what it used
+     * to be. `invoice.invoice_date` is the only source; the Acknowledgment at
+     * the foot of this page prints the very same field, so the two cannot
+     * disagree.
+     */
+    detail('Invoice Date:', dmy(invoice.invoice_date));
     // WHICH LAUNDRY TYPE THIS INVOICE IS. Hotel and Guest are now two separate
     // invoices over the same business and dates, so the document has to say
     // which of them it is. Omitted on an invoice that covers both, where there
@@ -403,19 +411,23 @@ ${line.ordered_quantity} ordered, ${line.defective_quantity} defective — ` +
     /*
      * Totals row across the foot of the table.
      *
-     * It sums the AMOUNT COLUMN — every line's quantity x price — so the
-     * column and the figure closing it agree. It is therefore the pre-tax
-     * subtotal; the tax and the payable grand total are stated in the summary
-     * block immediately below, which is where they were before.
+     * IT PRINTS `totals.subtotal`, IT DOES NOT ADD THE COLUMN UP AGAIN.
+     * `buildInvoice` sums the very `line.amount` values rendered above into
+     * that field, so re-summing them here could only ever produce the same
+     * number or — through a second rounding of a floating-point sum — a
+     * number a paisa away from the Sub Total in the summary block below. One
+     * figure, computed once, printed in both places.
+     *
+     * The quantity beside it is a COUNT, not money: nothing downstream states
+     * a total quantity, so it is summed here and rounding does not arise.
      */
-    const linesTotal = invoice.lines.reduce((sum, line) => sum + line.amount, 0);
     const quantityTotal = invoice.lines.reduce((sum, line) => sum + line.quantity, 0);
 
     doc.rect(left, y, width, 19).fill(BAND);
     doc.fillColor(TEXT).font('Helvetica-Bold').fontSize(9);
     doc.text('Total', col.item, y + 5);
     doc.text(String(quantityTotal), col.qty, y + 5, { width: 42, align: 'right' });
-    doc.text(inr(linesTotal), col.amount, y + 5, { width: 72, align: 'right' });
+    doc.text(inr(invoice.totals.subtotal), col.amount, y + 5, { width: 72, align: 'right' });
     y += 30;
 
     if (y > doc.page.height - 230) {
@@ -611,6 +623,12 @@ ${line.ordered_quantity} ordered, ${line.defective_quantity} defective — ` +
       }
 
       doc.font('Helvetica-Bold').fontSize(8.5).text('Invoice Details:', mid + 10, y + 14);
+      /*
+       * THE SAME `invoice.invoice_date` THE BLOCK AT THE HEAD OF THE PAGE
+       * PRINTS. One field, read twice — the date is never recomputed here, so
+       * the tear-off strip a customer signs and the invoice it is attached to
+       * cannot state different dates.
+       */
       doc.font('Helvetica').fontSize(8.5)
         .text(`Invoice No. : ${invoice.invoice_number_display}`, mid + 10, doc.y)
         .text(`Invoice Date : ${dmy(invoice.invoice_date)}`, mid + 10, doc.y)

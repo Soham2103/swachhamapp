@@ -121,6 +121,40 @@ async function relocate(printedUri: string, targetUri: string): Promise<boolean>
 }
 
 /**
+ * A cache path for a DOWNLOAD, under a directory nothing else has used.
+ *
+ * WHY THE DIRECTORY IS FRESH EVERY TIME. A downloaded document used to be
+ * written to `cacheDirectory/<fileName>` — the same path on every download of
+ * the same document. `downloadAsync` overwrites it, so the BYTES were always
+ * current, but the URI handed onward never changed: on Android
+ * `getContentUriAsync` derives the `content://` URI from the path, and the
+ * external PDF viewers Android hands it to cache their render against that
+ * URI. Re-opening an invoice after it had been regenerated showed the
+ * previous render — a stale document produced from a perfectly fresh file.
+ *
+ * A directory per download makes the URI unique, so no viewer can have seen
+ * it before and there is nothing to serve from a cache.
+ *
+ * THE FILE NAME IS UNTOUCHED, which is the point of putting the uniqueness in
+ * the directory rather than in the name: the share sheet, the saved copy and
+ * the print job all still show exactly what the caller asked for.
+ *
+ * These land in the OS cache directory, which the system clears on its own —
+ * the same lifetime the single shared path already had.
+ */
+export async function freshDownloadTarget(fileName: string): Promise<string> {
+  const dir = `${FileSystem.cacheDirectory}dl-${Date.now()}-${Math.floor(Math.random() * 1e6)}/`;
+  try {
+    await FileSystem.makeDirectoryAsync(dir, { intermediates: true });
+    return `${dir}${encodeURIComponent(fileName)}`;
+  } catch {
+    // A cache directory that cannot be created must not cost the download —
+    // fall back to the shared path, which is what this replaced.
+    return cacheUriFor(fileName);
+  }
+}
+
+/**
  * Renders `html` to a PDF and returns it under exactly `fileName`.
  *
  * The returned `uri` is the cached file when it could be placed there, and

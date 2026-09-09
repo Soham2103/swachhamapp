@@ -6,6 +6,7 @@ import {
   InvoiceLaundryType,
   LAUNDRY_TYPE_LABELS,
   invoiceNumberFor,
+  issuedInvoiceNumberFor,
   displayInvoiceNumber,
 } from './gstInvoice.service';
 
@@ -309,9 +310,19 @@ export async function buildItemQuantityReport(
     [config.BUSINESS_TZ_OFFSET]
   );
 
-  // The SAME number the invoice for this business, period and type carries, so
-  // the two documents are visibly one pair rather than two loose files.
-  const invoiceNumber = invoiceNumberFor(String(business.id), from, to, laundryType ?? null);
+  /*
+   * The SAME number the invoice for this business, period and type carries, so
+   * the two documents are visibly one pair rather than two loose files.
+   *
+   * READ, not derived. The invoice's number comes from a counter now, so
+   * rebuilding it from the business and the dates would print a number that
+   * names no invoice — and this sheet exists precisely to be read alongside
+   * one. The derived form remains the fallback for a period whose invoice has
+   * not been issued yet, which is what this always showed.
+   */
+  const invoiceNumber =
+    (await issuedInvoiceNumberFor(String(business.id), from, to, laundryType ?? null)) ??
+    invoiceNumberFor(String(business.id), from, to, laundryType ?? null);
 
   logger.info(
     `[ItemReport] built for ${invoiceNumber}: ${rows.length} item(s) over ${dates.length} date(s), ` +

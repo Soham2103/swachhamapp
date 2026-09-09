@@ -1,6 +1,12 @@
 import { query } from '../config/database';
 import { AppError } from '../utils/appError';
-import { GstInvoice, InvoiceLaundryType, displayInvoiceNumber } from './gstInvoice.service';
+import {
+  GstInvoice,
+  InvoiceLaundryType,
+  displayInvoiceNumber,
+  findInvoiceForPeriod,
+  invoiceDateFor,
+} from './gstInvoice.service';
 import { BillingCycle, BILLING_CYCLE_LABELS } from './billingCycle.service';
 
 /**
@@ -49,6 +55,13 @@ export interface InvoiceHistoryEntry {
   laundry_type_label: string | null;
   /** The deduction this invoice was issued with, as a percentage. 0 for none. */
   discount_percent: number;
+  /**
+   * The lines added up BEFORE any deduction — the Sub Total the document
+   * prints. Equal to `taxable_amount` on every invoice issued without one.
+   */
+  subtotal_amount: number;
+  /** What the deduction came to in rupees. 0 when there was none. */
+  discount_amount: number;
   taxable_amount: number;
   tax_amount: number;
   total_amount: number;
@@ -59,8 +72,37 @@ export interface InvoiceHistoryEntry {
   amount_paid: number;
   /** total_amount - amount_paid, never below zero. */
   amount_due: number;
+  /** When this invoice was FIRST issued. Never reset by a re-issue. */
   generated_at: string;
-  /** The invoice date, which is the day it was generated. */
+  /**
+   * WHEN THE DOCUMENT WAS LAST ACTUALLY PRODUCED — "Last Generated On" on the
+   * invoice card, and what the list is ordered by.
+   *
+   * Equal to `generated_at` until the invoice is regenerated, and moves every
+   * time it is. This is the ONLY field that tracks the act of generating;
+   * `invoice_date` below is a different date entirely and is deliberately not
+   * derived from it.
+   */
+  last_generated_at: string;
+  /**
+   * The same moment as a plain calendar date — "Last Generated On" as the card
+   * shows it.
+   *
+   * Sent already reduced to a date rather than left to the app, because
+   * `last_generated_at` is a UTC instant: an invoice generated at 9pm IST is
+   * 15:30 UTC the same day, but one generated at 2am IST is the PREVIOUS day
+   * in UTC, so slicing the ISO string on the client would date it a day early.
+   */
+  last_generated_on: string;
+  /**
+   * THE INVOICE DATE: the billing period's last day plus two.
+   *
+   * A fact about the CYCLE, not about when anyone pressed Generate — so it is
+   * derived from `period_to` rather than from either timestamp above, and
+   * regenerating the invoice cannot move it. It was `generated_at`'s date,
+   * which meant the same invoice was dated differently every time it was
+   * produced.
+   */
   invoice_date: string;
 }
 
@@ -90,40 +132,23 @@ const money = (value: unknown) => Number(value ?? 0);
  * invoice rather than recomputed here, which is what makes the row and the
  * PDF agree by construction.
  *
- * IDEMPOTENT. Regenerating the same period for the same business updates the
- * existing row instead of adding a second one: the invoice number is derived
- * from the business and the period, so "the same invoice" is a fact about the
- * inputs, not a guess. The generation timestamp is deliberately NOT reset —
- * an invoice keeps the date it was first issued.
+ * IDEMPOTENT, ON THE BILLING PERIOD. Billing a cycle that already has an
+ * invoice UPDATES that row — new orders inside the period are added to the
+ * invoice that exists rather than raising a second one, and it keeps its
+ * number. The generation timestamp is deliberately NOT reset: an invoice keeps
+ * the date it was first issued.
+ *
+ * "THE SAME INVOICE" IS DECIDED BY `findInvoiceForPeriod`, the same function
+ * the number resolver uses. It used to be decided here, independently, by
+ * bucketing the period into a month — so the resolver could conclude an
+ * invoice was new (and take a fresh number) while this concluded it already
+ * existed (and overwrote the old row with that new number). One definition
+ * means the number and the row can no longer disagree.
  *
  * Never throws into the caller's path: recording history must not be able to
  * fail an invoice that has otherwise been generated correctly. A failure is
  * logged by the caller and the invoice is still returned.
  */
-function getPeriodKey(pFrom: string, pTo: string, pCycle: string): string {
-  const c = (pCycle || 'MONTHLY').toUpperCase();
-  const fromMonth = pFrom.slice(0, 7);
-  const fromYear = pFrom.slice(0, 4);
-
-  if (c === 'QUARTERLY') {
-    const m = Number(pFrom.slice(5, 7));
-    const q = Math.floor((m - 1) / 3) + 1;
-    return `${fromYear}-Q${q}`;
-  }
-  if (c === 'HALF_YEARLY') {
-    const m = Number(pFrom.slice(5, 7));
-    const h = m <= 6 ? 1 : 2;
-    return `${fromYear}-H${h}`;
-  }
-  if (c === 'YEARLY') {
-    return `${fromYear}`;
-  }
-  if (c === 'WEEKLY' || c === 'FORTNIGHTLY') {
-    return `${pFrom}_${pTo}`;
-  }
-  return `${fromMonth}`;
-}
-
 export async function recordInvoice(
   invoice: GstInvoice,
   options: { cycle?: BillingCycle | null; generatedBy?: string | null } = {}
@@ -132,52 +157,57 @@ export async function recordInvoice(
   const businessId = invoice.customer.id;
   const laundryType = invoice.laundry_type ?? null;
 
-  // Find all existing invoices for this business and laundry_type
-  const existingRows = await query<{ id: number; period_from: unknown; period_to: unknown; billing_cycle: string }>(
-    `SELECT id, period_from, period_to, billing_cycle
-       FROM business_invoices
-      WHERE business_id = ?
-        AND (laundry_type = ? OR (laundry_type IS NULL AND ? IS NULL))
-      ORDER BY id DESC`,
-    [businessId, laundryType, laundryType]
+  const existing = await findInvoiceForPeriod(
+    businessId,
+    invoice.period.from,
+    invoice.period.to,
+    laundryType
   );
-
-  const targetKey = getPeriodKey(invoice.period.from, invoice.period.to, cycle);
-
-  let existingId: number | null = null;
-  for (const row of existingRows.rows) {
-    const rFrom = dateKey(row.period_from);
-    const rTo = dateKey(row.period_to);
-    const rKey = getPeriodKey(rFrom, rTo, row.billing_cycle || cycle);
-    if (rKey === targetKey) {
-      existingId = row.id;
-      break;
-    }
-  }
+  const existingId: number | null = existing ? existing.id : null;
 
   if (existingId !== null) {
+    /*
+     * RE-ISSUING IS A GENERATION, AND THE LIST ORDERS BY IT.
+     *
+     * `last_generated_at` moves to now; `generated_at` is deliberately NOT
+     * touched — that one is the invoice DATE, printed on the document, and an
+     * invoice keeps the date it was first issued. But an operator who has this
+     * second regenerated an old period expects to find it at the top of the
+     * Issued Invoice list, and ordering by the first issue would leave it
+     * wherever it was raised months ago. See migration 065.
+     */
     await query(
       `UPDATE business_invoices
           SET invoice_number = ?,
+              -- The business's own running number, written beside the string
+              -- it appears in. COALESCE so a re-issue cannot blank it if the
+              -- invoice is ever rebuilt from a path that has no number.
+              business_serial = COALESCE(?, business_serial),
               period_from = ?,
               period_to = ?,
               billing_cycle = ?,
               laundry_type = ?,
               discount_percent = ?,
+              subtotal_amount = ?,
               taxable_amount = ?,
               tax_amount = ?,
               total_amount = ?,
               order_count = ?,
               line_count = ?,
-              generated_by = COALESCE(?, generated_by)
+              generated_by = COALESCE(?, generated_by),
+              last_generated_at = CURRENT_TIMESTAMP
         WHERE id = ?`,
       [
         invoice.invoice_number,
+        invoice.invoice_serial ?? null,
         invoice.period.from,
         invoice.period.to,
         cycle,
         laundryType,
         invoice.totals?.discount_percent ?? 0,
+        // The Sub Total the document printed, stored beside the taxable value
+        // it was reduced to — read off the same invoice, never recomputed.
+        invoice.totals?.subtotal ?? 0,
         invoice.totals?.taxable_value ?? 0,
         invoice.totals?.total_tax ?? 0,
         invoice.totals?.grand_total ?? 0,
@@ -190,18 +220,23 @@ export async function recordInvoice(
   } else {
     await query(
       `INSERT INTO business_invoices
-         (invoice_number, business_id, period_from, period_to, billing_cycle,
-          laundry_type, discount_percent, taxable_amount, tax_amount, total_amount,
-          order_count, line_count, generated_by)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+         (invoice_number, business_serial, business_id, period_from, period_to,
+          billing_cycle, laundry_type, discount_percent, subtotal_amount,
+          taxable_amount, tax_amount, total_amount, order_count, line_count,
+          generated_by)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         invoice.invoice_number,
+        // The running number within this business — the digits in the string
+        // above, so the row and the document can never disagree about it.
+        invoice.invoice_serial ?? null,
         businessId,
         invoice.period.from,
         invoice.period.to,
         cycle,
         laundryType,
         invoice.totals?.discount_percent ?? 0,
+        invoice.totals?.subtotal ?? 0,
         invoice.totals?.taxable_value ?? 0,
         invoice.totals?.total_tax ?? 0,
         invoice.totals?.grand_total ?? 0,
@@ -223,6 +258,7 @@ interface InvoiceRow {
   billing_cycle: string;
   laundry_type: InvoiceLaundryType | null;
   discount_percent: string | number | null;
+  subtotal_amount: string | number | null;
   taxable_amount: string | number;
   tax_amount: string | number;
   total_amount: string | number;
@@ -230,6 +266,7 @@ interface InvoiceRow {
   line_count: number;
   status: InvoiceStatus;
   generated_at: Date | string;
+  last_generated_at: Date | string | null;
   amount_paid: string | number | null;
 }
 
@@ -245,9 +282,9 @@ const SELECT_INVOICE = `
   SELECT i.id, i.invoice_number, i.business_id,
          COALESCE(NULLIF(b.establishment_name, ''), b.name) AS business_name,
          i.period_from, i.period_to, i.billing_cycle, i.laundry_type,
-         i.discount_percent,
+         i.discount_percent, i.subtotal_amount,
          i.taxable_amount, i.tax_amount, i.total_amount,
-         i.order_count, i.line_count, i.status, i.generated_at,
+         i.order_count, i.line_count, i.status, i.generated_at, i.last_generated_at,
          (SELECT COALESCE(SUM(r.payment_received), 0)
             FROM business_payment_receipts r
            WHERE r.business_id = i.business_id
@@ -281,6 +318,21 @@ function toEntry(row: InvoiceRow): InvoiceHistoryEntry {
   const paid = money(row.amount_paid);
   const cycle = row.billing_cycle as BillingCycle;
 
+  /*
+   * THE SUB TOTAL, AS ISSUED — falling back to the taxable value for a row
+   * written before the column existed, where the invoice carried no deduction
+   * and the two are the same addition.
+   *
+   * It is never divided back out of the taxable value by the percentage: that
+   * would be a second calculation of a figure the invoice already recorded,
+   * and the rounding would not survive it.
+   */
+  const taxable = money(row.taxable_amount);
+  const subtotal = money(row.subtotal_amount) || taxable;
+  // The deduction, as the difference between the two figures above — the same
+  // subtraction the document printed, not a re-application of the percentage.
+  const discountAmount = Math.max(0, Number((subtotal - taxable).toFixed(2)));
+
   return {
     id: String(row.id),
     invoice_number: row.invoice_number,
@@ -295,7 +347,9 @@ function toEntry(row: InvoiceRow): InvoiceHistoryEntry {
     laundry_type: row.laundry_type,
     laundry_type_label: row.laundry_type ? LAUNDRY_TYPE_LABELS[row.laundry_type] : null,
     discount_percent: Number(row.discount_percent || 0),
-    taxable_amount: money(row.taxable_amount),
+    subtotal_amount: subtotal,
+    discount_amount: discountAmount,
+    taxable_amount: taxable,
     tax_amount: money(row.tax_amount),
     total_amount: total,
     order_count: Number(row.order_count || 0),
@@ -304,7 +358,11 @@ function toEntry(row: InvoiceRow): InvoiceHistoryEntry {
     amount_paid: paid,
     amount_due: Math.max(0, Number((total - paid).toFixed(2))),
     generated_at: new Date(row.generated_at).toISOString(),
-    invoice_date: dateKey(row.generated_at),
+    last_generated_at: new Date(row.last_generated_at ?? row.generated_at).toISOString(),
+    last_generated_on: dateKey(row.last_generated_at ?? row.generated_at),
+    // From the PERIOD, through the same function the PDF's date comes from —
+    // so the card and the document it opens are always dated identically.
+    invoice_date: invoiceDateFor(to),
   };
 }
 
@@ -322,10 +380,27 @@ export async function listInvoicesForBusiness(
   const limit = Math.min(Math.max(Number(options.limit) || 50, 1), 200);
   const offset = Math.max(Number(options.offset) || 0, 0);
 
+  /*
+   * NEWEST GENERATED FIRST, which is not the same as newest period.
+   *
+   * It was ordered by `period_to`, so an invoice raised TODAY for an older
+   * period — a re-issue, a period billed late, a back-dated walking order
+   * tidied up afterwards — landed somewhere down the list, and the invoice the
+   * operator had just generated was not the one at the top. The list is a
+   * record of what has been ISSUED, so it is ordered by when.
+   *
+   * `last_generated_at`, not `generated_at`: the latter is the invoice DATE and
+   * is never reset, so regenerating an old period would leave it exactly where
+   * it was. See migration 065.
+   *
+   * `id` breaks the tie, because the column has one-second resolution and two
+   * invoices — a Hotel and a Guest for the same business — are routinely raised
+   * inside the same second. The later row is the later invoice.
+   */
   const rows = await query<InvoiceRow>(
     `${SELECT_INVOICE}
      WHERE i.business_id = ?
-     ORDER BY i.period_to DESC, i.id DESC`,
+     ORDER BY i.last_generated_at DESC, i.id DESC`,
     [businessId]
   );
 
@@ -353,14 +428,21 @@ export async function listInvoicesForBusiness(
       periodKey = `${entry.period_from}_${entry.period_to}`;
     }
 
+    /*
+     * ONE ROW PER BUSINESS + CYCLE + TYPE + PERIOD, AND IT IS THE FIRST SEEN.
+     *
+     * The query above already returns the newest-generated invoice first, so
+     * the first row for a key IS the latest issue of that invoice — keeping it
+     * is what stops a regenerated invoice appearing twice in the list.
+     *
+     * It used to compare ids and replace, which under the old period ordering
+     * could keep one row while the list showed it in another row's position.
+     * Insertion order into this map is the order the list is rendered in, so
+     * the row kept and the place it appears are now decided by the same thing.
+     */
     const uniqueKey = `${entry.business_id}_${cycle}_${laundry}_${periodKey}`;
     if (!seen.has(uniqueKey)) {
       seen.set(uniqueKey, entry);
-    } else {
-      const existing = seen.get(uniqueKey)!;
-      if (Number(entry.id) > Number(existing.id)) {
-        seen.set(uniqueKey, entry);
-      }
     }
   }
 

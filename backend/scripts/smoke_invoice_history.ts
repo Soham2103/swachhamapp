@@ -35,8 +35,23 @@ function check(name: string, ok: boolean, detail = '') {
   else { failed += 1; console.log(`  FAIL  ${name}${detail ? ` — ${detail}` : ''}`); }
 }
 
-/** A minimal invoice shaped like the one gstInvoice.service returns. */
-function fakeInvoice(businessId: string, number: string, from: string, to: string, total: number) {
+/**
+ * A minimal invoice shaped like the one gstInvoice.service returns.
+ *
+ * `discountPercent` drives the sub total, because the two are only the same
+ * figure when there is no deduction — which is exactly the case the stored
+ * `subtotal_amount` exists to tell apart from the taxable value.
+ */
+function fakeInvoice(
+  businessId: string,
+  number: string,
+  from: string,
+  to: string,
+  total: number,
+  discountPercent = 0
+) {
+  const taxable = total / 1.18;
+  const subtotal = discountPercent > 0 ? taxable / (1 - discountPercent / 100) : taxable;
   return {
     invoice_number: number,
     period: { from, to, cycle: 'MONTHLY' as const },
@@ -44,9 +59,19 @@ function fakeInvoice(businessId: string, number: string, from: string, to: strin
     laundry_type: null,
     lines: [{}, {}, {}],
     orders: [{}, {}],
-    totals: { taxable_value: total / 1.18, total_tax: total - total / 1.18, grand_total: total },
+    totals: {
+      subtotal: Math.round(subtotal * 100) / 100,
+      discount_percent: discountPercent,
+      discount_amount: Math.round((subtotal - taxable) * 100) / 100,
+      taxable_value: Math.round(taxable * 100) / 100,
+      total_tax: Math.round((total - taxable) * 100) / 100,
+      grand_total: total,
+    },
   } as any;
 }
+
+/** Waits out MySQL's one-second TIMESTAMP resolution, so an order is provable. */
+const tick = () => new Promise((r) => setTimeout(r, 1100));
 
 async function main() {
   /* ================================================================
@@ -115,8 +140,18 @@ async function main() {
   await query(`DELETE FROM business_invoices WHERE invoice_number IN (?, ?)`, [numA, numB]);
 
   try {
-    await recordInvoice(fakeInvoice(String(A.id), numA, '2026-08-01', '2026-08-31', 1180));
-    await recordInvoice(fakeInvoice(String(B.id), numB, '2026-08-01', '2026-08-31', 2360));
+    /*
+     * A PERIOD NO REAL INVOICE CAN BE IN.
+     *
+     * These were August 2026 — a month these businesses do have invoices for.
+     * `recordInvoice` is idempotent per business + cycle + laundry type +
+     * period month, so a fixture landing on a real invoice's month UPDATES
+     * that row, renaming it to the SMOKE number — and the cleanup at the end
+     * of this block then deletes it. 2019 predates the system, so these rows
+     * can only ever be this test's own.
+     */
+    await recordInvoice(fakeInvoice(String(A.id), numA, '2019-08-01', '2019-08-31', 1180));
+    await recordInvoice(fakeInvoice(String(B.id), numB, '2019-08-01', '2019-08-31', 2360));
 
     const histA = await listInvoicesForBusiness(String(A.id));
     const histB = await listInvoicesForBusiness(String(B.id));
@@ -138,12 +173,12 @@ async function main() {
     check('the whole total is outstanding', mine.amount_due === 1180, String(mine.amount_due));
     check('it carries the business name', !!mine.business_name, mine.business_name);
     check('the period is returned as plain dates',
-      mine.period_from === '2026-08-01' && mine.period_to === '2026-08-31',
+      mine.period_from === '2019-08-01' && mine.period_to === '2019-08-31',
       `${mine.period_from}..${mine.period_to}`);
 
     // -- REGENERATING THE SAME INVOICE MUST NOT DUPLICATE IT --
     const before = (await listInvoicesForBusiness(String(A.id))).total;
-    await recordInvoice(fakeInvoice(String(A.id), numA, '2026-08-01', '2026-08-31', 1500));
+    await recordInvoice(fakeInvoice(String(A.id), numA, '2019-08-01', '2019-08-31', 1500));
     const after = await listInvoicesForBusiness(String(A.id));
     check('regenerating the same invoice does not add a second row',
       after.total === before, `${before} -> ${after.total}`);
@@ -165,6 +200,114 @@ async function main() {
     check('while its own business can', ok.invoice_number === numA);
   } finally {
     await query(`DELETE FROM business_invoices WHERE invoice_number IN (?, ?)`, [numA, numB]);
+  }
+
+  /* ================================================================
+   * ISSUED INVOICE — the latest generated one is at the TOP
+   *
+   * The list used to be ordered by the period it covered, so an invoice
+   * raised today for an older month appeared below one raised weeks ago for
+   * a later month — and an operator who had just pressed Generate Invoice
+   * could not find it. These are the three cases that distinguishes.
+   * ================================================================ */
+  console.log('\nISSUED INVOICE — ORDERING');
+
+  const numOld = `SMOKE/INV/${A.id}/OLD`;
+  const numNew = `SMOKE/INV/${A.id}/NEW`;
+  await query(`DELETE FROM business_invoices WHERE invoice_number IN (?, ?)`, [numOld, numNew]);
+
+  try {
+    /*
+     * THE PERIODS ARE IN 2019, DELIBERATELY.
+     *
+     * `recordInvoice` is idempotent per business + cycle + laundry type +
+     * period MONTH, so a fixture landing on a month this business really has
+     * an invoice for would update that row — and the cleanup below would then
+     * delete a real invoice. 2019 predates the system, so these rows can only
+     * ever be this test's own.
+     */
+    // Raised first, for the LATER period. Under the old ordering this row
+    // outranked everything below it whatever was generated afterwards.
+    await recordInvoice(fakeInvoice(String(A.id), numNew, '2019-08-01', '2019-08-31', 5000));
+    await tick();
+    // Raised second, for an EARLIER period — the case that used to sink.
+    await recordInvoice(fakeInvoice(String(A.id), numOld, '2019-01-01', '2019-01-31', 3000));
+
+    let list = (await listInvoicesForBusiness(String(A.id))).invoices;
+    check(
+      'the invoice generated last is first, even though its period is older',
+      list[0]?.invoice_number === numOld,
+      `top is ${list[0]?.invoice_number}`
+    );
+    check(
+      'the one generated before it is next',
+      list[1]?.invoice_number === numNew,
+      `second is ${list[1]?.invoice_number}`
+    );
+
+    // -- REGENERATING AN OLD INVOICE BRINGS IT BACK TO THE TOP --
+    const countBefore = (await listInvoicesForBusiness(String(A.id))).total;
+    const issuedBefore = list.find((i) => i.invoice_number === numNew)!.generated_at;
+    await tick();
+    await recordInvoice(fakeInvoice(String(A.id), numNew, '2019-08-01', '2019-08-31', 5000));
+
+    const after = await listInvoicesForBusiness(String(A.id));
+    list = after.invoices;
+    check(
+      'regenerating an invoice brings it to the top of the list',
+      list[0]?.invoice_number === numNew,
+      `top is ${list[0]?.invoice_number}`
+    );
+    check(
+      'and does NOT add a second entry for it',
+      after.total === countBefore,
+      `${countBefore} -> ${after.total}`
+    );
+    check(
+      'while the moment it was first issued is untouched',
+      list[0]?.generated_at === issuedBefore,
+      `${issuedBefore} -> ${list[0]?.generated_at}`
+    );
+    check(
+      'and its last-generated time HAS moved',
+      !!list[0] && list[0].last_generated_at > list[0].generated_at,
+      `issued ${list[0]?.generated_at}, regenerated ${list[0]?.last_generated_at}`
+    );
+
+    /* ================================================================
+     * ISSUED INVOICE — the figures the card shows
+     * ================================================================ */
+    console.log('\nISSUED INVOICE — FIGURES');
+
+    const numDisc = `SMOKE/INV/${A.id}/DISC`;
+    await query(`DELETE FROM business_invoices WHERE invoice_number = ?`, [numDisc]);
+    // 11800 payable at 12% off: sub total 11363.64, deduction 1363.64,
+    // taxable 10000, tax 1800.
+    await recordInvoice(fakeInvoice(String(A.id), numDisc, '2019-03-01', '2019-03-31', 11800, 12));
+    const disc = (await listInvoicesForBusiness(String(A.id))).invoices
+      .find((i) => i.invoice_number === numDisc)!;
+
+    check(
+      'the Sub Total is stored, not inferred from the taxable value',
+      Math.abs(disc.subtotal_amount - 11363.64) < 0.02,
+      String(disc.subtotal_amount)
+    );
+    check(
+      'the deduction is the difference between Sub Total and Taxable',
+      Math.abs(disc.subtotal_amount - disc.discount_amount - disc.taxable_amount) < 0.02,
+      `${disc.subtotal_amount} - ${disc.discount_amount} = ${disc.taxable_amount}`
+    );
+    check(
+      'Taxable + tax = Total on the stored row',
+      Math.abs(disc.taxable_amount + disc.tax_amount - disc.total_amount) < 0.02,
+      `${disc.taxable_amount} + ${disc.tax_amount} = ${disc.total_amount}`
+    );
+    check('the deduction percentage is carried', disc.discount_percent === 12,
+      String(disc.discount_percent));
+
+    await query(`DELETE FROM business_invoices WHERE invoice_number = ?`, [numDisc]);
+  } finally {
+    await query(`DELETE FROM business_invoices WHERE invoice_number IN (?, ?)`, [numOld, numNew]);
   }
 
   console.log(`\n${passed} passed, ${failed} failed`);

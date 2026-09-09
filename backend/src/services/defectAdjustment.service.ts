@@ -3,7 +3,7 @@ import { AppError } from '../utils/appError';
 import { logger } from '../utils/logger';
 import { config } from '../config/env';
 import { cycleForBusiness, periodFor } from './billingCycle.service';
-import { invoiceNumberFor } from './gstInvoice.service';
+import { invoiceNumberFor, issuedInvoiceNumberFor } from './gstInvoice.service';
 import {
   sendAdjustmentTemplate,
   sendDefectTemplate,
@@ -282,8 +282,12 @@ export interface InvoicePosition {
  * to KNOW, and the caller attaches it to the result.
  */
 async function invoicePositionFor(orderId: string): Promise<InvoicePosition | null> {
-  const context = await query<{ business_id: string; order_date: string }>(
-    `SELECT bu.business_id,
+  const context = await query<{
+    business_id: string;
+    order_date: string;
+    laundry_type: 'hotel' | 'guest' | null;
+  }>(
+    `SELECT bu.business_id, o.laundry_type,
             DATE_FORMAT(DATE(CONVERT_TZ(o.created_at, '+00:00', ?)), '%Y-%m-%d') AS order_date
        FROM orders o
        JOIN business_users bu ON bu.id = o.business_user_id
@@ -296,7 +300,24 @@ async function invoicePositionFor(orderId: string): Promise<InvoicePosition | nu
 
   const cycle = await cycleForBusiness(String(row.business_id));
   const period = periodFor(cycle, String(row.order_date));
-  const invoiceNumber = invoiceNumberFor(String(row.business_id), period.from, period.to);
+  /*
+   * THE NUMBER THE INVOICE WAS ACTUALLY ISSUED UNDER.
+   *
+   * It was derived here, from the business and the period. That is how the
+   * numbers used to be built, but they come from a counter now, so a derived
+   * string names no invoice — and this number is what the receipts below are
+   * looked up BY. Deriving it would have found no payments against an invoice
+   * that has them.
+   *
+   * The order's own laundry type picks between the Hotel and the Guest invoice
+   * for the period, which are two separate documents with separate numbers.
+   * Falling back to the derived form keeps a period that has not been invoiced
+   * yet behaving exactly as it did.
+   */
+  const invoiceNumber =
+    (await issuedInvoiceNumberFor(
+      String(row.business_id), period.from, period.to, row.laundry_type ?? null
+    )) ?? invoiceNumberFor(String(row.business_id), period.from, period.to);
 
   const receipts = await query<any>(
     `SELECT COUNT(*) AS n,
