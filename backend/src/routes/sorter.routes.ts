@@ -446,8 +446,12 @@ router.post(
   async (req: Request, res: Response, next: NextFunction) => {
     try {
       const authReq = req as AuthenticatedRequest;
-      const { photoBase64, mimeType, description, notify, orderItemId, defectiveQuantity } =
-        req.body || {};
+      const {
+        photoBase64, mimeType, description, notify, orderItemId, defectiveQuantity,
+        // The two colour figures. Both optional: a report without them is
+        // stored exactly as reports were stored before they existed.
+        whiteDefectiveQuantity, colorDefectiveQuantity,
+      } = req.body || {};
 
       if (typeof photoBase64 !== 'string' || photoBase64.length === 0) {
         return next(new AppError('A defect photo is required', 400));
@@ -464,6 +468,8 @@ router.post(
         photoBase64,
         mimeType: typeof mimeType === 'string' && mimeType ? mimeType : 'image/jpeg',
         description: typeof description === 'string' ? description.slice(0, 500) : null,
+        whiteDefectiveQuantity,
+        colorDefectiveQuantity,
         orderItemId:
           orderItemId === null || orderItemId === undefined || orderItemId === ''
             ? null

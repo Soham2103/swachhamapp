@@ -252,7 +252,13 @@ const styles = StyleSheet.create({
     borderBottomWidth: 1,
     borderBottomColor: COLORS.Border,
   },
-  logo: { width: 38, height: 38, borderRadius: BORDER_RADIUS.sm },
+  logo: {
+    width: 38,
+    height: 38,
+    borderRadius: BORDER_RADIUS.sm,
+    borderWidth: 1,
+    borderColor: COLORS.Border,
+  },
   headerTitle: {
     fontFamily: TYPOGRAPHY.fontFamily,
     fontSize: TYPOGRAPHY.sizes.lg,

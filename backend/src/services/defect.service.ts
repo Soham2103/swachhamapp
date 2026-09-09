@@ -46,6 +46,16 @@ export interface DefectRecord {
   order_item_id: string | null;
   /** Pieces reported defective with this photo; null when none was given. */
   defective_quantity: number | null;
+  /**
+   * How that total divides between the two colours, as typed into Mark
+   * Defective.
+   *
+   * NULL is "not split", not zero: reports taken before these were recorded
+   * carry no division, and `defective_quantity` remains the figure that is
+   * populated on every row.
+   */
+  white_defective_quantity: number | null;
+  color_defective_quantity: number | null;
   photo_url: string;
   description: string | null;
   reported_by: string | null;
@@ -176,6 +186,8 @@ function toRecord(row: any): DefectRecord {
       ? null
       : String(row.order_item_id),
     defective_quantity: toNumberOrNull(row.defective_quantity),
+    white_defective_quantity: toNumberOrNull(row.white_defective_quantity),
+    color_defective_quantity: toNumberOrNull(row.color_defective_quantity),
     photo_url: row.photo_url,
     description: row.description || null,
     reported_by: row.reported_by === null ? null : String(row.reported_by),
@@ -760,6 +772,21 @@ export async function previewDefectNotification(params: {
  * The order must be one the Sorter can still act on; a cancelled or delivered
  * order is rejected rather than quietly accepting evidence against it.
  */
+/**
+ * One colour's figure as the column takes it.
+ *
+ * Anything that is not a whole, non-negative number becomes NULL — "not
+ * split" — rather than reaching the row as a guess. The column is UNSIGNED, so
+ * a negative would be refused by the database anyway; this makes it a stored
+ * absence instead of an error, which is the right outcome for a field the
+ * report does not require.
+ */
+function splitQuantity(value: unknown): number | null {
+  if (value === null || value === undefined || value === '') return null;
+  const n = Number(value);
+  return Number.isInteger(n) && n >= 0 ? n : null;
+}
+
 async function reportDefect(params: {
   orderId: string;
   sorterUserId: string;
@@ -770,6 +797,14 @@ async function reportDefect(params: {
   orderItemId?: string | null;
   /** Pieces reported defective with this photo. */
   defectiveQuantity?: number | null;
+  /**
+   * The same pieces, split by colour, as typed into Mark Defective.
+   *
+   * Optional: a report that carries no split stores NULL for both and behaves
+   * exactly as every report did before these columns existed.
+   */
+  whiteDefectiveQuantity?: number | null;
+  colorDefectiveQuantity?: number | null;
   notify?: boolean;
 }): Promise<DefectRecord> {
   const order = await loadOrderContact(params.orderId);
@@ -808,12 +843,20 @@ async function reportDefect(params: {
 
   await query(
     `INSERT INTO order_defects
-       (order_id, order_item_id, defective_quantity, photo_url, description, reported_by)
-     VALUES (?, ?, ?, ?, ?, ?)`,
+       (order_id, order_item_id, defective_quantity,
+        white_defective_quantity, color_defective_quantity,
+        photo_url, description, reported_by)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
     [
       params.orderId,
+      // The line is the one already validated against this order above, so
+      // the split is stored against the correct item or against none at all.
       orderItemId,
       defectiveQuantity,
+      // Stored beside the total, never instead of it. A report with no split
+      // writes NULL for both, which is what every existing report holds.
+      splitQuantity(params.whiteDefectiveQuantity),
+      splitQuantity(params.colorDefectiveQuantity),
       stored.url,
       params.description || null,
       params.sorterUserId,

@@ -74,7 +74,8 @@ export function buildBatchDetailsPdfHtml(batch: BatchRecord, logo: string | null
               text-transform: uppercase; color: #2D6A4F; margin: 2px 0 0; }
   .brand { font-size: 26px; font-weight: 700; color: #2D6A4F; margin: 0; letter-spacing: 1px; }
   .tagline { display: block; font-size: 12px; color: #6B7280; font-weight: 400; letter-spacing: .4px; margin: 2px 0 0; }
-  .logo { width: 62px; height: 62px; object-fit: contain; }
+  .logo { width: 62px; height: 62px; object-fit: contain;
+          border: 1px solid #E5E7EB; border-radius: 8px; }
   h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .6px; color: #2D6A4F; margin: 22px 0 8px; page-break-after: avoid; }
   .grid { display: flex; flex-wrap: wrap; }
   .cell { width: 50%; padding: 5px 0; font-size: 12px; }

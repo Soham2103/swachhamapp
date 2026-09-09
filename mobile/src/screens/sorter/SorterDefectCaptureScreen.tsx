@@ -58,6 +58,10 @@ export default function SorterDefectCaptureScreen({ route, navigation }: any) {
     serviceType = null,
     totalQuantity = null,
     defectiveQuantity = null,
+    // Carried from Mark Defective so the report records the same division the
+    // Sorter typed, against the same line.
+    whiteDefectiveQuantity = null,
+    colorDefectiveQuantity = null,
     reason = '',
   } = route.params || {};
 
@@ -149,6 +153,14 @@ export default function SorterDefectCaptureScreen({ route, navigation }: any) {
         // The line and the count the report is about. Both optional on the
         // server, so a screen opened without them still files a report.
         orderItemId: orderItemId ? String(orderItemId) : null,
+        whiteDefectiveQuantity:
+          whiteDefectiveQuantity === null || whiteDefectiveQuantity === undefined
+            ? null
+            : Number(whiteDefectiveQuantity),
+        colorDefectiveQuantity:
+          colorDefectiveQuantity === null || colorDefectiveQuantity === undefined
+            ? null
+            : Number(colorDefectiveQuantity),
         defectiveQuantity:
           defectiveQuantity === null || defectiveQuantity === undefined
             ? null

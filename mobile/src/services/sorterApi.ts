@@ -570,6 +570,9 @@ export const sorterApi = {
       orderItemId?: string | null;
       /** Pieces reported defective with this photo. */
       defectiveQuantity?: number | null;
+      /** The same pieces split by colour, as typed into Mark Defective. */
+      whiteDefectiveQuantity?: number | null;
+      colorDefectiveQuantity?: number | null;
     }
   ): Promise<ApiResponse<DefectRecord>> => {
     try {
@@ -583,6 +586,10 @@ export const sorterApi = {
           // accepted and described against the order as a whole.
           orderItemId: payload.orderItemId ?? null,
           defectiveQuantity: payload.defectiveQuantity ?? null,
+          // Both optional on the server too: a report without them stores
+          // NULL for each and reads exactly as an older report does.
+          whiteDefectiveQuantity: payload.whiteDefectiveQuantity ?? null,
+          colorDefectiveQuantity: payload.colorDefectiveQuantity ?? null,
         },
         // A photo takes longer than a JSON call, and the server also has to
         // hand it to Meta before replying.

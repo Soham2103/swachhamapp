@@ -474,5 +474,11 @@ const styles = StyleSheet.create({
   },
 
   // Square box + contain: the logo is never stretched or cropped.
-  brandBadgeImage: { width: BADGE_IMAGE_SIZE, height: BADGE_IMAGE_SIZE },
+  brandBadgeImage: {
+    width: BADGE_IMAGE_SIZE,
+    height: BADGE_IMAGE_SIZE,
+    borderWidth: 1,
+    borderColor: '#E5E7EB',
+    borderRadius: 8,
+  },
 });

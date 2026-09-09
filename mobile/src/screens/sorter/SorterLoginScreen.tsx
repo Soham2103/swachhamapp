@@ -134,7 +134,14 @@ export default function SorterLoginScreen({ navigation }: any) {
 const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: COLORS.Background },
   scroll: { padding: SPACING.lg, paddingTop: SPACING.xxl, alignItems: 'stretch' },
-  logo: { width: 120, height: 120, alignSelf: 'center' },
+  logo: {
+    width: 120,
+    height: 120,
+    alignSelf: 'center',
+    borderWidth: 1,
+    borderColor: COLORS.Border,
+    borderRadius: BORDER_RADIUS.md,
+  },
   brand: {
     fontFamily: TYPOGRAPHY.fontFamily,
     fontSize: TYPOGRAPHY.sizes.xxl,

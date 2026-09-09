@@ -203,6 +203,9 @@ const styles = StyleSheet.create({
   logo: {
     width: 130,
     height: 130,
+    borderWidth: 1,
+    borderColor: COLORS.Border,
+    borderRadius: BORDER_RADIUS.md,
   },
   headerBadge: {
     marginTop: SPACING.xs,

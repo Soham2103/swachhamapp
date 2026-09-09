@@ -144,7 +144,8 @@ const ORDER_PDF_DOC_OPEN = `<!DOCTYPE html><html><head><meta charset="utf-8" />
      instead of one being tuned to the image.
      NOTE: this whole stylesheet sits inside a TS template literal, so no
      backtick may appear in these comments. */
-  .logo { width: 82px; height: 82px; object-fit: contain; }
+  .logo { width: 82px; height: 82px; object-fit: contain;
+          border: 1px solid #E5E7EB; border-radius: 12px; }
   h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .6px; color: #2D6A4F; margin: 22px 0 8px; }
   .grid { display: flex; flex-wrap: wrap; }
   .cell { width: 50%; padding: 5px 0; font-size: 12px; }

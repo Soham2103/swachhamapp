@@ -319,6 +319,8 @@ const styles = StyleSheet.create({
     height: 40,
     borderRadius: BORDER_RADIUS.sm,
     backgroundColor: COLORS.Surface,
+    borderWidth: 1,
+    borderColor: COLORS.Border,
   },
   headerBack: {
     width: 40,

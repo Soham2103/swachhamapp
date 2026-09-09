@@ -286,7 +286,13 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
     backgroundColor: COLORS.Background,
   },
-  headerBadgeImage: { width: 30, height: 30 },
+  headerBadgeImage: {
+    width: 30,
+    height: 30,
+    borderWidth: 1,
+    borderColor: COLORS.Border,
+    borderRadius: BORDER_RADIUS.sm,
+  },
   headerTitle: {
     fontFamily: TYPOGRAPHY.fontFamily,
     fontSize: TYPOGRAPHY.sizes.lg,
@@ -322,7 +328,13 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     borderColor: COLORS.Border,
   },
-  avatarImage: { width: 20, height: 20 },
+  avatarImage: {
+    width: 20,
+    height: 20,
+    borderWidth: 1,
+    borderColor: COLORS.Border,
+    borderRadius: BORDER_RADIUS.sm,
+  },
 
   bubble: {
     maxWidth: '82%',

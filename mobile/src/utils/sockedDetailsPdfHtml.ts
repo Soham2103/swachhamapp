@@ -71,7 +71,8 @@ const DOC_OPEN = `<!DOCTYPE html><html><head><meta charset="utf-8" />
   * { box-sizing: border-box; }
   body { font-family: -apple-system, Roboto, Helvetica, Arial, sans-serif; color: #1B1B1B; padding: 28px; }
   .head { display: flex; align-items: center; gap: 14px; border-bottom: 3px solid #2D6A4F; padding-bottom: 14px; }
-  .logo { width: 82px; height: 82px; object-fit: contain; }
+  .logo { width: 82px; height: 82px; object-fit: contain;
+          border: 1px solid #E5E7EB; border-radius: 12px; }
   .brand { font-size: 26px; font-weight: 700; color: #2D6A4F; margin: 0; letter-spacing: 1px; }
   .tagline { display: block; font-size: 12px; color: #6B7280; font-weight: 400; letter-spacing: .4px; margin: 2px 0 0; }
   .docbusiness { text-align: center; font-size: 20px; font-weight: 700; color: #1B4332; margin: 16px 0 0; }

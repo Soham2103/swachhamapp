@@ -238,6 +238,9 @@ const styles = StyleSheet.create({
     width: 80,
     height: 80,
     marginBottom: SPACING.md,
+    borderWidth: 1,
+    borderColor: COLORS.Border,
+    borderRadius: BORDER_RADIUS.md,
   },
   welcomeText: {
     fontFamily: TYPOGRAPHY.fontFamily,
