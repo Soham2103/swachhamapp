@@ -9,6 +9,8 @@ import {
   assignableFor,
   categoriesForActor,
   windowForOrder,
+  ticketableOrders,
+  categoriesNeedingOrder,
   CATEGORIES_BY_ROLE,
   CATEGORY_LABELS,
   STATUS_LABELS,
@@ -102,11 +104,33 @@ router.get('/meta', async (req: Request, res: Response, next: NextFunction) => {
       role: actor.role,
       categories: categoriesForActor(actor),
       categories_by_role: CATEGORIES_BY_ROLE,
+      // Which categories need a delivered order chosen first, so the form
+      // knows when to show the picker without hard-coding the three names.
+      categories_needing_order: categoriesNeedingOrder(),
       category_labels: CATEGORY_LABELS,
       status_labels: STATUS_LABELS,
       priorities: ['LOW', 'MEDIUM', 'HIGH', 'URGENT'],
       can_raise: actor.role !== 'SUPER_ADMIN',
     });
+  } catch (error) {
+    next(error);
+  }
+});
+
+/**
+ * GET /api/tickets/eligible-orders
+ *
+ * The delivered orders this hotel may still raise a Quality Issue, Missing
+ * Item or Rewash Request against — inside the 48-hour window, newest first.
+ *
+ * THE REFERENCE ONLY. Order number, the recorded delivery moment and the hours
+ * left; no items, amounts, weights, address or status. See `ticketableOrders`.
+ */
+router.get('/eligible-orders', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const actor = await actorFrom(req);
+    const orders = await ticketableOrders(actor);
+    sendSuccess(res, orders, `${orders.length} order(s) within the window`);
   } catch (error) {
     next(error);
   }

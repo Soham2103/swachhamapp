@@ -7,7 +7,7 @@ import { SafeAreaView } from 'react-native-safe-area-context';
 import { Ionicons } from '@expo/vector-icons';
 import { COLORS, SPACING, TYPOGRAPHY, BORDER_RADIUS, SHADOWS } from '../../constants/theme';
 import ticketApi, {
-  TicketCategory, TicketPriority, TicketMeta, TicketWindow, PRIORITY_LABELS,
+  TicketCategory, TicketPriority, TicketMeta, TicketOrderRef, PRIORITY_LABELS,
 } from '../../services/ticketApi';
 import { extractErrorMessage } from '../../services/api';
 
@@ -19,11 +19,20 @@ import { extractErrorMessage } from '../../services/api';
  * and a hotel sees its four, and adding a category anywhere means changing the
  * service and nothing else.
  *
- * THE 48-HOUR WINDOW IS SHOWN, NOT GUESSED. When the form is opened against an
- * order, `window` reports the recorded delivery time, the deadline and what may
- * still be raised. An expired category is disabled with the reason on screen
- * rather than offered and refused — but the refusal is the server's, and it
- * still happens if this screen is wrong.
+ * THE DELIVERED ORDER IS CHOSEN, NOT TYPED. Quality Issue, Missing Item and
+ * Rewash Request are about what arrived, so each must name the delivery it is
+ * about. The picker lists only orders the server says are eligible — delivered
+ * to this establishment and still inside the 48 hours — so an undelivered
+ * order and an expired one are both simply absent rather than offered and
+ * refused. The server checks it again on submit regardless.
+ *
+ * THE PICKER SHOWS THE REFERENCE AND NOTHING ELSE: the order number, when it
+ * was delivered, and how long is left. No items, amounts or status — a ticket
+ * form is not a way to read an order back.
+ *
+ * INVOICE ISSUE IS DIFFERENT, deliberately. An invoice covers a billing period
+ * rather than one delivery, so it needs no order and has no deadline; it stays
+ * available even when nothing is inside the window.
  *
  * Opened from the ticket list, or from an order screen with `orderId` and
  * `orderNumber` already known.
@@ -32,7 +41,12 @@ export default function CreateTicketScreen({ navigation, route }: any) {
   const { orderId = null, orderNumber = null } = route.params || {};
 
   const [meta, setMeta] = useState<TicketMeta | null>(null);
-  const [window, setWindow] = useState<TicketWindow | null>(null);
+  /** The delivered orders still inside the window. Empty for non-hotel roles. */
+  const [orders, setOrders] = useState<TicketOrderRef[]>([]);
+  /** Which of them this ticket is about. Pre-selected when opened from one. */
+  const [selectedOrderId, setSelectedOrderId] = useState<string | null>(
+    orderId ? String(orderId) : null
+  );
   const [category, setCategory] = useState<TicketCategory | null>(null);
   const [title, setTitle] = useState('');
   const [description, setDescription] = useState('');
@@ -46,10 +60,13 @@ export default function CreateTicketScreen({ navigation, route }: any) {
       setError('');
       const m = await ticketApi.meta();
       setMeta(m.data);
-      if (orderId) {
-        const w = await ticketApi.window(String(orderId));
-        setWindow(w.data);
-      }
+      /*
+       * Only a hotel picks an order. The endpoint returns an empty list for
+       * every other role, so this is asked for unconditionally and simply
+       * comes back empty for a Sorter or a Manager.
+       */
+      const list = await ticketApi.eligibleOrders();
+      setOrders(list.data);
     } catch (e: any) {
       setError(extractErrorMessage(e, 'Could not open the ticket form'));
     } finally {
@@ -59,19 +76,31 @@ export default function CreateTicketScreen({ navigation, route }: any) {
 
   useEffect(() => { load(); }, [load]);
 
+  /** True when this category must name a delivered order. From the server. */
+  const needsOrder = (value: TicketCategory) =>
+    (meta?.categories_needing_order || []).includes(value);
+
   /**
-   * Is this category still allowed for this order?
+   * Is this category offerable at all right now?
    *
-   * Only the three delivery-related categories can expire, and only when an
-   * order is in play — `window.allowed_categories` already has that worked out
-   * on the server, so this asks it rather than repeating the rule.
+   * A category that needs an order is unavailable when nothing is inside the
+   * window — there is no delivery left to complain about. Invoice Issue never
+   * needs one and is therefore always offerable.
    */
-  const isAllowed = (value: TicketCategory) =>
-    !window || !orderId ? true : window.allowed_categories.includes(value);
+  const isAllowed = (value: TicketCategory) => !needsOrder(value) || orders.length > 0;
+
+  /** The chosen order, for the confirmation line under the picker. */
+  const selectedOrder = orders.find((o) => o.order_id === selectedOrderId) || null;
 
   const submit = async () => {
     if (busy) return;
     if (!category) { setError('Choose a ticket type.'); return; }
+    // The order is required for the three delivery categories and refused by
+    // the server without one, so it is asked for here first.
+    if (needsOrder(category) && !selectedOrderId) {
+      setError('Choose the delivered order this ticket is about.');
+      return;
+    }
     if (!title.trim()) { setError('A title is required.'); return; }
     if (!description.trim()) { setError('A description is required.'); return; }
 
@@ -83,7 +112,9 @@ export default function CreateTicketScreen({ navigation, route }: any) {
         title: title.trim(),
         description: description.trim(),
         priority,
-        order_id: orderId ? String(orderId) : null,
+        // Only sent for the categories that are about a delivery. Invoice
+        // Issue carries no order, which is what keeps it period-wide.
+        order_id: needsOrder(category) ? selectedOrderId : null,
       });
       Alert.alert('Ticket raised', `${res.data.ticket_number} — ${res.data.title}`, [
         {
@@ -138,27 +169,6 @@ export default function CreateTicketScreen({ navigation, route }: any) {
             </View>
           )}
 
-          {orderNumber ? (
-            <View style={styles.card}>
-              <Text style={styles.cardTitle}>About order</Text>
-              <Text style={styles.orderNumber}>{orderNumber}</Text>
-              {window?.delivered_at ? (
-                <Text style={window.expired ? styles.windowClosed : styles.windowOpen}>
-                  {window.expired
-                    ? 'The 48-hour window closed on ' +
-                      new Date(window.deadline!).toLocaleString('en-IN') +
-                      '. Quality Issue, Missing Item and Rewash Request can no longer be raised for this order.'
-                    : `${window.hours_remaining} hour(s) left to raise a Quality Issue, ` +
-                      'Missing Item or Rewash Request for this order.'}
-                </Text>
-              ) : (
-                <Text style={styles.meta}>
-                  This order has no recorded delivery yet, so the 48-hour window has not started.
-                </Text>
-              )}
-            </View>
-          ) : null}
-
           <View style={styles.card}>
             <Text style={styles.cardTitle}>Type</Text>
             {(meta?.categories || []).map((c) => {
@@ -173,7 +183,9 @@ export default function CreateTicketScreen({ navigation, route }: any) {
                   accessibilityRole="button"
                   accessibilityState={{ selected: on, disabled: !allowed }}
                   accessibilityLabel={
-                    allowed ? c.label : `${c.label}, unavailable — the 48-hour window has closed`
+                    allowed
+                      ? c.label
+                      : `${c.label}, unavailable — no delivered order is inside the 48-hour window`
                   }
                 >
                   <Ionicons
@@ -182,7 +194,7 @@ export default function CreateTicketScreen({ navigation, route }: any) {
                     color={allowed ? COLORS.Primary : COLORS.TextSecondary}
                   />
                   <Text style={[styles.optionText, on && styles.optionTextOn]}>{c.label}</Text>
-                  {!allowed ? <Text style={styles.meta}>window closed</Text> : null}
+                  {!allowed ? <Text style={styles.meta}>no order in window</Text> : null}
                 </TouchableOpacity>
               );
             })}
@@ -190,6 +202,58 @@ export default function CreateTicketScreen({ navigation, route }: any) {
               <Text style={styles.meta}>Your role does not raise tickets.</Text>
             ) : null}
           </View>
+
+          {/* THE DELIVERED ORDER. Shown only for the categories that are about
+              a delivery, and only the reference is listed. */}
+          {category && needsOrder(category) ? (
+            <View style={styles.card}>
+              <Text style={styles.cardTitle}>Delivered order</Text>
+              {orders.length === 0 ? (
+                <Text style={styles.windowClosed}>
+                  No delivered order is inside the 48-hour window, so this ticket type
+                  cannot be raised right now.
+                </Text>
+              ) : (
+                <>
+                  {orders.map((o) => {
+                    const on = selectedOrderId === o.order_id;
+                    return (
+                      <TouchableOpacity
+                        key={o.order_id}
+                        style={[styles.option, on && styles.optionOn]}
+                        onPress={() => setSelectedOrderId(o.order_id)}
+                        accessibilityRole="button"
+                        accessibilityState={{ selected: on }}
+                        accessibilityLabel={
+                          `Order ${o.order_number}, ${o.hours_remaining} hours left`
+                        }
+                      >
+                        <Ionicons
+                          name={on ? 'radio-button-on' : 'radio-button-off'}
+                          size={18}
+                          color={COLORS.Primary}
+                        />
+                        <View style={{ flex: 1, minWidth: 0 }}>
+                          <Text style={[styles.optionText, on && styles.optionTextOn]}>
+                            {o.order_number}
+                          </Text>
+                          <Text style={styles.meta}>
+                            Delivered {new Date(o.delivered_at).toLocaleString('en-IN')}
+                          </Text>
+                        </View>
+                        <Text style={styles.windowOpen}>{o.hours_remaining}h left</Text>
+                      </TouchableOpacity>
+                    );
+                  })}
+                  {selectedOrder ? (
+                    <Text style={styles.meta}>
+                      This ticket will be linked to {selectedOrder.order_number}.
+                    </Text>
+                  ) : null}
+                </>
+              )}
+            </View>
+          ) : null}
 
           <View style={styles.card}>
             <Text style={styles.cardTitle}>Priority</Text>

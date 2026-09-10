@@ -433,8 +433,20 @@ export default function BusinessTimeSlotScreen({ navigation }: any) {
         }}
         onClose={() => {
           setPlacedOrder(null);
-          // The cart is empty now, so there is nothing to come back to.
-          navigation.goBack();
+          /*
+           * HOME, NOT BACK. The cart was cleared by `confirmOrder` and the
+           * order is confirmed, so there is nothing behind this screen to
+           * return to — going back landed the user in a checkout flow for an
+           * order they had just placed.
+           *
+           * NESTED ON PURPOSE. This screen is in BusinessCartStack and the
+           * home page is HomeScreen inside BusinessHomeStack, a different
+           * tab. A bare navigate('HomeScreen') is not handled by this
+           * navigator; naming the tab and the screen inside it is what
+           * reaches it, and it lands on Home rather than wherever that tab
+           * was last left.
+           */
+          navigation.navigate('BusinessHome', { screen: 'HomeScreen' });
         }}
       />
     </SafeAreaView>

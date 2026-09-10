@@ -273,12 +273,13 @@ async function deliveredAtFor(orderId: string): Promise<Date | null> {
  * now: the window exists so a complaint is made while the laundry can still be
  * looked at, and that clock starts when it arrives.
  *
- * An order that has NOT been delivered is not refused. Nothing has arrived to
- * complain about yet, so there is no deadline to have missed — the window
- * begins later, and a premature complaint is a matter for the person reading
- * it rather than a rule to be enforced here.
+ * AN UNDELIVERED ORDER IS REFUSED. These three categories are about what
+ * arrived, so there is nothing to raise until something has: a complaint filed
+ * before the delivery describes laundry the hotel has not seen. The window
+ * opens when the order is recorded as delivered and closes 48 hours later.
  *
- * Invoice Issue never reaches this function.
+ * Invoice Issue never reaches this function — it needs no order and has no
+ * deadline.
  */
 async function assertWithinWindow(
   category: TicketCategory,
@@ -287,13 +288,19 @@ async function assertWithinWindow(
   if (!WINDOWED_CATEGORIES.includes(category)) return;
   if (!orderId) {
     throw new AppError(
-      `A ${CATEGORY_LABELS[category]} ticket must name the order it is about.`,
+      `A ${CATEGORY_LABELS[category]} ticket must name the delivered order it is about.`,
       400
     );
   }
 
   const deliveredAt = await deliveredAtFor(orderId);
-  if (!deliveredAt) return;
+  if (!deliveredAt) {
+    throw new AppError(
+      `${CATEGORY_LABELS[category]} can only be raised against a delivered order. ` +
+        'This order has not been recorded as delivered yet.',
+      409
+    );
+  }
 
   const deadline = new Date(deliveredAt.getTime() + WINDOW_HOURS * 60 * 60 * 1000);
   if (Date.now() <= deadline.getTime()) return;
@@ -338,6 +345,79 @@ export async function windowForOrder(orderId: string): Promise<{
       ? CATEGORIES_BY_ROLE.BUSINESS.filter((c) => !WINDOWED_CATEGORIES.includes(c))
       : CATEGORIES_BY_ROLE.BUSINESS,
   };
+}
+
+/**
+ * THE ORDERS A HOTEL MAY RAISE A DELIVERY TICKET AGAINST.
+ *
+ * Delivered to THIS establishment, and still inside the 48 hours. An order
+ * that has not been delivered is not here, and one whose window has closed
+ * drops out of the list on its own — the same clock `assertWithinWindow`
+ * enforces, so the list and the rule cannot disagree.
+ *
+ * WHAT IS NOT RETURNED. No items, no quantities, no weights, no amounts, no
+ * address, no status. The ticket needs to be LINKED to an order, and the
+ * number is what links it; a picker is not a place to read an order back.
+ * `delivered_at` and the hours left are included because they are what the
+ * hotel chooses by, and they are facts about the window rather than about the
+ * order's contents.
+ */
+export async function ticketableOrders(actor: Actor): Promise<Array<{
+  order_id: string;
+  order_number: string;
+  delivered_at: Date;
+  hours_remaining: number;
+}>> {
+  if (actor.role !== 'BUSINESS' || !actor.businessId) {
+    // Only a hotel picks an order this way. Sorter and Manager categories are
+    // not about a delivery and never reach here.
+    return [];
+  }
+
+  /*
+   * Scoped to the establishment in the WHERE clause, not filtered afterwards:
+   * another hotel's delivery can never appear in this list.
+   *
+   * The delivery moment is the earlier of the two recorded sources, matching
+   * `deliveredAtFor` exactly.
+   */
+  const rows = await query<any>(
+    `SELECT o.id, o.order_number,
+            LEAST(
+              COALESCE((SELECT MIN(d.delivered_at) FROM deliveries d
+                         WHERE d.order_id = o.id AND d.delivered_at IS NOT NULL),
+                       '9999-12-31 23:59:59'),
+              COALESCE((SELECT MIN(h.created_at) FROM order_status_history h
+                         WHERE h.order_id = o.id AND h.status IN ('DELIVERED','COMPLETED')),
+                       '9999-12-31 23:59:59')
+            ) AS delivered_at
+       FROM orders o
+       JOIN business_users bu ON bu.id = o.business_user_id
+      WHERE bu.business_id = ?
+     HAVING delivered_at < '9999-12-31'
+        AND delivered_at >= DATE_SUB(UTC_TIMESTAMP(), INTERVAL ? HOUR)
+      ORDER BY delivered_at DESC`,
+    [actor.businessId, WINDOW_HOURS]
+  );
+
+  return rows.rows.map((row: any) => {
+    const deliveredAt = new Date(row.delivered_at);
+    const deadline = new Date(deliveredAt.getTime() + WINDOW_HOURS * 3600 * 1000);
+    return {
+      order_id: String(row.id),
+      order_number: row.order_number,
+      delivered_at: deliveredAt,
+      hours_remaining: Math.max(
+        0,
+        Math.round(((deadline.getTime() - Date.now()) / 3600000) * 10) / 10
+      ),
+    };
+  });
+}
+
+/** The categories that require a delivered order to be chosen first. */
+export function categoriesNeedingOrder(): TicketCategory[] {
+  return [...WINDOWED_CATEGORIES];
 }
 
 /* ============================================================

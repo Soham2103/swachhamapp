@@ -88,8 +88,24 @@ export interface TicketMeta {
   categories_by_role: Record<string, TicketCategory[]>;
   category_labels: Record<TicketCategory, string>;
   status_labels: Record<TicketStatus, string>;
+  /** The categories that require a delivered order to be chosen first. */
+  categories_needing_order: TicketCategory[];
   priorities: TicketPriority[];
   can_raise: boolean;
+}
+
+/**
+ * A delivered order a hotel may still raise a ticket against.
+ *
+ * THE REFERENCE ONLY — the number, when it was delivered and how long is left.
+ * The server sends no items, amounts or status, so a ticket form cannot become
+ * a way to read an order back.
+ */
+export interface TicketOrderRef {
+  order_id: string;
+  order_number: string;
+  delivered_at: string;
+  hours_remaining: number;
 }
 
 /** How long is left to raise a delivery-related ticket against an order. */
@@ -203,6 +219,10 @@ const ticketApi = {
         `/api/tickets/${ticketId}/assignable`
       )
     ).data,
+
+  /** The delivered orders still inside the 48-hour window, newest first. */
+  eligibleOrders: async (): Promise<ApiResponse<TicketOrderRef[]>> =>
+    (await apiClient.get<ApiResponse<TicketOrderRef[]>>('/api/tickets/eligible-orders')).data,
 
   window: async (orderId: string): Promise<ApiResponse<TicketWindow>> =>
     (await apiClient.get<ApiResponse<TicketWindow>>(`/api/tickets/order/${orderId}/window`)).data,
