@@ -159,6 +159,11 @@ import SorterRequestsScreen
 
 import SorterOrderDetailsScreen
   from '../screens/sorter/SorterOrderDetailsScreen';
+// The one ticket system. The same three screens serve every role; the
+// server scopes what each of them sees. See services/ticket.service.ts.
+import TicketsScreen from '../screens/tickets/TicketsScreen';
+import TicketDetailScreen from '../screens/tickets/TicketDetailScreen';
+import CreateTicketScreen from '../screens/tickets/CreateTicketScreen';
 
 import SorterScanScreen
   from '../screens/sorter/SorterScanScreen';
@@ -559,6 +564,13 @@ function BusinessHomeStack() {
       {/* 4. Existing Services: SubCategories & Items */}
       <Stack.Screen name="BusinessSubCategoriesScreen" component={BusinessSubCategoriesScreen} />
       <Stack.Screen name="BusinessItemsScreen" component={BusinessItemsScreen} />
+
+      {/* THE TICKET SCREENS. The hotel raises tickets and reads the replies.
+          Registered in every role stack that has a Tickets button, under the
+          same route names, because only one stack is mounted at a time. */}
+      <Stack.Screen name="TicketsScreen" component={TicketsScreen} />
+      <Stack.Screen name="TicketDetailScreen" component={TicketDetailScreen} />
+      <Stack.Screen name="CreateTicketScreen" component={CreateTicketScreen} />
     </Stack.Navigator>
   );
 }
@@ -688,6 +700,13 @@ function ManagerStack() {
           from ManagerRequests above, which is the manager's own account
           creation requests and is unchanged. */}
       <Stack.Screen name="ManagerOrderRequests" component={ManagerOrderRequestsScreen} />
+
+      {/* THE TICKET SCREENS. The Manager raises and answers tickets.
+          Registered in every role stack that has a Tickets button, under the
+          same route names, because only one stack is mounted at a time. */}
+      <Stack.Screen name="TicketsScreen" component={TicketsScreen} />
+      <Stack.Screen name="TicketDetailScreen" component={TicketDetailScreen} />
+      <Stack.Screen name="CreateTicketScreen" component={CreateTicketScreen} />
     </Stack.Navigator>
   );
 }
@@ -740,6 +759,13 @@ function SuperAdminStack() {
       {/* Creation requests: one screen, the kind chosen by route param. */}
       <Stack.Screen name="SuperAdminRequests" component={SuperAdminRequestsScreen} />
       <Stack.Screen name="SuperAdminManagers" component={SuperAdminManagersScreen} />
+
+      {/* THE TICKET SCREENS. The Super Admin answers every role's tickets.
+          Registered in every role stack that has a Tickets button, under the
+          same route names, because only one stack is mounted at a time. */}
+      <Stack.Screen name="TicketsScreen" component={TicketsScreen} />
+      <Stack.Screen name="TicketDetailScreen" component={TicketDetailScreen} />
+      <Stack.Screen name="CreateTicketScreen" component={CreateTicketScreen} />
     </Stack.Navigator>
   );
 }
@@ -775,6 +801,12 @@ function SorterStack() {
       {/* Both home buttons land here: mode 'today' or 'previous'. */}
       <Stack.Screen name="SorterRequestsScreen" component={SorterRequestsScreen} />
       <Stack.Screen name="SorterOrderDetailsScreen" component={SorterOrderDetailsScreen} />
+      {/* THE TICKET SCREENS. The Sorter raises tickets and reads the replies.
+          Registered in every role stack that has a Tickets button, under the
+          same route names, because only one stack is mounted at a time. */}
+      <Stack.Screen name="TicketsScreen" component={TicketsScreen} />
+      <Stack.Screen name="TicketDetailScreen" component={TicketDetailScreen} />
+      <Stack.Screen name="CreateTicketScreen" component={CreateTicketScreen} />
       <Stack.Screen name="SorterScanScreen" component={SorterScanScreen} />
       <Stack.Screen name="SorterDefectCaptureScreen" component={SorterDefectCaptureScreen} />
       {/* Batch processing: eligibility -> proposed distribution -> confirmed

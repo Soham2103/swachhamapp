@@ -28,6 +28,7 @@ import managerRoutes from './routes/manager.routes';
 import { UPLOAD_ROOT, UPLOAD_URL_PREFIX } from './utils/fileStorage';
 import adminRoutes from './routes/admin.routes';
 import riderRoutes from './routes/rider.routes';
+import ticketRoutes from './routes/ticket.routes';
 
 const app = express();
 const server = http.createServer(app);
@@ -132,6 +133,9 @@ app.use('/api/super-admin', superAdminRoutes);
 app.use('/api/manager', managerRoutes);
 app.use('/api/admin', adminRoutes);
 app.use('/api/rider', riderRoutes);
+// The one ticket router. Every role uses it; the service decides what each
+// of them sees and may do. See routes/ticket.routes.ts.
+app.use('/api/tickets', ticketRoutes);
 
 // Error Handling Middleware
 app.use(errorHandler);

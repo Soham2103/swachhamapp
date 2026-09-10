@@ -185,6 +185,29 @@ export default function SorterDashboardScreen({ navigation }: any) {
           <Ionicons name="chevron-forward" size={24} color={COLORS.Primary} />
         </TouchableOpacity>
 
+        {/* TICKETS. The one ticket system: the Sorter raises Quantity
+            Mismatched, Damage Item and Material Requisition here and reads the
+            replies. Resolving them is the Super Admin's. A fourth button in
+            the same shape as the three above; none of those changed. */}
+        <TouchableOpacity
+          style={[styles.actionButton, styles.actionSecondary]}
+          onPress={() => navigation.navigate('TicketsScreen')}
+          activeOpacity={0.85}
+          accessibilityRole="button"
+          accessibilityLabel="Tickets"
+        >
+          <View style={[styles.actionIcon, styles.actionIconSecondary]}>
+            <Ionicons name="ticket-outline" size={26} color={COLORS.Primary} />
+          </View>
+          <View style={styles.actionTextBlock}>
+            <Text style={styles.actionTitleSecondary}>Tickets</Text>
+            <Text style={styles.actionCaptionSecondary}>
+              Raise an issue and follow its replies
+            </Text>
+          </View>
+          <Ionicons name="chevron-forward" size={24} color={COLORS.Primary} />
+        </TouchableOpacity>
+
         {error ? (
           <View style={styles.errorBlock}>
             <Text style={styles.errorText}>{error}</Text>

@@ -1,12 +1,12 @@
 import React, { useCallback, useMemo, useState } from 'react';
 import {
   View, Text, ScrollView, TouchableOpacity, ActivityIndicator, RefreshControl,
-  TextInput, Alert, Modal,
+  TextInput, Alert, Modal, StyleSheet,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { useFocusEffect } from '@react-navigation/native';
 import { Ionicons } from '@expo/vector-icons';
-import { COLORS, SPACING } from '../../constants/theme';
+import { COLORS, SPACING, TYPOGRAPHY } from '../../constants/theme';
 import { sa, STATUS_TONE } from './styles';
 import superAdminApi, { BusinessAdmin } from '../../services/superAdminApi';
 import { ActionButton } from './SuperAdminCustomerPricesScreen';
@@ -161,7 +161,12 @@ export default function SuperAdminManageBusinessesScreen({ navigation }: any) {
               accessibilityRole="button"
               accessibilityState={{ selected: on }}
             >
-              <Text style={[sa.filterChipText, on && sa.filterChipTextOn]}>
+              {/* statusTabText comes last so it settles the size and weight
+                  for all five, while sa.filterChipTextOn keeps owning the
+                  selected colour. */}
+              <Text
+                style={[sa.filterChipText, on && sa.filterChipTextOn, styles.statusTabText]}
+              >
                 {value === 'ALL' ? 'All' : value.charAt(0) + value.slice(1).toLowerCase()}
               </Text>
             </TouchableOpacity>
@@ -439,3 +444,31 @@ function StatusPill({ status }: { status: string }) {
     </View>
   );
 }
+
+/**
+ * THE FIVE STATUS TABS, and nothing else on this screen.
+ *
+ * LOCAL, NOT IN `sa`. `sa.filterChipText` is the shared chip label used by a
+ * dozen Super Admin screens — expenses, prices, the KG reports — so changing it
+ * there would restyle every one of them. This overrides it for these five tabs
+ * only, and is applied after the shared styles so it is the one that lands.
+ *
+ * ONE WEIGHT FOR ALL FIVE. The shared styles set 600 when a chip is off and 800
+ * when it is on, so a tab changed weight as it was tapped and the row was never
+ * uniform. 700 in both states is bold and identical across the five, which is
+ * what makes them read as one set of tabs.
+ *
+ * COLOUR IS NOT TOUCHED. `sa.filterChipTextOn` still supplies the selected
+ * label colour; this sets no colour of its own, so selection looks exactly as
+ * it always has.
+ */
+const styles = StyleSheet.create({
+  statusTabText: {
+    // sizes.base (16) rather than sizes.sm (14): the tabs are the first thing
+    // read on the page and 14 was small for a bold label. The row is a
+    // horizontal ScrollView, so the extra width scrolls as it already did.
+    fontSize: TYPOGRAPHY.sizes.base,
+    fontWeight: '700',
+    textAlign: 'center',
+  },
+});

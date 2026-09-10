@@ -367,6 +367,32 @@ export default function HomeScreen({ navigation }: any) {
               </View>
             </TouchableOpacity>
           </View>
+
+          {/* TICKETS — BUSINESS ONLY, gated on the same `isBusinessUser` the
+              establishment name above uses. This screen is shared with the
+              customer stack, and a customer takes no part in the ticket
+              system. Quality Issue, Missing Item and Rewash Request are open
+              for 48 hours after a delivery; Invoice Issue has no deadline. */}
+          {isBusinessUser ? (
+            <TouchableOpacity
+              style={styles.ticketsEntry}
+              onPress={() => navigation.navigate('TicketsScreen')}
+              activeOpacity={0.85}
+              accessibilityRole="button"
+              accessibilityLabel="Tickets"
+            >
+              <View style={styles.ticketsIcon}>
+                <Ionicons name="ticket-outline" size={22} color={LAUNDRY_TEAL} />
+              </View>
+              <View style={{ flex: 1, minWidth: 0 }}>
+                <Text style={styles.ticketsTitle}>Tickets</Text>
+                <Text style={styles.ticketsSubtitle} numberOfLines={1}>
+                  Raise and track an issue with an order or invoice
+                </Text>
+              </View>
+              <Ionicons name="chevron-forward" size={22} color={LAUNDRY_TEAL} />
+            </TouchableOpacity>
+          ) : null}
         </View>
       </ScrollView>
 
@@ -630,6 +656,40 @@ const styles = StyleSheet.create({
     fontWeight: '600',
     fontSize: TYPOGRAPHY.sizes.sm,
   },
+  /* The Tickets entry under the two laundry cards. Card-shaped like them, and
+     deliberately quieter: it is a way in, not a third laundry type. */
+  ticketsEntry: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 12,
+    marginTop: 14,
+    padding: 14,
+    borderRadius: 16,
+    backgroundColor: '#ffbd4a',
+    borderWidth: 1,
+    borderColor: '#E5E7EB',
+  },
+  ticketsIcon: {
+    width: 40,
+    height: 40,
+    borderRadius: 20,
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: '#EAF6F5',
+  },
+  ticketsTitle: {
+    fontFamily: TYPOGRAPHY.fontFamily,
+    fontSize: TYPOGRAPHY.sizes.base,
+    fontWeight: '800',
+    color: '#1B1B1B',
+  },
+  ticketsSubtitle: {
+    fontFamily: TYPOGRAPHY.fontFamily,
+    fontSize: TYPOGRAPHY.sizes.xs,
+    color: '#6B7280',
+    marginTop: 2,
+  },
+
   laundryTypeSection: {
     // No bottom margin: the scroll container's own paddingBottom already
     // ends the page, and this margin was pure height the cards needed back.

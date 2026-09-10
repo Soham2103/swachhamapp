@@ -112,6 +112,17 @@ export default function ManagerDashboardScreen({ navigation }: any) {
           onPress={() => navigation.navigate('ManagerOrderRequests', { source: 'BUSINESS' })}
         />
 
+        {/* TICKETS. The Manager raises Technical Issue and Material
+            Requisition here, and answers the tickets hotels raise. Same
+            <Action> as every other entry on this screen. */}
+        <Text style={sa.label}>TICKETS</Text>
+        <Action
+          icon="ticket-outline"
+          title="Tickets"
+          subtitle="Raise a ticket, and answer the ones hotels raise"
+          onPress={() => navigation.navigate('TicketsScreen')}
+        />
+
         <Text style={sa.label}>CREATE A REQUEST</Text>
         <Action
           icon="business-outline"

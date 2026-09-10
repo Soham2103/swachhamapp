@@ -273,13 +273,13 @@ export default function SuperAdminDashboardScreen({ navigation }: any) {
         <View style={styles.row}>
           <ActionTile
             icon="business-outline"
-            label="Business requests"
+            label="Business Requests"
             badge={badges.BUSINESS}
             onPress={() => openRequests('BUSINESS')}
           />
           <ActionTile
             icon="bicycle-outline"
-            label="Rider requests"
+            label="Rider Requests"
             badge={badges.RIDER}
             onPress={() => openRequests('RIDER')}
           />
@@ -287,21 +287,34 @@ export default function SuperAdminDashboardScreen({ navigation }: any) {
         <View style={styles.row}>
           <ActionTile
             icon="shirt-outline"
-            label="Sorter requests"
+            label="Sorter Requests"
             badge={badges.SORTER}
             onPress={() => openRequests('SORTER')}
           />
-          {/* Managers is an ACCOUNT screen, not a request queue — there is no
-              MANAGER request type — so it keeps its plain tile and its own
-              navigation, unchanged. */}
+          {/* Managers still opens an ACCOUNT screen, not a request queue —
+              there is no MANAGER request type — so it carries no badge and
+              keeps its own navigation. Only its label changed. */}
           <ActionTile
             icon="people-outline"
-            label="Managers"
+            label="Managers Requests"
             onPress={() => navigation.navigate('SuperAdminManagers')}
           />
         </View>
 
         <Text style={styles.sectionTitle}>Manage</Text>
+
+        {/* TICKETS: every ticket in the application, from every role. The
+            Super Admin is the only resolver for Sorter and Manager tickets and
+            shares the hotels' with the Manager, so this is the one entry that
+            sees all of them. */}
+        <TouchableOpacity
+          style={[styles.wideAction, { marginBottom: SPACING.sm }]}
+          onPress={() => navigation.navigate('TicketsScreen')}
+        >
+          <Ionicons name="ticket-outline" size={18} color={COLORS.Primary} />
+          <Text style={styles.wideActionText}>Tickets</Text>
+          <Ionicons name="chevron-forward" size={18} color={COLORS.TextSecondary} />
+        </TouchableOpacity>
 
         {/* REPORT: the KG reports, and wherever reporting grows next.
             First in the section because a report is read far more often
@@ -529,7 +542,9 @@ const styles = StyleSheet.create({
   },
   actionLabel: {
     fontFamily: TYPOGRAPHY.fontFamily, fontSize: TYPOGRAPHY.sizes.sm,
-    fontWeight: '600', color: COLORS.TextPrimary, marginTop: SPACING.sm,
+    // Bold across all four options of the Requests card. ActionTile is used
+    // only by those four, so nothing else on this screen is affected.
+    fontWeight: '700', color: COLORS.TextPrimary, marginTop: SPACING.sm,
   },
   dot: {
     position: 'absolute', top: SPACING.md, right: SPACING.md,
