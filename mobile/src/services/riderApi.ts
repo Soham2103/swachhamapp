@@ -113,6 +113,23 @@ export interface RiderJob {
   /** Only present while the rider is carrying the job. */
   contact_mobile: string | null;
   handover_code_required: boolean;
+  /**
+   * THE ACCEPTANCE STEP, inside the order.
+   *
+   * `acceptance_required` is the only field the screen has to branch on: true
+   * means show the section and block every onward action until it is done.
+   * It is true only for a business order that has not been accepted yet — a
+   * customer pickup has no counting step and never sees one.
+   *
+   * The server enforces the same rule, so these fields decide what the rider
+   * is SHOWN, never whether the rule holds.
+   */
+  has_business: boolean;
+  acceptance_required: boolean;
+  door_acceptance_mode: DoorAcceptanceMode | null;
+  /** Total pieces counted. Only ever set when the mode is WITH_COUNT. */
+  accepted_piece_count: number | null;
+  door_accepted_at: string | null;
   weight_kg: number;
   item_count: number;
   total_quantity: number;
@@ -239,9 +256,12 @@ const riderApi = {
    * accepted either way, so this is information, not a failure.
    */
   acceptOfferWithCounting: async (
-    jobId: string
-  ): Promise<ApiResponse<{ job: RiderJob; messaged: boolean }>> => {
-    const response = await apiClient.post(`/api/rider/offers/${jobId}/accept-with-counting`);
+    jobId: string,
+    pieceCount: number
+  ): Promise<ApiResponse<{ job: RiderJob; messaged: boolean; piece_count: number }>> => {
+    const response = await apiClient.post(`/api/rider/offers/${jobId}/accept-with-counting`, {
+      pieceCount,
+    });
     return response.data;
   },
 

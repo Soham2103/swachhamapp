@@ -621,7 +621,9 @@ export async function approveRequest(
   const email = await sendCredentialsEmail({
     kind: request.request_type,
     to: created.username,
-    accountName: created.name,
+    // A business is addressed by its establishment name; staff have none, so
+    // this is their own name either way.
+    accountName: created.establishmentName || created.name,
     username: created.username,
     password,
   });
@@ -647,7 +649,7 @@ async function approveBusiness(
   request: CreationRequestRow,
   reviewerId: string,
   passwordHash: string
-): Promise<{ id: string; name: string; username: string }> {
+): Promise<{ id: string; name: string; establishmentName: string; username: string }> {
   const payload = request.payload as BusinessRequestPayload;
 
   // Re-validated from the stored payload rather than trusted: a row edited in
@@ -783,7 +785,15 @@ async function approveBusiness(
 
     // Required by validateBusinessPayload for the head, which is the only
     // contact whose email is ever read.
-    return { id: businessId, name, username: validated.business_head.email! };
+    // `name` is the LEGAL name. The credentials email addresses the business
+    // by the name it trades under, so the establishment name travels with it
+    // — falling back to the legal name exactly as the column does.
+    return {
+      id: businessId,
+      name,
+      establishmentName: validated.establishment_name || name,
+      username: validated.business_head.email!,
+    };
   } catch (error) {
     await connection.rollback();
     logger.error(`[CreationRequest] business approval ${request.id} rolled back: ${(error as Error).message}`);
@@ -798,7 +808,7 @@ async function approveStaff(
   request: CreationRequestRow,
   reviewerId: string,
   passwordHash: string
-): Promise<{ id: string; name: string; username: string }> {
+): Promise<{ id: string; name: string; establishmentName?: string; username: string }> {
   const payload = request.payload as StaffRequestPayload;
   const validated = validateStaffPayload(payload, request.request_type === 'RIDER' ? 'Rider' : 'Sorter');
   await assertStaffNotTaken(validated, request.id);

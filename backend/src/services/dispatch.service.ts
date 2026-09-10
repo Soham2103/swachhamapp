@@ -131,6 +131,10 @@ async function resolvePickupPoint(orderId: string): Promise<{
   contact_name: string | null;
   contact_mobile: string | null;
   order_number: string;
+  /** Which kind of address this is, so a missing-point message can name it. */
+  is_business: boolean;
+  /** The establishment or address this point belongs to, for that message. */
+  location_label: string;
 }> {
   const result = await query<any>(
     `SELECT o.order_number,
@@ -159,10 +163,39 @@ async function resolvePickupPoint(orderId: string): Promise<{
 
   const isBusiness = row.biz_lat !== null || row.biz_name !== null;
 
+  /*
+   * A COORDINATE PAIR IS TAKEN WHOLE OR NOT AT ALL.
+   *
+   * Reading latitude and longitude independently can combine one row's
+   * latitude with another's longitude and produce a point in neither place.
+   * `pair` returns both or nothing, so every fallback below is a complete
+   * location.
+   */
+  const pair = (lat: unknown, lng: unknown): { lat: number; lng: number } | null => {
+    const a = toNum(lat);
+    const b = toNum(lng);
+    return a !== null && b !== null ? { lat: a, lng: b } : null;
+  };
+
+  /*
+   * THE ESTABLISHMENT FIRST, THE ORDER'S OWN ADDRESS SECOND.
+   *
+   * A business order is collected from the establishment, so its point wins.
+   * But `businesses.latitude` is optional and frequently unset, and an order
+   * placed against a saved address still carries one through `address_id` —
+   * so that is used rather than giving up and stranding the job. A customer
+   * order has only ever had the one source and is unaffected.
+   */
+  const point =
+    (isBusiness ? pair(row.biz_lat, row.biz_lng) : null) ?? pair(row.cust_lat, row.cust_lng);
+
   return {
     order_number: row.order_number,
-    latitude: toNum(isBusiness ? row.biz_lat : row.cust_lat),
-    longitude: toNum(isBusiness ? row.biz_lng : row.cust_lng),
+    latitude: point ? point.lat : null,
+    longitude: point ? point.lng : null,
+    is_business: isBusiness,
+    location_label:
+      (isBusiness ? row.biz_name || row.biz_address : row.cust_address) || 'this address',
     address_text: (isBusiness ? row.biz_address : row.cust_address) || null,
     contact_name: (isBusiness ? row.biz_name : row.cust_name) || null,
     // The number the order was actually placed from wins: for a business it
@@ -215,6 +248,25 @@ function matchPointFor(job: {
     return { latitude: job.origin_latitude, longitude: job.origin_longitude };
   }
   return { latitude: job.latitude, longitude: job.longitude };
+}
+
+/**
+ * WHY A JOB CANNOT BE MATCHED, in words the person who can fix it can act on.
+ *
+ * "has no coordinates" says what the code found; it does not say whose
+ * address, or where to go and put that right. Dispatch failures are resolved
+ * by a human opening a record and setting a pickup point, so the message
+ * names the establishment or address and the screen that edits it.
+ */
+function missingCoordinatesMessage(point: {
+  is_business: boolean;
+  location_label: string;
+}): string {
+  return point.is_business
+    ? `The pickup address for "${point.location_label}" has no map coordinates. ` +
+        'Set the pickup location on that business profile before a rider can be matched.'
+    : `The address "${point.location_label}" has no map coordinates. ` +
+        'Ask the customer to re-select it on the map, or set the coordinates on the saved address.';
 }
 
 /** Four digits the other party reads out to close the handover. */
@@ -285,13 +337,32 @@ async function findNearbyRiders(
     radiusM,
   ];
 
+  /*
+   * CAPACITY IS COUNTED FROM THE JOBS THEMSELVES, not from the stored
+   * `rider_profiles.active_job_count`.
+   *
+   * That counter is incremented on accept and decremented on drop-off or
+   * release, so any path that finishes a job another way leaks one — and a
+   * leak is permanent. It is not hypothetical: a rider on this deployment
+   * carried a count of 2 with ZERO jobs actually active, which had quietly
+   * cut them from three concurrent jobs to one and would eventually have cut
+   * them to none.
+   *
+   * Counting the live rows cannot drift, is self-correcting for every rider
+   * already affected, and is what lets a rider hold several jobs at once up
+   * to `max_active_jobs`. The counter itself is left alone — profile screens
+   * still read it — it simply no longer decides who is offered work.
+   */
   const result = await query<any>(
     `SELECT rp.user_id, u.name, ${DISTANCE_SQL} AS distance_m
        FROM rider_profiles rp
        JOIN users u ON u.id = rp.user_id
       WHERE rp.is_online = TRUE
         AND u.is_active = TRUE
-        AND rp.active_job_count < rp.max_active_jobs
+        AND (SELECT COUNT(*) FROM rider_jobs busy
+              WHERE busy.rider_id = rp.user_id
+                AND busy.status IN ('ASSIGNED','EN_ROUTE','ARRIVED','COLLECTED')
+            ) < rp.max_active_jobs
         AND rp.last_latitude IS NOT NULL
         AND rp.last_longitude IS NOT NULL
         AND rp.last_latitude BETWEEN ? AND ?
@@ -388,6 +459,34 @@ async function createJobForOrder(orderId: string, jobType: JobType): Promise<Rid
   // A delivery starts at the facility; a pickup starts wherever the rider is.
   const origin = jobType === 'DELIVERY' ? facilityPoint() : null;
 
+  /*
+   * CHECKED BEFORE THE JOB IS WRITTEN, and the job is still written.
+   *
+   * The work is real — the order was accepted and somebody has to collect it
+   * — so refusing to create the row would lose it. What a missing point costs
+   * is the automatic MATCH, and that is what is reported here, once, at the
+   * moment it becomes true. `dispatchJob` re-reads the address later, so the
+   * job starts working the moment the coordinates are filled in.
+   */
+  if (point.latitude === null || point.longitude === null) {
+    const detail = missingCoordinatesMessage(point);
+    if (jobType === 'DELIVERY' && origin?.latitude !== null) {
+      // A delivery is matched on the facility, so it can still be offered —
+      // but the rider is being sent to an address with no point on the map.
+      logger.warn(
+        `[Dispatch] ${jobType} for order ${point.order_number}: destination has no coordinates. ${detail}`
+      );
+    } else {
+      logger.warn(
+        `[Dispatch] ${jobType} for order ${point.order_number} cannot be matched to a rider. ${detail}`
+      );
+    }
+  }
+
+  // Held in a variable rather than generated inline, so it can be logged
+  // below without reading the row back.
+  const handoverCode = generateHandoverCode();
+
   const inserted = await query(
     `INSERT INTO rider_jobs
        (order_id, job_type, status, latitude, longitude,
@@ -405,7 +504,7 @@ async function createJobForOrder(orderId: string, jobType: JobType): Promise<Rid
       point.address_text,
       point.contact_name,
       point.contact_mobile,
-      generateHandoverCode(),
+      handoverCode,
     ]
   );
 
@@ -421,6 +520,29 @@ async function createJobForOrder(orderId: string, jobType: JobType): Promise<Rid
   logger.info(
     `[Dispatch] ${jobType} job ${inserted.insertId} created for order ${point.order_number}`
   );
+
+  /*
+   * THE HANDOVER CODE, AS SOON AS IT EXISTS — development only.
+   *
+   * The same bargain `sms.service` strikes for the login OTP: outside
+   * production the code is written to the console so it can be read while
+   * testing, because the channels that carry it to a real recipient (the
+   * customer's notification, the hotel's Pickup Approvals message, push) are
+   * not all wired up on a developer's machine.
+   *
+   * GATED ON NODE_ENV, and deliberately unlike the ARRIVED log further down.
+   * That one fires at the moment of handover, when the rider is at the door
+   * and the code is about to be spoken aloud anyway. THIS one fires at
+   * creation, hours earlier, when the code is still the only thing standing
+   * between a job and someone closing it without turning up — so it must
+   * never reach a production log.
+   */
+  if (config.NODE_ENV !== 'production') {
+    logger.info(
+      `[Dispatch DEV] Handover code for ${jobType} job ${inserted.insertId} ` +
+        `(order ${point.order_number}): ${handoverCode}`
+    );
+  }
   return getJobById(String(inserted.insertId));
 }
 
@@ -430,8 +552,10 @@ async function createJobForOrder(orderId: string, jobType: JobType): Promise<Rid
  * Returns how many riders were reached. Zero means nobody was in range and
  * the job is left UNASSIGNED for a human to place.
  */
-async function dispatchJob(jobId: string): Promise<{ offered: number; job: RiderJob | null }> {
-  const job = await getJobById(jobId);
+async function dispatchJob(
+  jobId: string
+): Promise<{ offered: number; job: RiderJob | null; reason?: string }> {
+  let job = await getJobById(jobId);
   if (!job) throw new AppError('Job not found', 404);
 
   if (job.status !== 'PENDING' && job.status !== 'OFFERED' && job.status !== 'UNASSIGNED') {
@@ -440,18 +564,78 @@ async function dispatchJob(jobId: string): Promise<{ offered: number; job: Rider
   }
 
   // A delivery is matched on the facility, a pickup on the customer's door.
-  const match = matchPointFor(job);
+  let match = matchPointFor(job);
 
+  /*
+   * THE POINT IS RE-READ WHEN THE JOB HASN'T GOT ONE.
+   *
+   * A job snapshots its coordinates at creation, which is right — a business
+   * that moves later must not silently rewrite journeys already made. But a
+   * job created BEFORE anyone set the pickup point snapshotted nothing, and
+   * without this it would stay unmatched forever even after the coordinates
+   * were filled in: the row would keep saying NULL and no amount of retrying
+   * would change that.
+   *
+   * So a job with no point — and only such a job — re-reads its order and
+   * backfills. This is what makes "add the coordinates and it starts working"
+   * true, and it cannot overwrite a point that already exists.
+   */
   if (match.latitude === null || match.longitude === null) {
-    logger.warn(`[Dispatch] Job ${jobId} has no coordinates; cannot match a rider`);
-    await query(`UPDATE rider_jobs SET status = 'UNASSIGNED' WHERE id = ?`, [jobId]);
-    return { offered: 0, job };
+    const fresh = await resolvePickupPoint(job.order_id);
+    if (fresh.latitude !== null && fresh.longitude !== null) {
+      await query(`UPDATE rider_jobs SET latitude = ?, longitude = ? WHERE id = ?`, [
+        fresh.latitude,
+        fresh.longitude,
+        jobId,
+      ]);
+      logger.info(
+        `[Dispatch] Job ${jobId} (order ${job.order_number}): coordinates now available; ` +
+          'backfilled from the order address and continuing'
+      );
+      job = (await getJobById(jobId)) as RiderJob;
+      match = matchPointFor(job);
+    }
   }
 
-  // Riders who already turned this job down are not asked twice.
+  if (match.latitude === null || match.longitude === null) {
+    /*
+     * NOT A RETRYABLE FAILURE. Nobody is offered the job, `dispatch_attempts`
+     * is deliberately NOT spent — the attempts exist for "no rider was in
+     * range", and burning them here would exhaust the budget before the
+     * address is ever fixed. `redispatchStaleJobs` skips this job until its
+     * address has a point, so this message is logged once per real change
+     * rather than on every sweep.
+     */
+    const point = await resolvePickupPoint(job.order_id);
+    const reason = missingCoordinatesMessage(point);
+    logger.warn(
+      `[Dispatch] Job ${jobId} (order ${job.order_number}) left unassigned: ${reason}`
+    );
+    await query(`UPDATE rider_jobs SET status = 'UNASSIGNED' WHERE id = ?`, [jobId]);
+    return { offered: 0, job, reason };
+  }
+
+  /*
+   * ONLY A REFUSAL BARS A RIDER, not a missed notification.
+   *
+   * DECLINED is a decision: the rider looked at the job and said no, and
+   * asking again would be pestering them with work they have rejected.
+   *
+   * EXPIRED is not a decision. The offer lapsed after
+   * RIDER_OFFER_TTL_SECONDS because nobody answered in time — the phone was
+   * in a pocket, the app was closed, the rider was mid-handover. Treating
+   * that as a permanent refusal is what left every unplaced job on this
+   * deployment with "No rider available": the only eligible rider had an
+   * expired offer on each of them and could never be asked again.
+   *
+   * The insert below already re-arms an existing row with
+   * ON DUPLICATE KEY UPDATE, and its comment says a rider whose offer
+   * expired can be asked again on a later round. This is the line that
+   * stopped that from ever happening.
+   */
   const declined = await query<any>(
     `SELECT rider_id FROM rider_job_offers
-      WHERE job_id = ? AND status IN ('DECLINED','EXPIRED')`,
+      WHERE job_id = ? AND status = 'DECLINED'`,
     [jobId]
   );
   const skip = declined.rows.map((r) => String(r.rider_id));
@@ -843,14 +1027,43 @@ async function reclaimStaleHolds(): Promise<number> {
  * permanent.
  */
 async function redispatchStaleJobs(): Promise<number> {
+  /*
+   * A JOB WITH NOWHERE TO MATCH ON IS NOT STRANDED, IT IS BLOCKED.
+   *
+   * Re-offering it achieves nothing: `dispatchJob` would find the same NULL
+   * coordinates, log the same warning and set the same status, on every
+   * sweep, forever — which is exactly what filled the log with
+   * "has no coordinates; cannot match a rider". It never spends
+   * `dispatch_attempts` either, so the usual ceiling never stops it.
+   *
+   * The last two clauses are what let such a job come BACK on its own: the
+   * job's own snapshot is null, but if the establishment or the order's
+   * address has since been given a point, it is picked up again here and
+   * `dispatchJob` backfills it. Fix the address, and the job dispatches on
+   * the next sweep with nothing else to do.
+   */
   const stranded = await query<any>(
     `SELECT rj.id
        FROM rider_jobs rj
+       JOIN orders o                  ON o.id = rj.order_id
+       LEFT JOIN customer_addresses ca ON ca.id = o.address_id
+       LEFT JOIN business_users bu     ON bu.id = o.business_user_id
+       LEFT JOIN businesses b          ON b.id = bu.business_id
       WHERE rj.status IN ('OFFERED','UNASSIGNED')
         AND rj.dispatch_attempts < ?
         AND NOT EXISTS (
-              SELECT 1 FROM rider_job_offers o
-               WHERE o.job_id = rj.id AND o.status = 'OFFERED' AND o.expires_at > NOW()
+              SELECT 1 FROM rider_job_offers o2
+               WHERE o2.job_id = rj.id AND o2.status = 'OFFERED' AND o2.expires_at > NOW()
+            )
+        AND (
+              -- A delivery is matched on the facility it loads from.
+              (rj.job_type = 'DELIVERY'
+                 AND rj.origin_latitude IS NOT NULL AND rj.origin_longitude IS NOT NULL)
+              -- Or the job already carries its own point.
+              OR (rj.latitude IS NOT NULL AND rj.longitude IS NOT NULL)
+              -- Or the address behind it has one now, so a backfill will work.
+              OR (b.latitude IS NOT NULL AND b.longitude IS NOT NULL)
+              OR (ca.latitude IS NOT NULL AND ca.longitude IS NOT NULL)
             )`,
     [MAX_DISPATCH_ATTEMPTS]
   );

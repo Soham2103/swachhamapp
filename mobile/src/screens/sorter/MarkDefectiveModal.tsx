@@ -50,7 +50,6 @@ export default function MarkDefectiveModal({
   orderNumber,
   saving,
   onCancel,
-  onSave,
   onReportPiece,
   availableWhite,
   availableColour,
@@ -61,7 +60,6 @@ export default function MarkDefectiveModal({
   orderNumber: string;
   saving: boolean;
   onCancel: () => void;
-  onSave: (defectiveQuantity: number, reason: string, split: DefectiveSplit) => void;
   /**
    * REPORT THE PIECE ITSELF — the photo, and the WhatsApp notification that
    * carries it. Reached from HERE rather than from a button of its own, so
@@ -299,22 +297,14 @@ export default function MarkDefectiveModal({
               >
                 <Text style={styles.cancelText}>CANCEL</Text>
               </TouchableOpacity>
-              <TouchableOpacity
-                style={[styles.button, styles.save, !canSave && styles.buttonDisabled]}
-                onPress={() => {
-                  setTouched(true);
-                  if (validation.total === null) return;
-                  onSave(validation.total, reason.trim(), split);
-                }}
-                disabled={!canSave}
-                accessibilityRole="button"
-              >
-                {saving ? (
-                  <ActivityIndicator size="small" color={COLORS.Surface} />
-                ) : (
-                  <Text style={styles.saveText}>SAVE ADJUSTMENT</Text>
-                )}
-              </TouchableOpacity>
+              {/*
+                SAVE ADJUSTMENT WAS REMOVED, and its handler with it.
+                It recorded a defective quantity and stopped there — no photo,
+                nothing sent — which was the one way to mark a piece defective
+                without evidence. A defect is a claim against a customer's
+                garment, so the photo is not optional and there is now exactly
+                one way to record one: the button below.
+              */}
             </View>
 
             {/* THE DEFECTIVE PIECE ITSELF. Saves the figures above, then
@@ -336,7 +326,7 @@ export default function MarkDefectiveModal({
             </TouchableOpacity>
             <Text style={styles.reportHint}>
               Saves the figures above, then takes the photo and sends the report to the
-              customer, the manager and the super admin on WhatsApp.
+              customer and the sorting desk on WhatsApp. The photo is required.
             </Text>
           </ScrollView>
         </View>

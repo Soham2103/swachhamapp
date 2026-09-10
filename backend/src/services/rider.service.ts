@@ -3,6 +3,7 @@ import { AppError } from '../utils/appError';
 import { logger } from '../utils/logger';
 import socketService from './socket.service';
 import { createNotification } from './notification.service';
+import { sendToOwner, PushOwner } from './push.service';
 import {
   dispatchJob,
   expireStaleOffers,
@@ -350,7 +351,9 @@ async function listJobs(riderId: string, scope: 'active' | 'completed' = 'active
       : `rj.status = 'COMPLETED' AND DATE(rj.completed_at) = CURDATE()`;
 
   const result = await query<any>(
-    `SELECT rj.*, o.order_number,
+    // `business_user_id` is what decides whether the acceptance section is
+    // shown; it lives on the order, so `rj.*` alone does not carry it.
+    `SELECT rj.*, o.order_number, o.business_user_id,
             (SELECT COUNT(*) FROM order_items oi WHERE oi.order_id = o.id) AS item_count,
             (SELECT COALESCE(SUM(oi.quantity),0) FROM order_items oi WHERE oi.order_id = o.id) AS total_quantity
        FROM rider_jobs rj
@@ -383,6 +386,25 @@ function toJobPayload(r: any, includeContact: boolean) {
     contact_name: r.contact_name,
     contact_mobile: includeContact ? r.contact_mobile : null,
     handover_code_required: Boolean(r.handover_code),
+    /*
+     * THE ACCEPTANCE STEP, for the section inside the order.
+     *
+     * `acceptance_required` is the app's whole decision: show the section and
+     * block the next action, or do not. It is true only for a business order
+     * that has not been accepted yet — a customer pickup has no counting step
+     * and nobody to raise a ticket with, so it never sees one.
+     *
+     * The server enforces the same rule in `updateJobStatus`; this field
+     * exists so the rider is told before they tap, not after.
+     */
+    has_business: Boolean(r.business_user_id),
+    acceptance_required: Boolean(r.business_user_id) && !r.door_acceptance_mode,
+    door_acceptance_mode: r.door_acceptance_mode || null,
+    accepted_piece_count:
+      r.accepted_piece_count === null || r.accepted_piece_count === undefined
+        ? null
+        : Number(r.accepted_piece_count),
+    door_accepted_at: r.door_accepted_at || null,
     weight_kg: Number(r.total_weight_kg || 0),
     item_count: Number(r.item_count || 0),
     total_quantity: Number(r.total_quantity || 0),
@@ -398,7 +420,7 @@ function toJobPayload(r: any, includeContact: boolean) {
 /** One job in full, for the rider working it. */
 async function getJobDetail(riderId: string, jobId: string): Promise<any> {
   const result = await query<any>(
-    `SELECT rj.*, o.order_number,
+    `SELECT rj.*, o.order_number, o.business_user_id,
             (SELECT COUNT(*) FROM order_items oi WHERE oi.order_id = o.id) AS item_count,
             (SELECT COALESCE(SUM(oi.quantity),0) FROM order_items oi WHERE oi.order_id = o.id) AS total_quantity
        FROM rider_jobs rj
@@ -454,12 +476,25 @@ async function updateJobStatus(riderId: string, jobId: string, target: string): 
   }
 
   const current = await query<any>(
-    `SELECT id, status, order_id, job_type, handover_code
-       FROM rider_jobs WHERE id = ? AND rider_id = ?`,
+    `SELECT j.id, j.status, j.order_id, j.job_type, j.handover_code,
+            j.door_acceptance_mode,
+            o.business_user_id
+       FROM rider_jobs j
+       JOIN orders o ON o.id = j.order_id
+      WHERE j.id = ? AND j.rider_id = ?`,
     [jobId, riderId]
   );
   const job = current.rows[0];
   if (!job) throw new AppError('Job not found or not assigned to you', 404);
+
+  /*
+   * NO ACCEPTANCE CHECK HERE, DELIBERATELY.
+   *
+   * Setting off and arriving are movements; neither says anything about how
+   * the load was taken. The counting question is asked at the door, with the
+   * other party present, so it is enforced in `completeJob` — the handover
+   * itself — and not on the way there.
+   */
 
   const next = JOB_TRANSITIONS[job.status] || [];
   if (!next.includes(target)) {
@@ -567,8 +602,11 @@ async function completeJob(
     await connection.beginTransaction();
 
     const [rows]: any = await connection.execute(
-      `SELECT id, status, order_id, job_type, handover_code
-         FROM rider_jobs WHERE id = ? AND rider_id = ? FOR UPDATE`,
+      `SELECT j.id, j.status, j.order_id, j.job_type, j.handover_code,
+              j.door_acceptance_mode, o.business_user_id
+         FROM rider_jobs j
+         JOIN orders o ON o.id = j.order_id
+        WHERE j.id = ? AND j.rider_id = ? FOR UPDATE`,
       [jobId, riderId]
     );
     const job = rows[0];
@@ -576,6 +614,26 @@ async function completeJob(
     if (job.status === 'COMPLETED') throw new AppError('This job is already completed.', 409);
     if (job.status !== 'ARRIVED') {
       throw new AppError('Mark yourself as arrived before completing the handover.', 409);
+    }
+
+    /*
+     * ACCEPTANCE IS CHECKED HERE, AT THE HANDOVER.
+     *
+     * It used to gate the first move out of ASSIGNED, which asked the rider
+     * how they had taken a load they had not yet reached. Counting happens at
+     * the door, with the other party standing there — so the question belongs
+     * at the moment the handover is confirmed, beside the code, and that is
+     * where it is now enforced.
+     *
+     * BUSINESS ORDERS ONLY: a customer pickup has no counting step and nobody
+     * to raise a ticket with, so requiring a mode there would block a flow
+     * that cannot satisfy it.
+     */
+    if (job.business_user_id && !job.door_acceptance_mode) {
+      throw new AppError(
+        'Choose With Counting or Without Counting before confirming this handover.',
+        409
+      );
     }
 
     const given = String(handoverCode || '').trim();
@@ -757,7 +815,7 @@ async function dropAtFacility(
 /** Jobs this rider has parked until they have room. */
 async function listHeldJobs(riderId: string): Promise<any[]> {
   const result = await query<any>(
-    `SELECT rj.*, o.order_number,
+    `SELECT rj.*, o.order_number, o.business_user_id,
             TIMESTAMPDIFF(MINUTE, rj.held_at, NOW()) AS held_minutes,
             (SELECT COUNT(*) FROM order_items oi WHERE oi.order_id = o.id) AS item_count,
             (SELECT COALESCE(SUM(oi.quantity),0) FROM order_items oi WHERE oi.order_id = o.id) AS total_quantity
@@ -980,8 +1038,25 @@ async function notifyOrderParty(
     const row = result.rows[0];
     if (!row) return;
 
+    /*
+     * THE PUSH IS AN ADDITION TO THE DURABLE ROW, NEVER INSTEAD OF IT.
+     *
+     * Every branch below still writes what it always wrote — a customer's
+     * `notifications` row, an establishment's `business_messages` row — and
+     * those remain the record. What they cannot do is reach a phone that
+     * nobody is looking at, which for the handover code is the whole
+     * problem: a rider is at the door waiting for a number to be read out.
+     *
+     * `sendToOwner` never throws and reports its own failures, so a device
+     * that is off, uninstalled or unregistered cannot affect the status
+     * change that triggered this.
+     */
+    const push = (owner: PushOwner) =>
+      sendToOwner(owner, { title, body, data: { orderId, type } });
+
     if (row.user_id) {
       await createNotification(String(row.user_id), orderId, type, title, body, { orderId });
+      await push({ userId: String(row.user_id) });
     } else if (row.business_user_id) {
       /*
        * A BUSINESS ORDER NOW GETS A DURABLE MESSAGE, not just a socket emit.
@@ -1013,6 +1088,8 @@ async function notifyOrderParty(
             `(is migration 062 applied?): ${error instanceof Error ? error.message : String(error)}`
         );
       }
+
+      await push({ businessUserId: String(row.business_user_id) });
 
       socketService.emitJobUpdate(orderId, { orderId, type, title, body });
     } else {

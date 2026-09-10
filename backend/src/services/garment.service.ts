@@ -21,7 +21,14 @@ export type ScanStage = 'ACCEPTANCE' | 'DELIVERY';
 
 /** Statuses this workflow reads, in the project's existing vocabulary. */
 export const ORDER_STATUS = {
-  confirmed: 'ORDER_PLACED',
+  /*
+   * THE SAME FIRST STAGE THE SORTER USES — see `SORTER_STATUS` in
+   * sorter.service. Acceptance scanning happens on a load that has arrived
+   * and not yet been accepted, which is what PICKED_UP means. It read
+   * ORDER_PLACED until that stage moved, at which point scanning a freshly
+   * arrived order was refused as "not a confirmed order".
+   */
+  confirmed: 'PICKED_UP',
   accepted: 'RECEIVED_AT_FACILITY',
   ready: 'READY_FOR_DELIVERY',
   out_for_delivery: 'OUT_FOR_DELIVERY',

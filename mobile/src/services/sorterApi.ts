@@ -124,20 +124,13 @@ export function defectCopies(defect: DefectRecord): DefectCopy[] {
       error: defect.whatsapp_error,
       to: defect.whatsapp_to,
     },
-    {
-      role: 'manager',
-      label: 'Manager',
-      status: defect.manager_whatsapp_status ?? null,
-      error: defect.manager_whatsapp_error,
-      to: defect.manager_whatsapp_to,
-    },
-    {
-      role: 'super_admin',
-      label: 'Super Admin',
-      status: defect.super_admin_whatsapp_status ?? null,
-      error: defect.super_admin_whatsapp_error,
-      to: defect.super_admin_whatsapp_to,
-    },
+    /*
+     * THE MANAGER AND SUPER ADMIN COPIES ARE NO LONGER SENT, so they are no
+     * longer listed. Their columns still exist on `order_defects` and still
+     * hold whatever was recorded for reports sent before the change — this
+     * list is what the Sorter is shown for the report they just made, and
+     * two permanent "no recipient" rows would read as something broken.
+     */
     {
       role: 'sorter',
       label: 'Sorter',

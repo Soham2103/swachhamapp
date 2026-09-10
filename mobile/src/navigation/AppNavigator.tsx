@@ -22,6 +22,8 @@ import {
 
 import { DEMO_MODE } from '../demo/demoMode';
 
+import { registerDeviceForPush } from '../services/pushRegistration';
+
 import DemoLoginScreen
   from '../screens/demo/DemoLoginScreen';
 
@@ -835,6 +837,40 @@ export default function AppNavigator() {
     user,
     userType,
   } = useAuthStore();
+
+
+  /*
+   * =========================================================
+   * REGISTER THIS HANDSET FOR PUSH, ONCE SIGNED IN
+   * =========================================================
+   *
+   * HERE rather than in each sign-in path: `authStore` sets
+   * `isAuthenticated` in a dozen places — customer OTP, business password,
+   * every staff role, session restore on launch — and hooking each would
+   * guarantee one gets missed. Watching the flag catches all of them,
+   * including a session restored at startup, which no sign-in handler runs
+   * for at all.
+   *
+   * The endpoint takes the account from the JWT, so this must run AFTER the
+   * token exists — which is exactly what this flag means.
+   *
+   * Failure is expected and ignored: no permission, Expo Go, a build with no
+   * `google-services.json`. `registerDeviceForPush` never throws and the
+   * notifications it supplements arrive without it.
+   */
+  React.useEffect(() => {
+    if (!isAuthenticated || DEMO_MODE) return;
+    let cancelled = false;
+    registerDeviceForPush().then((result) => {
+      if (cancelled || result.registered) return;
+      // Visible in a dev build, silent in production. Worth printing because
+      // the failure mode is otherwise "nothing ever arrives".
+      if (__DEV__) console.log('[Push] not registered:', result.reason);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [isAuthenticated]);
 
 
   /*

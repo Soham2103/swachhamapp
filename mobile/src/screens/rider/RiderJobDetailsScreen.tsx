@@ -5,18 +5,20 @@ import {
   StyleSheet,
   ScrollView,
   TouchableOpacity,
-  SafeAreaView,
   StatusBar,
   Linking,
   Alert,
   TextInput,
   ActivityIndicator,
 } from 'react-native';
+// The context package's SafeAreaView — react-native's own is iOS-only and
+// applies no inset on Android. See the note in RiderDashboardScreen.
+import { SafeAreaView } from 'react-native-safe-area-context';
 import { Ionicons } from '@expo/vector-icons';
 import { useNavigation, useRoute, useFocusEffect } from '@react-navigation/native';
 
 import { COLORS, SPACING, TYPOGRAPHY, BORDER_RADIUS, SHADOWS } from '../../constants/theme';
-import riderApi, { RiderJobDetail } from '../../services/riderApi';
+import riderApi, { RiderJobDetail, DoorAcceptanceMode } from '../../services/riderApi';
 import { extractErrorMessage } from '../../services/api';
 import useRiderStore from '../../store/riderStore';
 import { canRouteTo, openGoogleMapsRoute } from '../../utils/navigation';
@@ -39,12 +41,25 @@ export default function RiderJobDetailsScreen() {
   const jobId = String(route.params?.jobId || '');
 
   const refreshJobs = useRiderStore((s) => s.refreshJobs);
+  const acceptOfferWithCounting = useRiderStore((s) => s.acceptOfferWithCounting);
+  const acceptOfferWithoutCounting = useRiderStore((s) => s.acceptOfferWithoutCounting);
 
   const [job, setJob] = useState<RiderJobDetail | null>(null);
   const [loading, setLoading] = useState(true);
   const [working, setWorking] = useState(false);
   const [code, setCode] = useState('');
   const [error, setError] = useState<string | null>(null);
+
+  /*
+   * THE ACCEPT ORDER STEP.
+   *
+   * `chosenMode` is null until the rider picks one, which is what keeps
+   * Confirm disabled — there is no default, because guessing on the rider's
+   * behalf is the thing this step exists to prevent.
+   */
+  const [chosenMode, setChosenMode] = useState<DoorAcceptanceMode | null>(null);
+  const [pieceCount, setPieceCount] = useState('');
+  const [accepting, setAccepting] = useState(false);
 
   const load = useCallback(async () => {
     try {
@@ -63,6 +78,54 @@ export default function RiderJobDetailsScreen() {
       load();
     }, [load])
   );
+
+  /**
+   * Records how this order was accepted, then reloads the job.
+   *
+   * The reload is what closes the section: the server returns
+   * `acceptance_required: false` once a mode is stored, so the screen moves
+   * on because the SERVER says the step is done — never because this function
+   * assumed it. A failure therefore leaves the section open with the reason
+   * on screen, which is the correct outcome.
+   *
+   * WITHOUT_COUNT does not navigate away. It raises a ticket the business
+   * must answer, and the rider stays here with the job in hand.
+   */
+  const confirmAcceptance = async () => {
+    if (!chosenMode || accepting) return;
+    setAccepting(true);
+    try {
+      /*
+       * THROUGH THE STORE, not straight to the API.
+       *
+       * The uncounted path sets `awaitingTicket`, and the dashboard's
+       * existing poll and "waiting on the business" card hang off it. Calling
+       * the API directly here would record the ticket server-side and leave
+       * that machinery blind to it, so the rider would be gated with nothing
+       * telling them why.
+       */
+      const result =
+        chosenMode === 'WITH_COUNT'
+          ? await acceptOfferWithCounting(jobId, Number(pieceCount))
+          : await acceptOfferWithoutCounting(jobId);
+
+      if (!result.ok) {
+        Alert.alert('Could not accept', result.message);
+        return;
+      }
+      // Reloaded rather than assumed: the SERVER decides whether the step is
+      // done, and `acceptance_required` coming back false is what closes the
+      // section.
+      await load();
+    } catch (err: any) {
+      Alert.alert(
+        'Could not accept',
+        extractErrorMessage(err, 'That did not go through. Try again.')
+      );
+    } finally {
+      setAccepting(false);
+    }
+  };
 
   const advance = async (status: 'EN_ROUTE' | 'ARRIVED') => {
     setWorking(true);
@@ -236,7 +299,8 @@ export default function RiderJobDetailsScreen() {
           <Ionicons name="arrow-back" size={22} color={COLORS.TextPrimary} />
         </TouchableOpacity>
         <View style={{ flex: 1 }}>
-          <Text style={styles.headerTitle}>{isPickup ? 'Pickup' : 'Delivery'}</Text>
+          {/* "Dispatch" in the UI; the stored job_type stays 'DELIVERY'. */}
+          <Text style={styles.headerTitle}>{isPickup ? 'Pickup' : 'Dispatch'}</Text>
           <Text style={styles.headerSub}>{job.order_number}</Text>
         </View>
         <StatusPill status={job.status} />
@@ -304,6 +368,24 @@ export default function RiderJobDetailsScreen() {
           ))}
         </View>
 
+        {/*
+          WHAT WAS AGREED AT THE DOOR, once it has been.
+          Kept on screen rather than disappearing: it is the record the rider
+          can point at if the count is questioned later.
+        */}
+        {!job.acceptance_required && job.door_acceptance_mode ? (
+          <View style={styles.card}>
+            <Text style={styles.cardLabel}>ACCEPTED</Text>
+            <Text style={styles.acceptedSummary}>
+              {job.door_acceptance_mode === 'WITH_COUNT'
+                ? `With counting — ${job.accepted_piece_count} piece${
+                    job.accepted_piece_count === 1 ? '' : 's'
+                  }`
+                : 'Without counting'}
+            </Text>
+          </View>
+        ) : null}
+
         {/* ---------- THE ONE NEXT ACTION ---------- */}
         {job.status === 'ASSIGNED' ? (
           <PrimaryButton
@@ -323,7 +405,32 @@ export default function RiderJobDetailsScreen() {
           />
         ) : null}
 
-        {job.status === 'ARRIVED' ? (
+        {/*
+          ---------- AT THE DOOR ----------
+
+          COUNTING FIRST, THEN THE CODE. The rider is standing with the other
+          party: they count the load, say how they took it, and only then read
+          out the code that closes the handover. Asking earlier — on the way
+          there — asked about a load they had not yet seen.
+
+          The code card is withheld until the acceptance is recorded, and
+          `completeJob` refuses the handover without it, so the order of these
+          two is the same whether the rider is looking at the screen or not.
+        */}
+        {job.status === 'ARRIVED' && job.acceptance_required ? (
+          <AcceptOrderSection
+            jobType={job.job_type}
+            contactName={job.contact_name}
+            busy={accepting}
+            pieceCount={pieceCount}
+            onChangePieceCount={setPieceCount}
+            mode={chosenMode}
+            onChooseMode={setChosenMode}
+            onConfirm={confirmAcceptance}
+          />
+        ) : null}
+
+        {job.status === 'ARRIVED' && !job.acceptance_required ? (
           <View style={styles.card}>
             <Text style={styles.cardLabel}>HANDOVER CODE</Text>
             <Text style={styles.codeHelp}>
@@ -373,6 +480,8 @@ export default function RiderJobDetailsScreen() {
         {/* Giving a job back is deliberately quiet: available, not inviting. */}
         {/* Not offered once COLLECTED: the bags are already on the bike, and
             handing the job back would leave them there with no owner. */}
+        {/* Offered even while acceptance is outstanding: a rider who cannot do
+            the job must not be trapped by a step they do not want to take. */}
         {['ASSIGNED', 'EN_ROUTE', 'ARRIVED'].includes(job.status) ? (
           <TouchableOpacity style={styles.releaseButton} onPress={release}>
             <Text style={styles.releaseText}>Can't do this job</Text>
@@ -383,22 +492,146 @@ export default function RiderJobDetailsScreen() {
   );
 }
 
+/**
+ * ACCEPT ORDER — the compulsory step, inside the order.
+ *
+ * IT IS THE ONLY THING ON SCREEN THAT CAN BE ACTED ON while it is showing:
+ * the caller suppresses every onward action behind it, so this cannot be
+ * scrolled past or tapped around. That is the whole point — the previous
+ * version sat beside a plain Accept button on the dashboard and was
+ * therefore optional.
+ *
+ * NO DEFAULT MODE. Confirm stays disabled until the rider chooses, because a
+ * pre-selected answer is one a tired rider confirms without reading, and
+ * "counted" is a claim made to a hotel on their behalf.
+ */
+function AcceptOrderSection({
+  jobType,
+  contactName,
+  busy,
+  mode,
+  onChooseMode,
+  pieceCount,
+  onChangePieceCount,
+  onConfirm,
+}: {
+  jobType: string;
+  contactName: string | null;
+  busy: boolean;
+  mode: DoorAcceptanceMode | null;
+  onChooseMode: (m: DoorAcceptanceMode) => void;
+  pieceCount: string;
+  onChangePieceCount: (v: string) => void;
+  onConfirm: () => void;
+}) {
+  const pieces = Number(pieceCount);
+  const countReady = Number.isInteger(pieces) && pieces > 0;
+  // WITH_COUNT needs a real number before it means anything; WITHOUT_COUNT is
+  // complete as soon as it is chosen.
+  const canConfirm = mode === 'WITHOUT_COUNT' || (mode === 'WITH_COUNT' && countReady);
+
+  const Option = ({ value, title, detail }: { value: DoorAcceptanceMode; title: string; detail: string }) => {
+    const selected = mode === value;
+    return (
+      <TouchableOpacity
+        style={[styles.acceptOption, selected && styles.acceptOptionSelected]}
+        onPress={() => onChooseMode(value)}
+        activeOpacity={0.85}
+        disabled={busy}
+      >
+        <Ionicons
+          name={selected ? 'radio-button-on' : 'radio-button-off'}
+          size={20}
+          color={selected ? COLORS.Primary : COLORS.TextSecondary}
+        />
+        <View style={styles.acceptOptionBody}>
+          <Text style={[styles.acceptOptionTitle, selected && styles.acceptOptionTitleSelected]}>
+            {title}
+          </Text>
+          <Text style={styles.acceptOptionDetail}>{detail}</Text>
+        </View>
+      </TouchableOpacity>
+    );
+  };
+
+  return (
+    <View style={[styles.card, styles.acceptCard]}>
+      <Text style={styles.cardLabel}>
+        {jobType === 'PICKUP' ? 'CONFIRM PICKUP' : 'CONFIRM COLLECTION'}
+      </Text>
+      <Text style={styles.codeHelp}>
+        {jobType === 'PICKUP'
+          ? `Before the code — how did you take this load from ${
+              contactName || 'the establishment'
+            }?`
+          : 'Before the code — how did you take this load from the facility?'}
+      </Text>
+
+      <Option
+        value="WITH_COUNT"
+        title="With Counting & Checked"
+        detail="You counted the pieces with their staff."
+      />
+
+      {mode === 'WITH_COUNT' ? (
+        <View style={styles.countBlock}>
+          <Text style={styles.countLabel}>TOTAL PIECES COUNTED</Text>
+          <TextInput
+            style={styles.codeInput}
+            value={pieceCount}
+            onChangeText={(t) => onChangePieceCount(t.replace(/[^0-9]/g, '').slice(0, 5))}
+            keyboardType="number-pad"
+            placeholder="0"
+            placeholderTextColor={COLORS.TextSecondary}
+            textAlign="center"
+            editable={!busy}
+          />
+        </View>
+      ) : null}
+
+      <Option
+        value="WITHOUT_COUNT"
+        title="Without Counting"
+        detail="Not counted. The establishment is asked to agree before you continue."
+      />
+
+      <PrimaryButton
+        label="Confirm acceptance"
+        icon="checkmark-circle-outline"
+        busy={busy}
+        onPress={canConfirm ? onConfirm : () => {}}
+        disabled={!canConfirm}
+      />
+
+      {mode === 'WITH_COUNT' && !countReady ? (
+        <Text style={styles.acceptHint}>Enter the number of pieces you counted.</Text>
+      ) : null}
+      {!mode ? <Text style={styles.acceptHint}>Choose one to continue.</Text> : null}
+    </View>
+  );
+}
+
 function PrimaryButton({
   label,
   icon,
   busy,
   onPress,
+  // Optional so every existing call site is unchanged. Used by the acceptance
+  // section, where Confirm stays inert until a mode has been chosen.
+  disabled = false,
 }: {
   label: string;
   icon: any;
   busy: boolean;
   onPress: () => void;
+  disabled?: boolean;
 }) {
+  const inert = busy || disabled;
   return (
     <TouchableOpacity
-      style={[styles.primaryButton, busy && styles.buttonDisabled]}
+      style={[styles.primaryButton, inert && styles.buttonDisabled]}
       onPress={onPress}
-      disabled={busy}
+      disabled={inert}
       activeOpacity={0.85}
     >
       {busy ? (
@@ -559,6 +792,60 @@ const styles = StyleSheet.create({
     letterSpacing: 8,
     color: COLORS.TextPrimary,
     marginBottom: SPACING.md,
+  },
+
+  /* ---------- ACCEPT ORDER ---------- */
+  /* Bordered in the accent colour so the step reads as the thing to deal
+     with, not as one more card among the order's details. */
+  acceptCard: {
+    borderWidth: 2,
+    borderColor: COLORS.Accent,
+  },
+  acceptOption: {
+    flexDirection: 'row',
+    alignItems: 'flex-start',
+    gap: SPACING.sm,
+    borderWidth: 1,
+    borderColor: COLORS.Border ?? '#E3E8E4',
+    borderRadius: BORDER_RADIUS.md,
+    padding: SPACING.md,
+    marginBottom: SPACING.sm,
+  },
+  acceptOptionSelected: {
+    borderColor: COLORS.Primary,
+    backgroundColor: '#F3FAF5',
+  },
+  acceptOptionBody: { flex: 1 },
+  acceptOptionTitle: {
+    fontSize: TYPOGRAPHY.sizes.base,
+    fontWeight: '600',
+    color: COLORS.TextPrimary,
+  },
+  acceptOptionTitleSelected: { color: COLORS.PrimaryDark },
+  acceptOptionDetail: {
+    fontSize: TYPOGRAPHY.sizes.sm,
+    color: COLORS.TextSecondary,
+    marginTop: 2,
+    lineHeight: 18,
+  },
+  countBlock: { marginBottom: SPACING.sm },
+  countLabel: {
+    fontSize: TYPOGRAPHY.sizes.xs,
+    fontWeight: '700',
+    letterSpacing: 0.6,
+    color: COLORS.TextSecondary,
+    marginBottom: SPACING.xs,
+  },
+  acceptHint: {
+    fontSize: TYPOGRAPHY.sizes.sm,
+    color: COLORS.TextSecondary,
+    textAlign: 'center',
+    marginTop: SPACING.sm,
+  },
+  acceptedSummary: {
+    fontSize: TYPOGRAPHY.sizes.base,
+    fontWeight: '600',
+    color: COLORS.TextPrimary,
   },
 
   carryingBanner: {

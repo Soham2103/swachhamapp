@@ -148,20 +148,34 @@ router.post(
 );
 
 /**
- * DOOR ACCEPTANCE — the same acceptance, plus what the rider found at the door.
+ * DOOR ACCEPTANCE — what the rider found at the door.
  *
- * These two sit BESIDE `/accept` rather than replacing it. The plain route is
- * still the one a customer pickup uses and is untouched, so nothing that
- * already works had to learn about door modes.
+ * THESE RUN AGAINST A JOB THE RIDER ALREADY HOLDS. Acceptance used to be a
+ * second pair of buttons on the offer card, which meant a rider could take
+ * the plain `/accept` above and never answer the counting question at all.
+ * It now lives inside the order, after the job is claimed, and
+ * `updateJobStatus` refuses to move a business job out of ASSIGNED until one
+ * of these has been called. The paths still claim an unclaimed job, so an
+ * older client calling them against a live offer keeps working.
+ *
+ * The `/offers/...` prefix is kept so existing clients do not break; the id
+ * has always been a JOB id.
  */
 
-/** "With Counting & Checked" — accept, and tell the hotel it was checked. */
+/**
+ * "With Counting & Checked" — record the count, and tell the hotel what was
+ * checked. Body: `{ pieceCount }` — the total pieces, required.
+ */
 router.post(
   '/offers/:jobId/accept-with-counting',
   async (req: AuthenticatedRequest, res: Response, next: NextFunction) => {
     try {
-      const result = await acceptWithCounting(String(req.params.jobId), riderId(req));
-      return sendSuccess(res, result, 'Job accepted');
+      const result = await acceptWithCounting(
+        String(req.params.jobId),
+        riderId(req),
+        req.body?.pieceCount ?? req.body?.piece_count
+      );
+      return sendSuccess(res, result, 'Order accepted with counting');
     } catch (error) {
       return next(error);
     }

@@ -5,13 +5,21 @@ import {
   StyleSheet,
   ScrollView,
   TouchableOpacity,
-  SafeAreaView,
   StatusBar,
   Switch,
   RefreshControl,
   Alert,
   ActivityIndicator,
 } from 'react-native';
+/*
+ * SafeAreaView FROM THE CONTEXT PACKAGE, not from react-native.
+ *
+ * React Native's own SafeAreaView is IOS-ONLY — on Android it renders a plain
+ * View and applies no inset at all, which is why this header sat under the
+ * status bar. Every other screen in the app already imports it from here; the
+ * rider screens were the exception.
+ */
+import { SafeAreaView } from 'react-native-safe-area-context';
 import { Ionicons } from '@expo/vector-icons';
 import { useNavigation, useFocusEffect } from '@react-navigation/native';
 
@@ -51,8 +59,10 @@ export default function RiderDashboardScreen() {
   const goOnline = useRiderStore((s) => s.goOnline);
   const goOffline = useRiderStore((s) => s.goOffline);
   const acceptOffer = useRiderStore((s) => s.acceptOffer);
-  const acceptOfferWithCounting = useRiderStore((s) => s.acceptOfferWithCounting);
-  const acceptOfferWithoutCounting = useRiderStore((s) => s.acceptOfferWithoutCounting);
+  // The two acceptance actions are no longer called from here — the Accept
+  // Order section inside the order owns them now. `awaitingTicket` below is
+  // still read, because the ticket a rider raises in the order is waited on
+  // from this screen.
   const awaitingTicket = useRiderStore((s) => s.awaitingTicket);
   const isSubmittingDoorChoice = useRiderStore((s) => s.isSubmittingDoorChoice);
   const pollAwaitingTicket = useRiderStore((s) => s.pollAwaitingTicket);
@@ -93,6 +103,19 @@ export default function RiderDashboardScreen() {
     }
   };
 
+  /**
+   * ACCEPT CLAIMS THE JOB. IT DOES NOT ACCEPT THE ORDER.
+   *
+   * Those were the same act until now, and the counting choice sat beside
+   * this button as a second, optional card — so a rider could take the job
+   * with this and never answer the counting question at all.
+   *
+   * Claiming and accepting are now separate: this wins the race for the job
+   * and opens it, and the Accept Order section INSIDE the order is what
+   * records how the load was taken. The server refuses to move a business
+   * job out of ASSIGNED until that section has been completed, so there is
+   * no path onward that skips it.
+   */
   const handleAccept = async (offer: JobOffer) => {
     const result = await acceptOffer(offer.job_id);
     if (result.ok) {
@@ -100,32 +123,6 @@ export default function RiderDashboardScreen() {
     } else {
       Alert.alert('Job unavailable', result.message);
     }
-  };
-
-  /**
-   * "With Counting & Checked" — accept and tell the business.
-   *
-   * Same destination as the plain accept: the rider goes straight to the job.
-   * Nothing is waited on, because nothing was left open at the door.
-   */
-  const handleAcceptWithCounting = async (offer: JobOffer) => {
-    const result = await acceptOfferWithCounting(offer.job_id);
-    if (result.ok) {
-      navigation.navigate('RiderJobDetails', { jobId: offer.job_id });
-    } else {
-      Alert.alert('Job unavailable', result.message);
-    }
-  };
-
-  /**
-   * "Without Counting & Checked" — raise a ticket, then hold the rider.
-   *
-   * There is NO navigation here. The rider stays on the dashboard with the
-   * waiting card until the business accepts; that is the gate.
-   */
-  const handleAcceptWithoutCounting = async (offer: JobOffer) => {
-    const result = await acceptOfferWithoutCounting(offer.job_id);
-    if (!result.ok) Alert.alert('Could not raise ticket', result.message);
   };
 
   const handleHold = async (offer: JobOffer) => {
@@ -339,25 +336,21 @@ export default function RiderDashboardScreen() {
         ) : (
           offers.map((offer) => (
             <View key={offer.offer_id}>
+              {/*
+                * ONE ANSWER PER OFFER NOW.
+                *
+                * The door acceptance card used to sit here, below the offer,
+                * giving a business order two ways to be taken — and the plain
+                * Accept above it was the one that skipped counting. The
+                * counting choice has moved inside the order, where it is
+                * compulsory, so this card is the whole of the offer.
+                */}
               <OfferCard
                 offer={offer}
                 onAccept={() => handleAccept(offer)}
                 onHold={() => handleHold(offer)}
                 onDecline={() => declineOffer(offer.job_id)}
               />
-
-              {/*
-                * The door acceptance card, on offers that have a business
-                * behind them. A plain customer pickup has nobody to message
-                * or raise a ticket with, so it keeps the offer card alone.
-                */}
-              {offer.has_business ? (
-                <AcceptCard
-                  disabled={isSubmittingDoorChoice || Boolean(awaitingTicket)}
-                  onWithCounting={() => handleAcceptWithCounting(offer)}
-                  onWithoutCounting={() => handleAcceptWithoutCounting(offer)}
-                />
-              ) : null}
             </View>
           ))
         )}
@@ -405,86 +398,19 @@ export default function RiderDashboardScreen() {
  * fixed number, so a card that was on screen while the phone slept shows the
  * truth when it wakes rather than a number that kept ticking in a dream.
  */
-/**
- * THE ACCEPT CARD — how the load was taken at the door.
+/*
+ * THE ACCEPT CARD USED TO LIVE HERE.
  *
- * Two options, chosen then confirmed. The confirm step is deliberate: both
- * choices accept the job, and one of them additionally tells a business
- * something on the rider's behalf, so neither should be one mistap away.
+ * It has moved into the order — `AcceptOrderSection` in
+ * RiderJobDetailsScreen — because sitting here, beside the offer card's own
+ * Accept button, it was optional: a rider could take a business job with the
+ * plain Accept and never answer the counting question. Inside the order it
+ * gates every onward action, and the server refuses to move a business job
+ * out of ASSIGNED until it has been completed.
  *
- * This card sits BESIDE the offer card and does not replace it. The offer
- * card's own Accept, Hold and Decline are untouched.
+ * The waiting card below stays. The uncounted path still raises a ticket,
+ * and a rider who closed the app mid-wait still needs to come back to it.
  */
-function AcceptCard({
-  disabled,
-  onWithCounting,
-  onWithoutCounting,
-}: {
-  disabled: boolean;
-  onWithCounting: () => void;
-  onWithoutCounting: () => void;
-}) {
-  const [choice, setChoice] = useState<'WITH' | 'WITHOUT' | null>(null);
-
-  const options: Array<{ key: 'WITH' | 'WITHOUT'; label: string; hint: string }> = [
-    {
-      key: 'WITH',
-      label: 'With Counting & Checked',
-      hint: 'Counted with the business. They are told it was checked at the door.',
-    },
-    {
-      key: 'WITHOUT',
-      label: 'Without Counting & Checked',
-      hint: 'Raises a ticket. You wait here until the business accepts.',
-    },
-  ];
-
-  return (
-    <View style={styles.acceptCard}>
-      <View style={styles.acceptHeader}>
-        <Ionicons name="clipboard-outline" size={16} color={COLORS.Primary} />
-        <Text style={styles.acceptTitle}>Accept</Text>
-      </View>
-
-      {options.map((option) => {
-        const selected = choice === option.key;
-        return (
-          <TouchableOpacity
-            key={option.key}
-            style={[styles.acceptOption, selected && styles.acceptOptionSelected]}
-            onPress={() => setChoice(option.key)}
-            disabled={disabled}
-            activeOpacity={0.85}
-          >
-            <Ionicons
-              name={selected ? 'radio-button-on' : 'radio-button-off'}
-              size={18}
-              color={selected ? COLORS.Primary : COLORS.TextSecondary}
-            />
-            <View style={styles.acceptOptionBody}>
-              <Text style={[styles.acceptOptionLabel, selected && styles.acceptOptionLabelSelected]}>
-                {option.label}
-              </Text>
-              <Text style={styles.acceptOptionHint}>{option.hint}</Text>
-            </View>
-          </TouchableOpacity>
-        );
-      })}
-
-      <TouchableOpacity
-        style={[styles.acceptConfirm, (!choice || disabled) && styles.acceptConfirmDisabled]}
-        onPress={() => (choice === 'WITH' ? onWithCounting() : onWithoutCounting())}
-        disabled={!choice || disabled}
-        activeOpacity={0.85}
-      >
-        <Text style={styles.acceptConfirmText}>
-          {choice === 'WITHOUT' ? 'Raise ticket & accept' : 'Confirm accept'}
-        </Text>
-      </TouchableOpacity>
-    </View>
-  );
-}
-
 /**
  * The waiting card.
  *
@@ -548,7 +474,13 @@ function OfferCard({
             color={COLORS.Primary}
           />
           <Text style={styles.offerBadgeText}>
-            {offer.job_type === 'PICKUP' ? 'PICKUP' : 'DELIVERY'}
+            {/*
+              DISPATCH, not DELIVERY — the word the operation uses. The stored
+              `job_type` is still 'DELIVERY'; renaming the enum would touch
+              every reader for no functional gain, so the change is here, at
+              the only place a rider reads it.
+            */}
+            {offer.job_type === 'PICKUP' ? 'PICKUP' : 'DISPATCH'}
           </Text>
         </View>
 

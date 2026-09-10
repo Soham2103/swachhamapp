@@ -142,15 +142,73 @@ async function resolveJobParty(
  * to write it must not undo an acceptance the rider has already been told
  * succeeded.
  */
-async function recordMode(jobId: string, mode: DoorAcceptanceMode): Promise<void> {
+async function recordMode(
+  jobId: string,
+  mode: DoorAcceptanceMode,
+  pieceCount: number | null = null
+): Promise<void> {
   try {
-    await query(`UPDATE rider_jobs SET door_acceptance_mode = ? WHERE id = ?`, [mode, jobId]);
+    await query(
+      `UPDATE rider_jobs
+          SET door_acceptance_mode = ?, accepted_piece_count = ?, door_accepted_at = NOW()
+        WHERE id = ?`,
+      [mode, mode === 'WITH_COUNT' ? pieceCount : null, jobId]
+    );
   } catch (error) {
     logger.error(
       `[DoorAcceptance] Could not record mode ${mode} on job ${jobId}: ` +
         `${error instanceof Error ? error.message : String(error)}`
     );
   }
+}
+
+/**
+ * The pieces the rider counted, as the column will take it.
+ *
+ * WITH_COUNT WITHOUT A NUMBER IS REFUSED. The whole difference between the
+ * two answers is that one of them produced a figure — accepting the mode and
+ * silently storing nothing would tell the hotel the load was checked while
+ * recording no evidence of what was checked.
+ *
+ * Zero is rejected for the same reason: a rider who counted nothing did not
+ * count. The ceiling is a sanity bound, not a business rule; it exists so a
+ * mistyped 99999 is caught at the door rather than printed on an invoice.
+ */
+function validatePieceCount(value: unknown): number {
+  const n = Number(value);
+  if (!Number.isInteger(n) || n <= 0) {
+    throw new AppError('Enter the total number of pieces you counted.', 400);
+  }
+  if (n > 10000) {
+    throw new AppError('That piece count looks wrong. Check it and try again.', 400);
+  }
+  return n;
+}
+
+/**
+ * Makes sure the job is THIS rider's, claiming it from the offer if it is not
+ * yet claimed.
+ *
+ * WHY BOTH CASES. Acceptance used to happen on the dashboard, against a live
+ * OFFER, so it had to claim the job itself. It now happens inside the order,
+ * by which point the rider already holds the job. Handling both means the
+ * acceptance step works wherever it is called from, and a rider who somehow
+ * reaches it with an unclaimed offer still gets the same race-safe claim
+ * `acceptJob` has always performed.
+ */
+async function ensureClaimed(jobId: string, riderId: string): Promise<any> {
+  const existing = await query<any>(
+    `SELECT rider_id, status FROM rider_jobs WHERE id = ?`,
+    [jobId]
+  );
+  const row = existing.rows[0];
+  if (!row) throw new AppError('That job no longer exists.', 404);
+
+  // Already ours: nothing to claim, and `acceptJob` would reject it as taken.
+  if (row.rider_id && String(row.rider_id) === String(riderId)) {
+    return null;
+  }
+  return acceptJob(jobId, riderId);
 }
 
 /**
@@ -195,25 +253,32 @@ async function sendBusinessMessage(
  */
 export async function acceptWithCounting(
   jobId: string,
-  riderId: string
-): Promise<{ job: any; messaged: boolean }> {
+  riderId: string,
+  pieceCount: unknown
+): Promise<{ job: any; messaged: boolean; piece_count: number }> {
   const party = await resolveJobParty(jobId, riderId);
 
-  // The existing acceptance, unchanged — offer validation, the race against
-  // other riders, and the job's own state transition all stay where they are.
-  const job = await acceptJob(jobId, riderId);
+  // Validated BEFORE anything is written, so a mistyped count leaves the job
+  // exactly as it was rather than half-accepted.
+  const pieces = validatePieceCount(pieceCount);
 
-  await recordMode(jobId, 'WITH_COUNT');
+  // Claims the job when it is still an offer; a no-op once the rider holds
+  // it, which is the normal case now that acceptance lives inside the order.
+  const job = await ensureClaimed(jobId, riderId);
+
+  await recordMode(jobId, 'WITH_COUNT', pieces);
 
   const messaged = await sendBusinessMessage(
     party.business_user_id,
     party.order_id,
     null,
     'DOOR_CHECKED',
-    MESSAGE_DOOR_CHECKED
+    // The count travels with the message: "checked at door" is worth more to
+    // a hotel when it says what was checked.
+    `${MESSAGE_DOOR_CHECKED} — ${pieces} piece${pieces === 1 ? '' : 's'} counted`
   );
 
-  return { job, messaged };
+  return { job, messaged, piece_count: pieces };
 }
 
 /**
@@ -246,7 +311,7 @@ export async function raiseUncountedTicket(
     );
   }
 
-  const job = await acceptJob(jobId, riderId);
+  const job = await ensureClaimed(jobId, riderId);
 
   await recordMode(jobId, 'WITHOUT_COUNT');
 

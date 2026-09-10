@@ -269,13 +269,19 @@ router.post('/manage/businesses/:id/password', async (req: Request, res: Respons
       password: req.body?.password,
       confirm_password: req.body?.confirm_password ?? req.body?.confirmPassword,
     });
-    sendSuccess(
-      res,
-      result,
-      result.email.sent
-        ? 'Password updated and emailed to the business.'
-        : 'Password updated, but the notification email could not be sent.'
-    );
+    /*
+     * The password is set either way — every branch below says so first,
+     * because "Password updated" is the fact the Super Admin acts on and a
+     * failed notification must never read as a failed change.
+     */
+    const message = result.email.sent
+      ? result.whatsapp.sent
+        ? 'Password updated. Credentials emailed and a WhatsApp notice sent.'
+        : 'Password updated and emailed to the business. The WhatsApp notice could not be sent.'
+      : result.whatsapp.sent
+        ? 'Password updated, but the credentials email could not be sent. A WhatsApp notice was sent.'
+        : 'Password updated, but neither the credentials email nor the WhatsApp notice could be sent.';
+    sendSuccess(res, result, message);
   } catch (error) {
     next(error);
   }

@@ -76,18 +76,37 @@ function toSorterAdjustment(a: AdjustmentRecord): SorterAdjustmentRecord {
  *
  * The Sorter owns exactly two transitions and nothing else:
  *
- *   ORDER_PLACED (confirmed) -> RECEIVED_AT_FACILITY (accepted)
- *   RECEIVED_AT_FACILITY     -> READY_FOR_DELIVERY   (ready)
+ *   PICKED_UP (confirmed) -> RECEIVED_AT_FACILITY (accepted)
+ *   RECEIVED_AT_FACILITY  -> READY_FOR_DELIVERY   (ready)
  *
  * Those are statuses the orders enum already had, so the workflow reuses the
  * existing pipeline rather than introducing a parallel one. Delivery and
  * completion stay with whoever owned them before — the Sorter cannot reach
  * them.
+ *
+ * ============================================================
+ * WHEN AN ORDER REACHES THE SHOP FLOOR
+ * ============================================================
+ *
+ * WHEN THE RIDER PICKS IT UP, which is what PICKED_UP means.
+ *
+ * The first stage used to be ORDER_PLACED, which a MANAGER sets on approving
+ * the order — so an order appeared on the Sorter's queue while it was still
+ * sitting at the hotel, with nothing on the floor to work on. Worse,
+ * collecting it set PICKED_UP, which belonged to no stage at all, so the
+ * order then VANISHED from the queue and never came back: `dropAtFacility`
+ * completes the rider's job without advancing the order. Orders were reaching
+ * the facility and becoming invisible to the people meant to process them.
+ *
+ * `confirmed` is PICKED_UP, so the order joins the queue the moment the rider
+ * has it and stays there — the Sorter sees the work coming, and it can no
+ * longer fall out between collection and the facility. The Sorter's own
+ * accept step is unchanged.
  */
 
 /** The workflow, in the vocabulary the Sorter UI speaks. */
 export const SORTER_STATUS = {
-  confirmed: 'ORDER_PLACED',
+  confirmed: 'PICKED_UP',
   accepted: 'RECEIVED_AT_FACILITY',
   ready: 'READY_FOR_DELIVERY',
   /**
@@ -105,7 +124,7 @@ export type SorterStage = keyof typeof SORTER_STATUS;
 
 /** Database status -> the stage the Sorter sees. */
 const STAGE_OF: Record<string, SorterStage> = {
-  ORDER_PLACED: 'confirmed',
+  PICKED_UP: 'confirmed',
   RECEIVED_AT_FACILITY: 'accepted',
   READY_FOR_DELIVERY: 'ready',
   PARTIALLY_COMPLETED: 'partially_completed',

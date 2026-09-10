@@ -4,6 +4,7 @@ import { AppError } from '../utils/appError';
 import { logger } from '../utils/logger';
 import { validatePassword } from '../utils/password';
 import { sendCredentialsEmail } from './email.service';
+import { sendAccountReadyMessage, toWhatsAppNumber } from './whatsapp.service';
 import { normaliseMobile } from './businessContact.service';
 import {
   parseBillingCycle,
@@ -628,11 +629,22 @@ export async function setBusinessActive(id: string, active: unknown) {
 export async function setBusinessPassword(
   id: string,
   input: { password?: unknown; confirm_password?: unknown }
-): Promise<{ business_id: string; username: string; email: { sent: boolean; error?: string } }> {
+): Promise<{
+  business_id: string;
+  username: string;
+  email: { sent: boolean; error?: string };
+  whatsapp: { sent: boolean; error?: string };
+}> {
   const business = await getBusiness(id);
 
-  const account = await query<{ id: string; email: string | null; name: string | null }>(
-    `SELECT id, email, name FROM business_users
+  const account = await query<{
+    id: string;
+    email: string | null;
+    name: string | null;
+    whatsapp_number: string | null;
+    mobile_number: string | null;
+  }>(
+    `SELECT id, email, name, whatsapp_number, mobile_number FROM business_users
       WHERE business_id = ? AND email IS NOT NULL AND TRIM(email) <> ''
       ORDER BY (password_hash IS NULL), FIELD(contact_type,'PRIMARY','ALTERNATIVE'), id
       LIMIT 1`,
@@ -662,15 +674,40 @@ export async function setBusinessPassword(
   const mail = await sendCredentialsEmail({
     kind: 'BUSINESS',
     to: row.email!,
-    accountName: business.name,
+    // The trading name, matching the approval email. `businesses.name` is the
+    // LEGAL name, which is not what the establishment calls itself.
+    accountName: business.establishment_name || business.name,
     username: row.email!,
     password,
   });
+
+  /*
+   * THE WHATSAPP NOTICE. A nudge, not a delivery.
+   *
+   * The credentials are in the email above and nowhere else — this message
+   * only tells the business the account is ready and to look in their inbox.
+   * That split is deliberate: a phone number can be reassigned or read off a
+   * borrowed handset, so it is not somewhere a password may go.
+   *
+   * IT NEVER BLOCKS THE PASSWORD CHANGE. The new password is already written
+   * and hashed by this point; the notice is best-effort, its outcome is
+   * reported alongside the email's, and a WhatsApp failure does not undo a
+   * password the business can already sign in with.
+   *
+   * The WhatsApp number wins over the mobile — a business that gave both gave
+   * the first one for exactly this — and an account with neither simply gets
+   * no notice rather than an error.
+   */
+  const whatsappNumber = toWhatsAppNumber(row.whatsapp_number || row.mobile_number);
+  const notice = whatsappNumber
+    ? await sendAccountReadyMessage({ to: whatsappNumber, label: `business ${id}` })
+    : { ok: false, messageId: null, error: 'No WhatsApp or mobile number on the account.' };
 
   return {
     business_id: String(id),
     username: row.email!,
     email: { sent: mail.sent, error: mail.error },
+    whatsapp: { sent: notice.ok, error: notice.error || undefined },
   };
 }
 

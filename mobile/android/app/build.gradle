@@ -2,6 +2,25 @@ apply plugin: "com.android.application"
 apply plugin: "org.jetbrains.kotlin.android"
 apply plugin: "com.facebook.react"
 
+/*
+ * Firebase Cloud Messaging. Reads `android/app/google-services.json` — see
+ * the note beside the classpath entry in the root build.gradle.
+ *
+ * THIS PLUGIN FAILS THE BUILD WHEN THAT FILE IS ABSENT, and deliberately so:
+ * the alternative is an APK that installs, runs, registers nothing and never
+ * receives a notification, with no error anywhere to explain it.
+ *
+ * NOT APPLIED TO THE DEMO BUILD. The demo takes the application id
+ * `com.anonymous.swachham.demo` (see the block below), and the plugin
+ * refuses any package it cannot find in google-services.json — so applying
+ * it unconditionally would break the demo APK for a Firebase project the
+ * demo has no use for. A demo build talks to no server at all; there is
+ * nothing for it to be notified about.
+ */
+if (System.getenv('EXPO_PUBLIC_DEMO_MODE') != '1') {
+    apply plugin: "com.google.gms.google-services"
+}
+
 def projectRoot = rootDir.getAbsoluteFile().getParentFile().getAbsolutePath()
 
 /**

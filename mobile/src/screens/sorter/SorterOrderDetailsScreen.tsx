@@ -1456,8 +1456,20 @@ export default function SorterOrderDetailsScreen({ navigation, route }: any) {
           </View>
         ) : null}
 
-        {/* ---- DEFECTIVE ADJUSTMENT: history, money position, notify ---- */}
-        {order.has_adjustment ? (
+        {/* ---- DEFECTIVE ADJUSTMENT: history, money position, notify ----
+
+            HIDDEN ONCE THE PIECE HAS BEEN REPORTED WITH A PHOTO.
+
+            The report is the fuller account of the same event: it carries the
+            photo, both quantities and the reason, and it has already gone to
+            the customer on WhatsApp. Leaving this card up beside it offered a
+            SECOND notify button for the same damage, which is how a customer
+            ends up told twice about one torn sheet.
+
+            `defects.length` rather than a flag: a defect row exists only
+            because someone photographed the piece, which is exactly the
+            condition being asked about. */}
+        {order.has_adjustment && order.defects.length === 0 ? (
           <View style={styles.card}>
             <Text style={styles.cardTitle}>Defective adjustment</Text>
 
@@ -1494,22 +1506,20 @@ export default function SorterOrderDetailsScreen({ navigation, route }: any) {
               </Text>
             ) : null}
 
-            <TouchableOpacity
-              style={[styles.defectButton, sendingAdjustmentWhatsApp && styles.buttonDisabled]}
-              onPress={sendAdjustmentWhatsApp}
-              disabled={sendingAdjustmentWhatsApp}
-              accessibilityRole="button"
-              accessibilityLabel="Send the adjustment to the customer on WhatsApp"
-            >
-              {sendingAdjustmentWhatsApp ? (
-                <ActivityIndicator size="small" color={COLORS.Surface} />
-              ) : (
-                <>
-                  <Ionicons name="logo-whatsapp" size={18} color={COLORS.Surface} />
-                  <Text style={styles.defectButtonText}>SEND WHATSAPP</Text>
-                </>
-              )}
-            </TouchableOpacity>
+            {/*
+              SEND WHATSAPP WAS REMOVED FROM THIS CARD.
+
+              It sent the ADJUSTMENT template, which is empty by default
+              (`WHATSAPP_ADJUSTMENT_TEMPLATE`) because no such template is
+              approved on the account — so the button reported a send that
+              Meta had refused, or fell back to a defect template describing
+              something else. It was a button that looked connected and was
+              not.
+
+              The defect report is the path that works: it carries the photo,
+              both quantities and the reason, and it goes to the customer and
+              the sorting desk. Nothing is lost by removing this.
+            */}
           </View>
         ) : null}
 
@@ -1763,7 +1773,6 @@ export default function SorterOrderDetailsScreen({ navigation, route }: any) {
         orderNumber={order.order_number}
         saving={savingAdjustment}
         onCancel={() => setDefectiveFor(null)}
-        onSave={saveAdjustment}
         onReportPiece={reportDefectivePiece}
         /*
          * The cloth counted on the line being adjusted, so each box knows its

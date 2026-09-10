@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "744341216892",
+    "project_id": "swachham-notification",
+    "storage_bucket": "swachham-notification.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:744341216892:android:61c29d2f6e455decd1f3f9",
+        "android_client_info": {
+          "package_name": "com.anonymous.swachham"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyBSgi6HvZ4w6yvc_xozmT3De8N-vjPBzzI"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}

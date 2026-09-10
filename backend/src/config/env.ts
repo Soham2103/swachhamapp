@@ -94,6 +94,27 @@ interface AppConfig {
   /** Overrides the From header; falls back to the company name and address. */
   SMTP_FROM: string;
 
+  // --- Firebase Cloud Messaging (push notifications) ---
+  //
+  // Server-side only, and a genuine credential: the private key below signs
+  // for the whole Firebase project. None of these may ever reach the app —
+  // the app needs only its own google-services.json, which is not secret.
+  //
+  // Empty means "push is not configured", which the push service reports
+  // rather than throwing: a notification that cannot be pushed is still
+  // written to `notifications` / `business_messages` as it always was.
+  FIREBASE_PROJECT_ID: string;
+  FIREBASE_CLIENT_EMAIL: string;
+  /**
+   * The service account's private key.
+   *
+   * A .env cannot hold real newlines, so the key is stored with literal `\n`
+   * sequences and they are turned back into newlines when the credential is
+   * built. Getting this wrong is the usual cause of "Failed to parse private
+   * key" on first run.
+   */
+  FIREBASE_PRIVATE_KEY: string;
+
   // --- Meta WhatsApp Cloud API ---
   // Server-side only. None of these may ever reach the mobile app.
   WHATSAPP_PHONE_NUMBER_ID: string;
@@ -121,6 +142,28 @@ interface AppConfig {
    * when Meta refuses that. See .env.example for the parameter order.
    */
   WHATSAPP_DEFECT_DETAIL_TEMPLATE: string;
+  /**
+   * The APPROVED template for the FULL defective-piece report — the photo as
+   * an IMAGE header and every field the Sorter entered in the body.
+   *
+   * Unlike the two above this DOES carry a default, for the same reason
+   * `WHATSAPP_DEFECT_TEMPLATE` does: `defective_piece_report` is approved on
+   * the account. Its ten body parameters are listed in .env.example and are
+   * built by `reportTemplateParams` in defect.service.ts — the order is the
+   * contract, and the template must be built to match it.
+   */
+  WHATSAPP_DEFECT_REPORT_TEMPLATE: string;
+  /**
+   * An APPROVED template for the ACCOUNT-READY notice — the message sent to a
+   * business when a Super Admin creates its account or changes its password.
+   *
+   * Empty by default, like the two above: naming a template that Meta has not
+   * approved fails for every send. It must take NO body parameters; the copy
+   * is fixed and substitutes nothing. While this is empty the same wording is
+   * attempted as a free-form message, which Meta delivers only inside the
+   * 24-hour customer-service window.
+   */
+  WHATSAPP_ACCOUNT_READY_TEMPLATE: string;
   WHATSAPP_TEMPLATE_LANG: string;
   WHATSAPP_DEFAULT_COUNTRY_CODE: string;
   /** Fallback for the Sorter copy when the sorter account has no mobile. */
@@ -266,6 +309,12 @@ const config: AppConfig = {
     'Thank you for doing business with us.'
   ),
 
+  // Optional, like every other provider: an unconfigured deployment logs that
+  // push is off rather than failing to boot.
+  FIREBASE_PROJECT_ID: optionalEnv('FIREBASE_PROJECT_ID', ''),
+  FIREBASE_CLIENT_EMAIL: optionalEnv('FIREBASE_CLIENT_EMAIL', ''),
+  FIREBASE_PRIVATE_KEY: optionalEnv('FIREBASE_PRIVATE_KEY', ''),
+
   // Optional so the app still boots without WhatsApp configured; the defect
   // service reports a clear "not configured" failure instead of crashing.
   WHATSAPP_PHONE_NUMBER_ID: optionalEnv('WHATSAPP_PHONE_NUMBER_ID', ''),
@@ -276,6 +325,15 @@ const config: AppConfig = {
   WHATSAPP_DEFECT_TEMPLATE: optionalEnv('WHATSAPP_DEFECT_TEMPLATE', 'defective_piece_notification'),
   WHATSAPP_ADJUSTMENT_TEMPLATE: optionalEnv('WHATSAPP_ADJUSTMENT_TEMPLATE', ''),
   WHATSAPP_DEFECT_DETAIL_TEMPLATE: optionalEnv('WHATSAPP_DEFECT_DETAIL_TEMPLATE', ''),
+  // Approved on the account, so it is the default rather than empty. Set it
+  // to '' to fall back to the captioned-photo path.
+  WHATSAPP_DEFECT_REPORT_TEMPLATE: optionalEnv(
+    'WHATSAPP_DEFECT_REPORT_TEMPLATE',
+    'defective_piece_report'
+  ),
+  // Empty until the account-ready template is approved at Meta; the notice
+  // then falls back to a free-form message. See .env.example.
+  WHATSAPP_ACCOUNT_READY_TEMPLATE: optionalEnv('WHATSAPP_ACCOUNT_READY_TEMPLATE', ''),
   WHATSAPP_TEMPLATE_LANG: optionalEnv('WHATSAPP_TEMPLATE_LANG', 'en'),
   // Indian numbers are stored as 10 digits; Meta needs them in E.164.
   WHATSAPP_DEFAULT_COUNTRY_CODE: optionalEnv('WHATSAPP_DEFAULT_COUNTRY_CODE', '91'),

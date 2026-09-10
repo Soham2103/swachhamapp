@@ -79,6 +79,23 @@ import { absolutePathForUrl } from '../utils/fileStorage';
  * respect, and it is what is checked here.
  */
 const ADJUSTABLE_STATUSES = [
+  /*
+   * THE SORTER'S FIRST STAGE, which is where a defective piece is found.
+   *
+   * PICKED_UP is what an order carries from the moment the rider collects it
+   * until the Sorter accepts it — the whole window in which the load is on
+   * the floor being looked through. It was missing from this list when the
+   * Sorter's first stage moved from ORDER_PLACED to PICKED_UP, so every
+   * attempt to mark a piece defective on a freshly arrived order was refused
+   * with "This order is PICKED UP and can no longer be adjusted" — which is
+   * exactly the order that SHOULD be adjustable.
+   */
+  'PICKED_UP',
+  /*
+   * Kept, though nothing reaches the Sorter at this status any more: an order
+   * is ORDER_PLACED only while it still sits at the hotel awaiting collection.
+   * Harmless, and removing it would be a second behaviour change for no gain.
+   */
   'ORDER_PLACED',
   'RECEIVED_AT_FACILITY',
   'READY_FOR_DELIVERY',

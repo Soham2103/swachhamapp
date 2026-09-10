@@ -4,6 +4,7 @@ import * as SecureStore from 'expo-secure-store';
 import authApi from '../services/authApi';
 import type { SignInResult, BusinessSignInTarget } from '../services/authApi';
 import { extractErrorMessage } from '../services/api';
+import { unregisterDeviceForPush } from '../services/pushRegistration';
 import { User, LoginPayload, RegisterPayload, BusinessRegisterPayload } from '../types';
 import { DEMO_MODE } from '../demo/demoMode';
 import { DEMO_CREDENTIALS_MESSAGE, DEMO_TOKEN, DEMO_USER, isDemoCredential } from '../demo/demoAuth';
@@ -630,6 +631,16 @@ export const useAuthStore = create<AuthState>((set, get) => ({
   logout: async () => {
     try {
       set({ isLoading: true });
+      /*
+       * HAND THE DEVICE BACK FIRST, while the token is still valid — the
+       * endpoint is authenticated, so doing it after the keys are cleared
+       * would always fail. On a shared handset this is what stops the next
+       * person to sign in from receiving this account's notifications.
+       *
+       * Best-effort by construction: `unregisterDeviceForPush` swallows its
+       * own errors, so signing out never depends on it.
+       */
+      await unregisterDeviceForPush();
       // A demo session exists only on this device, so there is no server-side
       // session to end; the stored keys below are the whole of it.
       if (!DEMO_MODE) {

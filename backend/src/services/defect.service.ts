@@ -132,7 +132,26 @@ const COLUMNS: Record<DefectRecipientRole, {
 };
 
 /** The order in which copies are sent and reported. */
-const ROLES: DefectRecipientRole[] = ['customer', 'manager', 'super_admin', 'sorter'];
+/**
+ * WHO A DEFECT REPORT GOES TO: the two people it concerns.
+ *
+ *   customer  the customer or establishment whose piece was damaged — they
+ *             are the ones who have to be told, and the only ones who can
+ *             dispute it.
+ *   sorter    the sorting desk, which is where the report was raised and
+ *             where the piece physically is.
+ *
+ * THE MANAGER AND SUPER ADMIN COPIES WERE REMOVED DELIBERATELY. A defect is
+ * an operational fact between the desk that found it and the customer who
+ * owns the garment; copying every report to management turned a working
+ * notification into a broadcast, and a WhatsApp message costs money per send.
+ *
+ * Their columns on `order_defects` are LEFT IN PLACE and simply stay NULL.
+ * Dropping them would rewrite history for every report already sent, and
+ * restoring a copy later is then a one-line change here rather than a
+ * migration.
+ */
+const ROLES: DefectRecipientRole[] = ['customer', 'sorter'];
 
 /** How each role reads in a message or an error. */
 export const ROLE_LABEL: Record<DefectRecipientRole, string> = {
@@ -154,7 +173,13 @@ const ORDER_CONTACT_SELECT = `
   SELECT o.id, o.order_number, o.status, o.created_at, o.manager_approved_by,
          COALESCE(b.name, u.name, 'Customer') AS customer_name,
          NULLIF(TRIM(b.establishment_name), '') AS establishment_name,
-         COALESCE(bu.mobile_number, u.mobile_number) AS customer_contact,
+         -- The business's WHATSAPP number wins over its mobile: a business
+         -- that recorded both gave the first one for exactly this. NULLIF
+         -- keeps a blank column from beating a real mobile. A customer order
+         -- has no business_users row and falls through to the user's mobile,
+         -- exactly as before.
+         COALESCE(NULLIF(TRIM(bu.whatsapp_number), ''), bu.mobile_number, u.mobile_number)
+           AS customer_contact,
          DATE_FORMAT(CONVERT_TZ(o.created_at, '+00:00', ?), '%d %b %Y') AS order_date,
          (SELECT st.name FROM services st WHERE st.id = o.service_id) AS order_service_name
     FROM orders o
@@ -319,8 +344,19 @@ interface DefectDetails {
   totalQuantity: number;
   /** Pieces found damaged. */
   defectiveQuantity: number;
+  /**
+   * How that total divides by colour, as the Sorter typed it.
+   *
+   * NULL is "not split", not zero — a report filed before the split existed,
+   * or one filed against the whole order. The template prints a dash for it
+   * rather than a 0 that would read as "none of these were white".
+   */
+  whiteDefectiveQuantity: number | null;
+  colorDefectiveQuantity: number | null;
   reason: string | null;
   reportedBy: string | null;
+  /** When the report was filed, in business time. */
+  reportedAt: string;
 }
 
 async function loadDefectDetails(defect: DefectRecord, order: any): Promise<DefectDetails> {
@@ -409,6 +445,31 @@ async function loadDefectDetails(defect: DefectRecord, order: any): Promise<Defe
 
   const sorter = await loadSorterContact(defect.reported_by);
 
+  /*
+   * WHEN THE REPORT WAS FILED, off the DATABASE clock.
+   *
+   * `reported_at` is stored in UTC and converted through the same
+   * `BUSINESS_TZ_OFFSET` the order date above already uses. Formatting it in
+   * Node with `new Date()` instead would introduce a second clock that can
+   * disagree with the one the row was stamped with — the reason
+   * `utils/istTime.ts` exists at all.
+   */
+  const stamp = defect.id
+    ? await query<any>(
+        `SELECT DATE_FORMAT(CONVERT_TZ(reported_at, '+00:00', ?), '%d %b %Y, %h:%i %p')
+                  AS reported_at
+           FROM order_defects WHERE id = ?`,
+        [config.BUSINESS_TZ_OFFSET, defect.id]
+      )
+    : // The PREVIEW passes a report that has not been filed, so there is no
+      // row and no id to read one by. "Now" is what a report filed at this
+      // moment would carry, which is what the preview is answering.
+      await query<any>(
+        `SELECT DATE_FORMAT(CONVERT_TZ(UTC_TIMESTAMP(), '+00:00', ?), '%d %b %Y, %h:%i %p')
+                  AS reported_at`,
+        [config.BUSINESS_TZ_OFFSET]
+      );
+
   return {
     orderNumber: order.order_number,
     customerName: order.customer_name,
@@ -418,8 +479,13 @@ async function loadDefectDetails(defect: DefectRecord, order: any): Promise<Defe
     serviceType: serviceType || '—',
     totalQuantity,
     defectiveQuantity,
+    // Straight off the row: the division the Sorter typed with this photo,
+    // not a figure re-derived from the line, which can be edited afterwards.
+    whiteDefectiveQuantity: defect.white_defective_quantity,
+    colorDefectiveQuantity: defect.color_defective_quantity,
     reason: defect.description || null,
     reportedBy: sorter?.name || null,
+    reportedAt: stamp.rows[0]?.reported_at || '—',
   };
 }
 
@@ -443,8 +509,17 @@ function buildDefectMessage(details: DefectDetails): string {
     `Service Type: ${details.serviceType}`,
     `Total Quantity: ${details.totalQuantity}`,
     `Defective Quantity: ${details.defectiveQuantity}`,
+    // Only when the Sorter actually recorded a division. A report without one
+    // prints neither line rather than two zeroes.
+    details.whiteDefectiveQuantity !== null
+      ? `White Quantity: ${details.whiteDefectiveQuantity}`
+      : null,
+    details.colorDefectiveQuantity !== null
+      ? `Colour Quantity: ${details.colorDefectiveQuantity}`
+      : null,
     details.reason ? `Reason: ${details.reason}` : null,
     details.reportedBy ? `Reported by: ${details.reportedBy}` : null,
+    `Reported at: ${details.reportedAt}`,
   ];
   return lines.filter((line) => line !== null).join('\n');
 }
@@ -456,6 +531,54 @@ function buildDefectMessage(details: DefectDetails): string {
  * template can be built to match. Meta rejects an empty text parameter, so
  * every slot falls back to a dash rather than being left blank.
  */
+/**
+ * The body parameters for `defective_piece_report`.
+ *
+ * THE ORDER IS THE CONTRACT — it is the approved template's {{1}}..{{10}} and
+ * nothing may be reordered here without the template being re-approved to
+ * match. It is documented in .env.example beside the variable that names it.
+ *
+ *   {{1}}  Order ID           {{6}}  Colour quantity
+ *   {{2}}  Customer           {{7}}  Total defective pieces
+ *   {{3}}  Cloth type         {{8}}  Remarks
+ *   {{4}}  Defective category {{9}}  Reported by
+ *   {{5}}  White quantity     {{10}} Date & time
+ *
+ * {{4}} IS THE SERVICE THE LINE WAS BOOKED FOR — Dry Clean, Wash & Fold — and
+ * it is the one slot with no field of its own behind it: the app records no
+ * defect category anywhere, and inventing a form field for one would be a UI
+ * change this work was not asked to make. The service is used because it is
+ * real data that recipients ALREADY see (the captioned-photo path prints
+ * "Service Type:"), so mapping it here keeps the information rather than
+ * dropping it. Change this one line if the category should read differently.
+ *
+ * Meta rejects an EMPTY text parameter, so every slot falls back to a dash or
+ * a word rather than being left blank — a rejected message would take the
+ * photo with it.
+ */
+function reportTemplateParams(details: DefectDetails): string[] {
+  // A split that was never recorded prints as a dash: 0 would assert that
+  // none of the damaged pieces were of that colour, which is a different and
+  // possibly untrue statement.
+  const white =
+    details.whiteDefectiveQuantity === null ? '—' : String(details.whiteDefectiveQuantity);
+  const colour =
+    details.colorDefectiveQuantity === null ? '—' : String(details.colorDefectiveQuantity);
+
+  return [
+    `#${details.orderNumber}`,
+    details.customerName || '—',
+    details.itemName || '—',
+    details.serviceType || '—',
+    white,
+    colour,
+    String(details.defectiveQuantity),
+    details.reason || 'Not specified',
+    details.reportedBy || 'Sorter',
+    details.reportedAt || '—',
+  ];
+}
+
 function detailTemplateParams(details: DefectDetails): string[] {
   return [
     details.customerName || '—',
@@ -476,6 +599,14 @@ interface Attempt {
   ok: boolean;
   messageId: string | null;
   error: string | null;
+  /**
+   * WHICH of the delivery paths produced this outcome, for the log line.
+   *
+   * Recorded rather than inferred: the send falls back through several paths,
+   * and "it went out" is not actionable when what matters is whether the
+   * approved template was used or a fallback quietly covered for it.
+   */
+  via?: string;
 }
 
 /** Writes one copy's outcome, addressing whichever columns that role owns. */
@@ -565,10 +696,21 @@ async function notifyForDefect(defectId: string, orderId: string): Promise<Defec
 
   const numbers: Record<DefectRecipientRole, string | null> = {
     customer: toWhatsAppNumber(order.customer_contact),
-    // The account's own number first; the configured fallback only when the
-    // account has none. Neither is written into this file.
+    /*
+     * THE CONFIGURED SORTING-DESK NUMBER FIRST, the reporting Sorter's own
+     * only when none is configured.
+     *
+     * This is the one ordering that changed with the report template: the
+     * desk number in WHATSAPP_SORTER_NUMBER is a fixed line that should see
+     * every defect report, whereas the reporting Sorter's personal number
+     * varies with whoever happened to be on shift. Neither is written into
+     * this file — the number lives only in the environment.
+     *
+     * When both resolve to the same number, the per-number guard below sends
+     * one message, not two.
+     */
     sorter:
-      toWhatsAppNumber(sorter?.mobile_number) || toWhatsAppNumber(config.WHATSAPP_SORTER_NUMBER),
+      toWhatsAppNumber(config.WHATSAPP_SORTER_NUMBER) || toWhatsAppNumber(sorter?.mobile_number),
     manager:
       toWhatsAppNumber(manager?.mobile_number) || toWhatsAppNumber(config.WHATSAPP_MANAGER_NUMBER),
     super_admin:
@@ -589,6 +731,7 @@ async function notifyForDefect(defectId: string, orderId: string): Promise<Defec
   const details = await loadDefectDetails(defect, order);
   const caption = buildDefectMessage(details);
   const detailTemplate = String(config.WHATSAPP_DEFECT_DETAIL_TEMPLATE || '').trim();
+  const reportTemplate = String(config.WHATSAPP_DEFECT_REPORT_TEMPLATE || '').trim();
 
   // Upload once, reuse for every message. A failure here is fatal to all.
   let mediaId: string | null = null;
@@ -608,20 +751,44 @@ async function notifyForDefect(defectId: string, orderId: string): Promise<Defec
   /**
    * Sends ONE copy: the photo and every detail, in a single message.
    *
-   * THREE PATHS, in the order of how much they carry, and only ever ONE
+   * FOUR PATHS, in the order of how much they carry, and only ever ONE
    * message per recipient — a path is tried solely because the one before it
    * was NOT delivered:
    *
-   *   1. An approved detail template, when one is configured. Photo header,
-   *      every field in the body, deliverable at any time.
-   *   2. A captioned photo. Same content, no template needed, but Meta only
+   *   1. `defective_piece_report`: photo as the IMAGE header, every field the
+   *      Sorter entered in the body, deliverable at any time because it is an
+   *      approved UTILITY template. This is the one that should be used.
+   *   2. An approved detail template, when one is separately configured. Kept
+   *      so a deployment that had WHATSAPP_DEFECT_DETAIL_TEMPLATE working
+   *      does not lose it.
+   *   3. A captioned photo. Same content, no template needed, but Meta only
    *      delivers free-form messages inside the 24-hour service window.
-   *   3. The approved defect template the account already has. Photo, name
+   *   4. The approved defect template the account already has. Photo, name
    *      and order number — less detail, but it always reaches its
    *      recipient, which is why it is the floor and not the ceiling.
+   *
+   * The photo travels WITH the details in every one of them. There is no path
+   * on which the image and the text arrive as two messages.
    */
   const deliver = async (to: string): Promise<Attempt> => {
     if (!mediaId) return { ok: false, messageId: null, error: uploadError };
+
+    if (reportTemplate) {
+      const result = await sendDefectDetailTemplate({
+        to,
+        templateName: reportTemplate,
+        mediaId,
+        bodyParams: reportTemplateParams(details),
+        orderNumber: details.orderNumber,
+      });
+      if (result.ok) return { ...result, via: `template ${reportTemplate}` };
+      // Worth a line of its own: a template rejection is a Meta-side
+      // configuration problem, and the fallbacks below can mask it by
+      // succeeding.
+      logger.warn(
+        `[Defect] template "${reportTemplate}" refused for order ${details.orderNumber} → ${to}: ${result.error}`
+      );
+    }
 
     if (detailTemplate) {
       const result = await sendDefectDetailTemplate({
@@ -631,7 +798,7 @@ async function notifyForDefect(defectId: string, orderId: string): Promise<Defec
         bodyParams: detailTemplateParams(details),
         orderNumber: details.orderNumber,
       });
-      if (result.ok) return result;
+      if (result.ok) return { ...result, via: `template ${detailTemplate}` };
     }
 
     const captioned = await sendImageWithCaption({
@@ -640,7 +807,7 @@ async function notifyForDefect(defectId: string, orderId: string): Promise<Defec
       caption,
       orderNumber: details.orderNumber,
     });
-    if (captioned.ok) return captioned;
+    if (captioned.ok) return { ...captioned, via: 'captioned photo' };
 
     const templated = await sendDefectTemplate({
       to,
@@ -648,7 +815,7 @@ async function notifyForDefect(defectId: string, orderId: string): Promise<Defec
       orderNumber: details.orderNumber,
       mediaId,
     });
-    if (templated.ok) return templated;
+    if (templated.ok) return { ...templated, via: `template ${config.WHATSAPP_DEFECT_TEMPLATE}` };
 
     // Say why the message with the detail in it was refused, not just why the
     // fallback was: the first reason is the one worth acting on.
@@ -694,6 +861,27 @@ async function notifyForDefect(defectId: string, orderId: string): Promise<Defec
     const attempt = already ?? (await deliver(to));
     if (!already) sentTo.set(to, attempt);
     await recordAttempt(defectId, role, to, attempt);
+
+    /*
+     * ONE LINE PER COPY: who it went to, which order, how it was delivered
+     * and what Meta said. The timestamp is the logger's own.
+     *
+     * The number is logged because a report nobody received is investigated
+     * by asking which number was tried; it is an ordinary business contact,
+     * not a credential, and no token or message body is written here.
+     */
+    const reused = already ? ' (reused, same number)' : '';
+    if (attempt.ok) {
+      logger.info(
+        `[Defect] order ${details.orderNumber} → ${ROLE_LABEL[role]} ${to}: sent via ` +
+          `${attempt.via || 'unknown path'}, message ${attempt.messageId}${reused}`
+      );
+    } else {
+      logger.error(
+        `[Defect] order ${details.orderNumber} → ${ROLE_LABEL[role]} ${to}: NOT sent` +
+          `${reused} — ${attempt.error || 'no reason reported'}`
+      );
+    }
   }
 
   return getDefectById(defectId);
@@ -718,11 +906,16 @@ export async function previewDefectNotification(params: {
   orderId: string;
   orderItemId?: string | null;
   defectiveQuantity?: number | null;
+  /** The colour split, when the caller is previewing one. */
+  whiteDefectiveQuantity?: number | null;
+  colorDefectiveQuantity?: number | null;
   reason?: string | null;
   sorterUserId?: string | null;
 }): Promise<{
   details: DefectDetails;
   message: string;
+  /** The template the send would use first, or null when none is configured. */
+  templateName: string | null;
   templateParams: string[];
   recipients: Array<{ role: DefectRecipientRole; label: string; to: string | null }>;
 }> {
@@ -734,6 +927,10 @@ export async function previewDefectNotification(params: {
     order_id: params.orderId,
     order_item_id: params.orderItemId ? String(params.orderItemId) : null,
     defective_quantity: params.defectiveQuantity ?? null,
+    // Explicitly null rather than absent: `undefined` here would reach the
+    // template parameters as the string "undefined" instead of a dash.
+    white_defective_quantity: params.whiteDefectiveQuantity ?? null,
+    color_defective_quantity: params.colorDefectiveQuantity ?? null,
     description: params.reason ?? null,
     reported_by: params.sorterUserId ? String(params.sorterUserId) : null,
   } as DefectRecord;
@@ -749,8 +946,11 @@ export async function previewDefectNotification(params: {
 
   const numbers: Record<DefectRecipientRole, string | null> = {
     customer: toWhatsAppNumber(order.customer_contact),
+    // The SAME precedence the real send uses. A preview that resolved
+    // recipients differently would be the drift this function exists to
+    // avoid.
     sorter:
-      toWhatsAppNumber(sorter?.mobile_number) || toWhatsAppNumber(config.WHATSAPP_SORTER_NUMBER),
+      toWhatsAppNumber(config.WHATSAPP_SORTER_NUMBER) || toWhatsAppNumber(sorter?.mobile_number),
     manager:
       toWhatsAppNumber(manager?.mobile_number) || toWhatsAppNumber(config.WHATSAPP_MANAGER_NUMBER),
     super_admin:
@@ -758,10 +958,15 @@ export async function previewDefectNotification(params: {
       toWhatsAppNumber(config.WHATSAPP_SUPER_ADMIN_NUMBER),
   };
 
+  // Whichever template the send would actually reach for first, so the
+  // parameters shown are the parameters Meta would receive.
+  const reportTemplate = String(config.WHATSAPP_DEFECT_REPORT_TEMPLATE || '').trim();
+
   return {
     details,
     message: buildDefectMessage(details),
-    templateParams: detailTemplateParams(details),
+    templateName: reportTemplate || String(config.WHATSAPP_DEFECT_DETAIL_TEMPLATE || '').trim() || null,
+    templateParams: reportTemplate ? reportTemplateParams(details) : detailTemplateParams(details),
     recipients: ROLES.map((role) => ({ role, label: ROLE_LABEL[role], to: numbers[role] })),
   };
 }

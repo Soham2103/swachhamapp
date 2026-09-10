@@ -142,13 +142,13 @@ export async function sendCredentialsEmail(input: {
       ? 'Your business account has been approved.'
       : `Your ${label.toLowerCase()} account has been approved.`,
     '',
-    `${input.kind === 'BUSINESS' ? 'Business Name' : 'Name'}: ${input.accountName}`,
+    `${input.kind === 'BUSINESS' ? 'Establishment Name' : 'Name'}: ${input.accountName}`,
     '',
     `Username: ${input.username}`,
     '',
     `Password: ${input.password}`,
     '',
-    'Please log in and change your password after your first login.',
+    `Your account is ready. Use the password provided by us to begin your journey with ${brand}.`,
     '',
     `— ${brand}`,
   ].join('\n');
@@ -163,7 +163,7 @@ export async function sendCredentialsEmail(input: {
       }</p>
       <table style="border-collapse:collapse;margin:16px 0">
         <tr><td style="padding:4px 12px 4px 0;color:#6B7280">${
-          input.kind === 'BUSINESS' ? 'Business Name' : 'Name'
+          input.kind === 'BUSINESS' ? 'Establishment Name' : 'Name'
         }</td><td style="padding:4px 0"><strong>${escapeHtml(input.accountName)}</strong></td></tr>
         <tr><td style="padding:4px 12px 4px 0;color:#6B7280">Username</td><td style="padding:4px 0"><strong>${escapeHtml(
           input.username
@@ -172,7 +172,9 @@ export async function sendCredentialsEmail(input: {
           input.password
         )}</code></td></tr>
       </table>
-      <p>Please log in and change your password after your first login.</p>
+      <p>Your account is ready. Use the password provided by us to begin your journey with ${escapeHtml(
+        brand
+      )}.</p>
       <p style="color:#6B7280">— ${escapeHtml(brand)}</p>
     </div>`;
 

@@ -29,6 +29,7 @@ import { UPLOAD_ROOT, UPLOAD_URL_PREFIX } from './utils/fileStorage';
 import adminRoutes from './routes/admin.routes';
 import riderRoutes from './routes/rider.routes';
 import ticketRoutes from './routes/ticket.routes';
+import pushRoutes from './routes/push.routes';
 
 const app = express();
 const server = http.createServer(app);
@@ -136,6 +137,9 @@ app.use('/api/rider', riderRoutes);
 // The one ticket router. Every role uses it; the service decides what each
 // of them sees and may do. See routes/ticket.routes.ts.
 app.use('/api/tickets', ticketRoutes);
+// Device registration for push. Every signed-in role may register its own
+// handset; the account is taken from the token, never from the body.
+app.use('/api/push', pushRoutes);
 
 // Error Handling Middleware
 app.use(errorHandler);

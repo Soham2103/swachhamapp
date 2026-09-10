@@ -116,7 +116,11 @@ export interface RiderState {
   refreshJobs: () => Promise<void>;
   acceptOffer: (jobId: string) => Promise<{ ok: boolean; message: string }>;
   /** "With Counting & Checked" — accept and tell the business. */
-  acceptOfferWithCounting: (jobId: string) => Promise<{ ok: boolean; message: string }>;
+  /** `pieceCount` is the total pieces counted at the door. Required. */
+  acceptOfferWithCounting: (
+    jobId: string,
+    pieceCount: number
+  ) => Promise<{ ok: boolean; message: string }>;
   /** "Without Counting & Checked" — accept, raise a ticket, then wait. */
   acceptOfferWithoutCounting: (jobId: string) => Promise<{ ok: boolean; message: string }>;
   /** One poll of the ticket the rider is waiting on. */
@@ -359,10 +363,10 @@ export const useRiderStore = create<RiderState>((set, get) => ({
    * The job is accepted and the business is told it was checked at the door.
    * The rider is not held: this path has nothing to wait for.
    */
-  acceptOfferWithCounting: async (jobId: string) => {
+  acceptOfferWithCounting: async (jobId: string, pieceCount: number) => {
     set({ isSubmittingDoorChoice: true });
     try {
-      const response = await riderApi.acceptOfferWithCounting(jobId);
+      const response = await riderApi.acceptOfferWithCounting(jobId, pieceCount);
       set({ offers: get().offers.filter((o) => o.job_id !== jobId) });
       await Promise.all([get().refreshJobs(), get().refreshOffers()]);
 
